@@ -52,6 +52,10 @@ const ABN_POSCHANGED_ID: usize = 1;
 const TIMER_CLOCK: usize = 1;
 const TIMER_ANIM: usize = 2;
 const TIMER_RESYNC: usize = 3;
+const TIMER_PREVIEW: usize = 4;
+const PREVIEW_DELAY_MS: u32 = 350;
+/// Buttons shrink under crowding but never below this.
+const BUTTON_MIN_W: f32 = 48.0;
 const CLOCK_W: f32 = 84.0;
 const LAUNCHER_W: f32 = 40.0;
 const TRAY_CELL_W: f32 = 24.0;
@@ -75,7 +79,9 @@ struct Entry {
     hwnd: Option<HWND>,
     exe: Option<String>,
     title: Vec<u16>,
+    /// Display width; shrunk from `full_width` when the bar is crowded.
     width: f32,
+    full_width: f32,
     flash: bool,
     pinned: bool,
 }
@@ -132,6 +138,7 @@ pub struct Bar {
     tray_hover: Option<usize>,
     status: crate::status::Status,
     status_hover: Option<usize>,
+    preview: crate::preview::Preview,
 }
 
 /// Cells in the status cluster, left→right; presence varies (no battery on
@@ -226,6 +233,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             tray_hover: None,
             status: crate::status::Status::new(),
             status_hover: None,
+            preview: crate::preview::Preview::new(dpi)?,
         };
         bar.refresh();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
@@ -406,6 +414,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     TIMER_ANIM => bar.tick_anims(),
                     TIMER_RESYNC => bar.resync(),
+                    TIMER_PREVIEW => {
+                        let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+                        bar.preview_fire();
+                    }
                     _ => {}
                 }
                 LRESULT(0)
@@ -417,12 +429,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else {
                     let th = bar.tray_hit(x);
                     let sh = bar.status_hit(x);
+                    let eh = if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None };
+                    let changed =
+                        th != bar.tray_hover || sh != bar.status_hover || eh != bar.hover;
                     if th != bar.tray_hover || sh != bar.status_hover {
                         bar.tray_hover = th;
                         bar.status_hover = sh;
                         bar.paint();
                     }
-                    bar.set_hover(if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None });
+                    bar.set_hover(eh);
+                    if changed {
+                        bar.schedule_preview(hwnd);
+                    }
                 }
                 if !bar.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
@@ -439,6 +457,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_MOUSELEAVE => {
                 bar.tracking_leave = false;
+                let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+                bar.preview.hide();
                 if bar.tray_hover.take().is_some() | bar.status_hover.take().is_some() {
                     bar.paint();
                 }
@@ -446,6 +466,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
+                bar.preview.hide();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(t) = bar.tray_hit(x) {
                     bar.tray_forward(t, WM_LBUTTONDOWN);
@@ -464,6 +485,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_LBUTTONDBLCLK => {
                 // CS_DBLCLKS swallows the second LBUTTONDOWN of a fast pair;
                 // tray icons get the dblclk, entries treat it as another press.
+                bar.preview.hide();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(t) = bar.tray_hit(x) {
                     bar.tray_forward(t, WM_LBUTTONDBLCLK);
@@ -520,6 +542,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
+                bar.preview.hide();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(t) = bar.tray_hit(x) {
                     // Standard sequence the owner expects for its menu.
@@ -665,11 +688,13 @@ impl Bar {
                 if flags & NIF_STATE != 0 && ev.state_mask & NIS_HIDDEN != 0 {
                     t.hidden = ev.state & NIS_HIDDEN != 0;
                 }
+                self.apply_overflow();
                 self.paint();
             }
             NIM_DELETE => {
                 self.tray_icons
                     .retain(|t| !(t.owner == ev.owner && t.uid == ev.uid));
+                self.apply_overflow();
                 self.paint();
             }
             NIM_SETVERSION => {
@@ -814,6 +839,7 @@ impl Bar {
                     exe: Some(pin.clone()),
                     title: Vec::new(),
                     width: LAUNCHER_W,
+                    full_width: LAUNCHER_W,
                     flash: false,
                     pinned: true,
                 };
@@ -845,6 +871,7 @@ impl Bar {
         self.anims.retain(|k, _| entry_keys.contains(k));
         self.entries = entries;
         self.entry_keys = entry_keys;
+        self.apply_overflow();
         self.active = unsafe { GetForegroundWindow() };
         self.ensure_anim_timer();
         self.paint();
@@ -863,7 +890,135 @@ impl Bar {
             .entry(key)
             .or_insert_with(|| icons::window_icon(&self.renderer.dc, h));
         let flash = self.entries.iter().any(|e| e.hwnd == Some(h) && e.flash);
-        Entry { hwnd: Some(h), exe, title, width, flash, pinned }
+        Entry { hwnd: Some(h), exe, title, width, full_width: width, flash, pinned }
+    }
+
+    /// Shrink window buttons evenly when they would run into the tray;
+    /// launcher slots keep their fixed width.
+    fn apply_overflow(&mut self) {
+        for e in &mut self.entries {
+            e.width = e.full_width;
+        }
+        let avail = self.tray_left() - 8.0 - 4.0;
+        let total: f32 = self.entries.iter().map(|e| e.width + 4.0).sum();
+        if total <= avail {
+            return;
+        }
+        let fixed: f32 = self
+            .entries
+            .iter()
+            .filter(|e| e.hwnd.is_none())
+            .map(|e| e.width + 4.0)
+            .sum();
+        let n = self.entries.iter().filter(|e| e.hwnd.is_some()).count();
+        if n == 0 {
+            return;
+        }
+        let cap = ((avail - fixed) / n as f32 - 4.0).clamp(BUTTON_MIN_W, theme::BUTTON_MAX_W);
+        for e in self.entries.iter_mut().filter(|e| e.hwnd.is_some()) {
+            e.width = e.full_width.min(cap);
+        }
+    }
+
+    /// Hover settled or moved: open/retarget/close the preview popup.
+    fn schedule_preview(&mut self, hwnd: HWND) {
+        unsafe {
+            if self.hover.is_none() && self.tray_hover.is_none() && self.status_hover.is_none() {
+                let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+                self.preview.hide();
+            } else if self.preview.current.is_some() {
+                // Popup already open: switch targets without the delay,
+                // explorer-style.
+                self.preview_fire();
+            } else {
+                SetTimer(Some(hwnd), TIMER_PREVIEW, PREVIEW_DELAY_MS, None);
+            }
+        }
+    }
+
+    fn preview_fire(&mut self) {
+        use crate::preview::Target;
+        if self.drag.as_ref().is_some_and(|d| d.active) {
+            return;
+        }
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        let scale = self.scale();
+        let anchor = |cx: f32| rect.left + (cx * scale).round() as i32;
+
+        if let Some(i) = self.hover {
+            if i >= self.entries.len() {
+                return;
+            }
+            let (hwnd_opt, exe_opt, title, center) = {
+                let e = &self.entries[i];
+                (
+                    e.hwnd,
+                    e.exe.clone(),
+                    e.title.clone(),
+                    self.entry_left(i) + e.width / 2.0,
+                )
+            };
+            match hwnd_opt {
+                Some(h) => {
+                    self.preview.show_window(
+                        Target::Window(h.0 as isize),
+                        h,
+                        &title,
+                        anchor(center),
+                        rect.top,
+                    );
+                }
+                None => {
+                    if let Some(exe) = exe_opt {
+                        let name = exe.rsplit('\\').next().unwrap_or(&exe);
+                        let t: Vec<u16> = name.encode_utf16().collect();
+                        self.preview.show_tip(Target::Launcher(i), &t, anchor(center), rect.top);
+                    }
+                }
+            }
+        } else if let Some(ti) = self.tray_hover {
+            let Some(icon) = self.tray_icons.get(ti) else { return };
+            if icon.tip.is_empty() {
+                return;
+            }
+            let visible = self.tray_visible();
+            let Some(cell) = visible.iter().position(|v| *v == ti) else { return };
+            let center = self.tray_left() + cell as f32 * TRAY_CELL_W + TRAY_CELL_W / 2.0;
+            let tip: Vec<u16> = icon.tip.encode_utf16().collect();
+            self.preview.show_tip(Target::Tray(ti), &tip, anchor(center), rect.top);
+        } else if let Some(s) = self.status_hover {
+            let cells = self.status_cells();
+            let Some(cell) = cells.get(s) else { return };
+            let text = match cell {
+                StatusCell::Ime => match self.status.ime_hangul {
+                    Some(true) => "한글 입력".to_string(),
+                    _ => "영문 입력".to_string(),
+                },
+                StatusCell::Net => {
+                    if self.status.net_connected {
+                        "인터넷 연결됨".to_string()
+                    } else {
+                        "네트워크 연결 안 됨".to_string()
+                    }
+                }
+                StatusCell::Vol => match self.status.volume {
+                    Some((_, true)) => "음소거 — 클릭하여 해제".to_string(),
+                    Some((v, false)) => format!("볼륨 {:.0}% — 휠로 조절", v * 100.0),
+                    None => "오디오 장치 없음".to_string(),
+                },
+                StatusCell::Bat => match self.status.battery {
+                    Some((p, true)) => format!("배터리 {p}% · 전원 연결됨"),
+                    Some((p, false)) => format!("배터리 {p}%"),
+                    None => return,
+                },
+            };
+            let t: Vec<u16> = text.encode_utf16().collect();
+            let center = self.status_left() + s as f32 * STATUS_CELL_W + STATUS_CELL_W / 2.0;
+            self.preview.show_tip(Target::Status(s), &t, anchor(center), rect.top);
+        }
     }
 
     fn hit_test(&self, x: f32) -> Option<usize> {
@@ -1080,6 +1235,7 @@ impl Bar {
             let _ = MoveWindow(self.hwnd, rect.left, rect.top, w_px, h_px, true);
             let _ = self.renderer.resize(w_px as u32, h_px as u32, dpi);
             self.width = w_px as f32 / (dpi / 96.0);
+            self.apply_overflow();
             self.paint();
         }
     }

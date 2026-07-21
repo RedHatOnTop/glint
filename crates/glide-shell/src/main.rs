@@ -5,6 +5,7 @@
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
 mod icons;
+mod preview;
 mod render;
 mod spike_toasts;
 mod status;

@@ -305,6 +305,25 @@ ShowWindow/SetForegroundWindow가 조용히 거부됨. **received-last-input 자
 WM_LBUTTONDBLCLK 포워딩. explorer-kill 세션에서 Everything 트레이 클릭 → 창 열림 →
 셸훅으로 러닝 버튼 등장까지 전체 루프 확인.
 
+### 6.6.1 호버 프리뷰 팝업 + 버튼 overflow (0721)
+
+`preview.rs` = 바 위 팝업 창 1개(acrylic dark, DWM-rounded, NOREDIRECTIONBITMAP +
+자체 Renderer). **§6.7 벌룬/토스트/플라이아웃이 재사용할 팝업 기계의 첫 사용자.**
+호버 350ms 타이머 후 표시, 이미 떠 있으면 즉시 재타겟(탐색기 동작), 클릭/이탈/드래그에
+숨김.
+
+- 창 버튼: 전체 제목 + **DWM 라이브 썸네일** — `DwmRegisterThumbnail`이 DComp 팝업
+  위에도 그대로 합성됨(증명됨). dest rect는 **디바이스 px**, 축소만(fit ≤ 1.0),
+  소스 크기 0이면 텍스트 팁으로 폴백.
+- 트레이 아이콘: NIF_TIP 텍스트 팁. 상태 셀: 한글 팁(IME/넷/볼륨/배터리 %).
+  런처: exe 이름 팁.
+- overflow: `Entry.full_width`(자연폭)와 표시폭 분리 — tray_left 앞 공간을 넘으면
+  창 버튼만 균등 축소, 하한 `BUTTON_MIN_W`(48 DIP). add/remove/reposition마다 재계산.
+
+라이브 검증 0721: Zetile 창 라이브 썸네일 캡처, 배터리 팁, 더미 6창 → 13버튼 균등
+축소 → 닫으면 원복. **RAM WS 84.5 / private 66.2 MB — 40 예산 초과.** 트림 경로 =
+바/팝업 Renderer 간 D3D 디바이스 공유(각자 디바이스+스왑체인 소유 중).
+
 ### 6.7 알림 (M4, 스왑 전 필수 — 유저 확정 0721)
 
 - tray 벌룬(NIF_INFO): §6.2-5, 자체 팝업.
