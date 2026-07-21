@@ -27,7 +27,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA, SHAppBarMessage,
     ShellExecuteW,
@@ -79,6 +81,16 @@ struct Anim {
     active: f32,
 }
 
+struct Drag {
+    idx: usize,
+    press_x: f32,
+    cur_x: f32,
+    /// press_x − button left at press time (grab anchor).
+    offset: f32,
+    /// True once movement exceeds the click threshold.
+    active: bool,
+}
+
 struct Bar {
     hwnd: HWND,
     renderer: Renderer,
@@ -94,6 +106,7 @@ struct Bar {
     running_order: Vec<isize>,
     active: HWND,
     hover: Option<usize>,
+    drag: Option<Drag>,
     tracking_leave: bool,
     anim_timer: bool,
     last_tick: Instant,
@@ -163,6 +176,7 @@ pub fn run() -> anyhow::Result<()> {
             running_order: Vec::new(),
             active: GetForegroundWindow(),
             hover: None,
+            drag: None,
             tracking_leave: false,
             anim_timer: false,
             last_tick: Instant::now(),
@@ -305,7 +319,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_MOUSEMOVE => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
-                bar.set_hover(bar.hit_test(x));
+                if bar.drag.is_some() {
+                    bar.drag_move(x);
+                } else {
+                    bar.set_hover(bar.hit_test(x));
+                }
                 if !bar.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -324,10 +342,36 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 bar.set_hover(None);
                 LRESULT(0)
             }
-            WM_LBUTTONUP => {
+            WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(i) = bar.hit_test(x) {
-                    bar.click(i);
+                    bar.drag = Some(Drag {
+                        idx: i,
+                        press_x: x,
+                        cur_x: x,
+                        offset: x - bar.entry_left(i),
+                        active: false,
+                    });
+                    SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let _ = ReleaseCapture();
+                if let Some(d) = bar.drag.take() {
+                    if d.active {
+                        save_pins(&bar.pins);
+                        bar.paint();
+                    } else {
+                        bar.click(d.idx);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                if bar.drag.take().is_some() {
+                    save_pins(&bar.pins);
+                    bar.paint();
                 }
                 LRESULT(0)
             }
@@ -510,6 +554,78 @@ impl Bar {
         None
     }
 
+    fn entry_left(&self, i: usize) -> f32 {
+        8.0 + self.entries[..i].iter().map(|e| e.width + 4.0).sum::<f32>()
+    }
+
+    fn drag_move(&mut self, x: f32) {
+        let Some(d) = &mut self.drag else { return };
+        d.cur_x = x;
+        if !d.active && (x - d.press_x).abs() > 4.0 {
+            d.active = true;
+        }
+        if !d.active {
+            return;
+        }
+        // Swap with a neighbor when the dragged button's center crosses the
+        // neighbor's center. One swap per event; sections don't mix.
+        let idx = d.idx;
+        let center = d.cur_x - d.offset + self.entries[idx].width / 2.0;
+        if idx > 0 && self.entries[idx - 1].pinned == self.entries[idx].pinned {
+            let n_center = self.entry_left(idx - 1) + self.entries[idx - 1].width / 2.0;
+            if center < n_center {
+                self.swap_entries(idx - 1, idx);
+                if let Some(d) = &mut self.drag {
+                    d.idx = idx - 1;
+                }
+                self.paint();
+                return;
+            }
+        }
+        if idx + 1 < self.entries.len() && self.entries[idx + 1].pinned == self.entries[idx].pinned
+        {
+            let n_center = self.entry_left(idx + 1) + self.entries[idx + 1].width / 2.0;
+            if center > n_center {
+                self.swap_entries(idx, idx + 1);
+                if let Some(d) = &mut self.drag {
+                    d.idx = idx + 1;
+                }
+            }
+        }
+        self.paint();
+    }
+
+    /// Swap two adjacent entries and mirror the move into the backing order
+    /// (pins for the pin section, running_order for windows) so the next
+    /// refresh() reproduces the dropped arrangement.
+    fn swap_entries(&mut self, a: usize, b: usize) {
+        let (ea, eb) = (&self.entries[a], &self.entries[b]);
+        if ea.pinned && eb.pinned {
+            let (xa, xb) = (ea.exe.clone(), eb.exe.clone());
+            if xa != xb {
+                let pa = xa.and_then(|x| self.pins.iter().position(|p| *p == x));
+                let pb = xb.and_then(|x| self.pins.iter().position(|p| *p == x));
+                if let (Some(pa), Some(pb)) = (pa, pb) {
+                    self.pins.swap(pa, pb);
+                }
+            } else if let (Some(ha), Some(hb)) = (ea.hwnd, eb.hwnd) {
+                self.swap_running(ha, hb);
+            }
+        } else if let (Some(ha), Some(hb)) = (ea.hwnd, eb.hwnd) {
+            self.swap_running(ha, hb);
+        }
+        self.entries.swap(a, b);
+        self.entry_keys.swap(a, b);
+    }
+
+    fn swap_running(&mut self, ha: HWND, hb: HWND) {
+        let pa = self.running_order.iter().position(|k| *k == ha.0 as isize);
+        let pb = self.running_order.iter().position(|k| *k == hb.0 as isize);
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            self.running_order.swap(pa, pb);
+        }
+    }
+
     fn set_hover(&mut self, h: Option<usize>) {
         if self.hover != h {
             self.hover = h;
@@ -682,6 +798,130 @@ impl Bar {
         self.paint();
     }
 
+    /// One button at the given layout left. `floating` = the dragged copy:
+    /// solid backing so it reads as lifted above the row.
+    fn draw_entry(&self, i: usize, cx: f32, floating: bool) {
+        let r = &self.renderer;
+        let bar_h = theme::BAR_HEIGHT;
+        let e = &self.entries[i];
+        let key = self.entry_keys[i];
+        let a = self.anims.get(&key).copied().unwrap_or_default();
+        let rect = D2D_RECT_F {
+            left: cx,
+            top: 5.0,
+            right: cx + e.width,
+            bottom: bar_h - 5.0,
+        };
+        unsafe {
+            if floating {
+                if let Ok(b) = r.brush(theme::rgba(23, 24, 28, 0.92)) {
+                    r.dc.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect,
+                            radiusX: theme::BUTTON_RADIUS,
+                            radiusY: theme::BUTTON_RADIUS,
+                        },
+                        &b,
+                    );
+                }
+            }
+
+            // Fill: active wash + hover fade on top; floating gets a firm wash.
+            let mut fill_a = theme::ACTIVE_FILL.a * a.active + theme::HOVER_FILL.a * a.hover;
+            if floating {
+                fill_a = fill_a.max(theme::HOVER_FILL.a);
+            }
+            if fill_a > 0.005 {
+                if let Ok(b) = r.brush(theme::rgba(255, 255, 255, fill_a)) {
+                    r.dc.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect,
+                            radiusX: theme::BUTTON_RADIUS,
+                            radiusY: theme::BUTTON_RADIUS,
+                        },
+                        &b,
+                    );
+                }
+            }
+
+            // Icon 20×20: left-aligned in window buttons, centered in
+            // launcher slots. Launchers render dimmed.
+            let icon_left = if e.hwnd.is_some() { cx + 10.0 } else { cx + (e.width - 20.0) / 2.0 };
+            let icon_rect = D2D_RECT_F {
+                left: icon_left,
+                top: (bar_h - 20.0) / 2.0,
+                right: icon_left + 20.0,
+                bottom: (bar_h + 20.0) / 2.0,
+            };
+            let bmp = match e.hwnd {
+                Some(h) => self.icon_cache.get(&(h.0 as isize)),
+                None => e.exe.as_ref().and_then(|x| self.exe_icon_cache.get(x)),
+            };
+            let opacity = if e.hwnd.is_some() { 1.0 } else { 0.55 + 0.45 * a.hover };
+            if let Some(Some(bmp)) = bmp {
+                r.dc.DrawBitmap(
+                    bmp,
+                    Some(&icon_rect),
+                    opacity,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    None,
+                    None,
+                );
+            } else if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.5 * opacity)) {
+                r.dc.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: icon_rect, radiusX: 4.0, radiusY: 4.0 },
+                    &b,
+                );
+            }
+
+            // Title (window buttons only), clipped to the button.
+            if e.hwnd.is_some() {
+                let text_color = if e.flash { theme::FLASH } else { theme::TEXT };
+                if let Ok(b) = r.brush(text_color) {
+                    let text_rect = D2D_RECT_F {
+                        left: cx + 38.0,
+                        top: 0.0,
+                        right: cx + e.width - 10.0,
+                        bottom: bar_h,
+                    };
+                    r.dc.DrawText(
+                        &e.title,
+                        &r.fmt_title,
+                        &text_rect,
+                        &b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+
+            // Active underline: grows from the center (glide accent-pill
+            // gesture), amber when flashing. Window buttons only.
+            let grow = a.active;
+            if e.hwnd.is_some() && (grow > 0.01 || e.flash) {
+                let full = e.width - 28.0;
+                let w = if e.flash { full } else { 8.0 + (full - 8.0) * grow };
+                let mid = cx + e.width / 2.0;
+                let color = if e.flash { theme::FLASH } else { theme::ACCENT };
+                if let Ok(b) = r.brush(color) {
+                    r.dc.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: mid - w / 2.0,
+                                top: bar_h - theme::UNDERLINE_H - 2.0,
+                                right: mid + w / 2.0,
+                                bottom: bar_h - 2.0,
+                            },
+                            radiusX: theme::UNDERLINE_H / 2.0,
+                            radiusY: theme::UNDERLINE_H / 2.0,
+                        },
+                        &b,
+                    );
+                }
+            }
+        }
+    }
+
     fn paint(&mut self) {
         let r = &self.renderer;
         let scale = self.scale();
@@ -698,111 +938,19 @@ impl Bar {
                 );
             }
 
+            let dragging = self
+                .drag
+                .as_ref()
+                .filter(|d| d.active)
+                .map(|d| (d.idx, d.cur_x - d.offset));
             let mut cx = 8.0;
             let mut pin_section_end: Option<f32> = None;
             for (i, e) in self.entries.iter().enumerate() {
                 if e.pinned {
                     pin_section_end = Some(cx + e.width);
                 }
-                let key = self.entry_keys[i];
-                let a = self.anims.get(&key).copied().unwrap_or_default();
-                let rect = D2D_RECT_F {
-                    left: cx,
-                    top: 5.0,
-                    right: cx + e.width,
-                    bottom: bar_h - 5.0,
-                };
-
-                // Fill: active wash + hover fade on top.
-                let mut fill_a = theme::ACTIVE_FILL.a * a.active;
-                fill_a += theme::HOVER_FILL.a * a.hover;
-                if fill_a > 0.005 {
-                    if let Ok(b) = r.brush(theme::rgba(255, 255, 255, fill_a)) {
-                        r.dc.FillRoundedRectangle(
-                            &D2D1_ROUNDED_RECT {
-                                rect,
-                                radiusX: theme::BUTTON_RADIUS,
-                                radiusY: theme::BUTTON_RADIUS,
-                            },
-                            &b,
-                        );
-                    }
-                }
-
-                // Icon 20×20: left-aligned in window buttons, centered in
-                // launcher slots. Launchers render dimmed.
-                let icon_left = if e.hwnd.is_some() { cx + 10.0 } else { cx + (e.width - 20.0) / 2.0 };
-                let icon_rect = D2D_RECT_F {
-                    left: icon_left,
-                    top: (bar_h - 20.0) / 2.0,
-                    right: icon_left + 20.0,
-                    bottom: (bar_h + 20.0) / 2.0,
-                };
-                let bmp = match e.hwnd {
-                    Some(h) => self.icon_cache.get(&(h.0 as isize)),
-                    None => e.exe.as_ref().and_then(|x| self.exe_icon_cache.get(x)),
-                };
-                let opacity = if e.hwnd.is_some() { 1.0 } else { 0.55 + 0.45 * a.hover };
-                if let Some(Some(bmp)) = bmp {
-                    r.dc.DrawBitmap(
-                        bmp,
-                        Some(&icon_rect),
-                        opacity,
-                        D2D1_INTERPOLATION_MODE_LINEAR,
-                        None,
-                        None,
-                    );
-                } else if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.5 * opacity)) {
-                    r.dc.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT { rect: icon_rect, radiusX: 4.0, radiusY: 4.0 },
-                        &b,
-                    );
-                }
-
-                // Title (window buttons only), clipped to the button.
-                if e.hwnd.is_some() {
-                    let text_color = if e.flash { theme::FLASH } else { theme::TEXT };
-                    if let Ok(b) = r.brush(text_color) {
-                        let text_rect = D2D_RECT_F {
-                            left: cx + 38.0,
-                            top: 0.0,
-                            right: cx + e.width - 10.0,
-                            bottom: bar_h,
-                        };
-                        r.dc.DrawText(
-                            &e.title,
-                            &r.fmt_title,
-                            &text_rect,
-                            &b,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                            DWRITE_MEASURING_MODE_NATURAL,
-                        );
-                    }
-                }
-
-                // Active underline: grows from the center (glide accent-pill
-                // gesture), amber when flashing. Window buttons only.
-                let grow = a.active;
-                if e.hwnd.is_some() && (grow > 0.01 || e.flash) {
-                    let full = e.width - 28.0;
-                    let w = if e.flash { full } else { 8.0 + (full - 8.0) * grow };
-                    let mid = cx + e.width / 2.0;
-                    let color = if e.flash { theme::FLASH } else { theme::ACCENT };
-                    if let Ok(b) = r.brush(color) {
-                        r.dc.FillRoundedRectangle(
-                            &D2D1_ROUNDED_RECT {
-                                rect: D2D_RECT_F {
-                                    left: mid - w / 2.0,
-                                    top: bar_h - theme::UNDERLINE_H - 2.0,
-                                    right: mid + w / 2.0,
-                                    bottom: bar_h - 2.0,
-                                },
-                                radiusX: theme::UNDERLINE_H / 2.0,
-                                radiusY: theme::UNDERLINE_H / 2.0,
-                            },
-                            &b,
-                        );
-                    }
+                if dragging.map(|(di, _)| di) != Some(i) {
+                    self.draw_entry(i, cx, false);
                 }
                 cx += e.width + 4.0;
             }
@@ -856,6 +1004,13 @@ impl Bar {
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
+            }
+
+            // Dragged button floats on top, following the cursor.
+            if let Some((di, float_left)) = dragging {
+                let w = self.entries[di].width;
+                let left = float_left.clamp(8.0, (self.width - CLOCK_W - w - 4.0).max(8.0));
+                self.draw_entry(di, left, true);
             }
 
             let end = r.dc.EndDraw(None, None);
