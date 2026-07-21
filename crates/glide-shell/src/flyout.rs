@@ -69,7 +69,7 @@ pub struct Flyout {
     fmt_big: IDWriteTextFormat,
     fmt_pct: IDWriteTextFormat,
     fmt_g16: IDWriteTextFormat,
-    fmt_g22: IDWriteTextFormat,
+    fmt_g30: IDWriteTextFormat,
     pub kind: Option<Kind>,
     scale: f32,
     w: f32,
@@ -94,7 +94,6 @@ pub struct Flyout {
     // battery
     battery: Option<(u8, bool)>,
     charging: bool,
-    life_secs: u32,
 }
 
 impl Flyout {
@@ -178,9 +177,9 @@ impl Flyout {
             let fmt_g16 = mkg(16.0)?;
             fmt_g16.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             fmt_g16.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let fmt_g22 = mkg(22.0)?;
-            fmt_g22.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            fmt_g22.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_g30 = mkg(30.0)?;
+            fmt_g30.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_g30.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             Ok(Flyout {
                 hwnd,
@@ -189,7 +188,7 @@ impl Flyout {
                 fmt_big,
                 fmt_pct,
                 fmt_g16,
-                fmt_g22,
+                fmt_g30,
                 kind: None,
                 scale: dpi / 96.0,
                 w: 0.0,
@@ -211,7 +210,6 @@ impl Flyout {
                 connecting: None,
                 battery: None,
                 charging: false,
-                life_secs: u32::MAX,
             })
         }
     }
@@ -346,7 +344,6 @@ impl Flyout {
                 self.battery = Some((sps.BatteryLifePercent.min(100), sps.ACLineStatus == 1));
             }
             self.charging = sps.BatteryFlag & 8 != 0;
-            self.life_secs = sps.BatteryLifeTime;
         }
     }
 
@@ -387,9 +384,9 @@ impl Flyout {
                 }
             }
             Some(Kind::Battery) => {
-                let before = (self.battery, self.charging, self.life_secs / 60);
+                let before = (self.battery, self.charging);
                 self.poll_battery();
-                if (self.battery, self.charging, self.life_secs / 60) != before {
+                if (self.battery, self.charging) != before {
                     self.paint();
                 }
             }
@@ -649,26 +646,20 @@ impl Flyout {
         let Some((p, ac)) = self.battery else { return };
         self.glyph(
             crate::status::battery_glyph(p, self.charging),
-            &self.fmt_g22.clone(),
-            rect(14.0, 14.0, 56.0, 62.0),
+            &self.fmt_g30.clone(),
+            rect(14.0, 10.0, 70.0, 64.0),
             theme::TEXT,
         );
-        self.text(&format!("{p}%"), &self.fmt_big.clone(), rect(64.0, 14.0, 260.0, 62.0), theme::TEXT);
+        self.text(&format!("{p}%"), &self.fmt_big.clone(), rect(78.0, 14.0, 260.0, 62.0), theme::TEXT);
 
+        // No runtime estimate on purpose — Windows' BatteryLifeTime numbers
+        // are garbage (user verdict 0721), state only.
         let sub = if ac {
-            if self.charging { "전원 연결됨 · 충전 중".to_string() } else { "전원 연결됨".to_string() }
-        } else if self.life_secs != u32::MAX {
-            let h = self.life_secs / 3600;
-            let m = (self.life_secs % 3600) / 60;
-            if h > 0 {
-                format!("약 {h}시간 {m}분 사용 가능")
-            } else {
-                format!("약 {m}분 사용 가능")
-            }
+            if self.charging { "전원 연결됨 · 충전 중" } else { "전원 연결됨" }
         } else {
-            "배터리 사용 중".to_string()
+            "배터리 사용 중"
         };
-        self.text(&sub, &self.renderer.fmt_title.clone(), rect(16.0, 66.0, 328.0, 90.0), theme::TEXT_DIM);
+        self.text(sub, &self.renderer.fmt_title.clone(), rect(16.0, 66.0, 328.0, 90.0), theme::TEXT_DIM);
 
         let sep = 94.0;
         self.fill_round(rect(14.0, sep, 330.0, sep + 1.0), 0.0, theme::rgba(255, 255, 255, 0.08));

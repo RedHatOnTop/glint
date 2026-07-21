@@ -336,7 +336,8 @@ SetForegroundWindow 거부 대비 1Hz 타이머가 상태 갱신 + 닫힘 폴백
   SSID 중복 제거 스캔 목록(신호 4단계 글리프/자물쇠/연결됨), 저장 프로필 클릭 =
   `WlanConnect`, 미저장 = ms-settings 이관, 하단 설정 딥링크. `wifi.rs` = wlanapi
   래퍼(첫 인터페이스만).
-- **배터리**: % 크게 + 상태 + `BatteryLifeTime` 잔여 추정 + 전원 설정 딥링크.
+- **배터리**: 글리프 30px + % 크게 + 상태 + 전원 설정 딥링크. `BatteryLifeTime`
+  잔여 추정은 넣었다가 삭제 — "윈도우 배터리타임 추정은 쓰레기" (유저 판정 0721).
 
 함정 재확인: **WM_MOUSELEAVE는 WindowsAndMessaging 미수출 — match 패턴에 쓰면
 전부 잡아먹는 바인딩이 됨**(taskbar.rs처럼 로컬 const). WlanConnect는
