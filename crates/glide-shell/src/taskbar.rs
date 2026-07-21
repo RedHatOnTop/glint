@@ -168,8 +168,11 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
 
         let mon = primary_monitor_rect();
         // Rough initial placement; the appbar negotiation below moves us.
+        // TOPMOST like explorer's taskbar: without it any normal window that
+        // ignores the work area (Zetile tiles the full monitor) sits over the
+        // bar and swallows its clicks. Fullscreen-app auto-hide is an M6 item.
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
             class,
             w!("glide-shell taskbar"),
             WS_POPUP,
@@ -274,6 +277,49 @@ fn save_pins(pins: &[String]) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(p, pins.join("\n"));
+}
+
+/// Bring a window to the foreground from this WS_EX_NOACTIVATE bar.
+///
+/// Plain SetForegroundWindow loses the foreground-lock fight: our click never
+/// made us the foreground process, so the system refuses the switch (the tray
+/// had the mirror problem — see AllowSetForegroundWindow in tray_forward).
+/// Borrow the current foreground thread's input state via AttachThreadInput;
+/// as a last resort tap Alt, which resets the lock (the keybd_event
+/// workaround every shell replacement ends up shipping).
+fn force_foreground(hwnd: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
+        VK_MENU,
+    };
+    unsafe {
+        if SetForegroundWindow(hwnd).as_bool() {
+            return;
+        }
+        let fg = GetForegroundWindow();
+        if !fg.is_invalid() {
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            let our_tid = GetCurrentThreadId();
+            if fg_tid != 0 && fg_tid != our_tid {
+                let _ = AttachThreadInput(our_tid, fg_tid, true);
+                let ok = SetForegroundWindow(hwnd).as_bool();
+                let _ = AttachThreadInput(our_tid, fg_tid, false);
+                if ok {
+                    return;
+                }
+            }
+        }
+        let mk = |flags: KEYBD_EVENT_FLAGS| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: VK_MENU, dwFlags: flags, ..Default::default() },
+            },
+        };
+        let inputs = [mk(KEYBD_EVENT_FLAGS(0)), mk(KEYEVENTF_KEYUP)];
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(hwnd);
+    }
 }
 
 fn window_exe(hwnd: HWND) -> Option<String> {
@@ -434,9 +480,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                // Take the drag BEFORE ReleaseCapture: ReleaseCapture sends
+                // WM_CAPTURECHANGED synchronously and that arm would consume
+                // the drag first, eating the click.
+                let pending = bar.drag.take();
                 let _ = ReleaseCapture();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
-                if let Some(d) = bar.drag.take() {
+                if let Some(d) = pending {
                     if d.active {
                         save_pins(&bar.pins);
                         bar.paint();
@@ -917,7 +967,7 @@ impl Bar {
                         if IsIconic(h).as_bool() {
                             let _ = ShowWindow(h, SW_RESTORE);
                         }
-                        let _ = SetForegroundWindow(h);
+                        force_foreground(h);
                     }
                 }
                 None => {
@@ -1487,7 +1537,9 @@ fn enumerate_taskbar_windows(own: HWND) -> Vec<HWND> {
                 &mut cloaked as *mut _ as *mut _,
                 4,
             );
-            if cloaked != 0 {
+            // Minimized XAML/UWP windows (Win11 notepad included) report
+            // cloaked — they still belong on the taskbar.
+            if cloaked != 0 && !IsIconic(hwnd).as_bool() {
                 return true.into();
             }
             let mut title = [0u16; 8];
