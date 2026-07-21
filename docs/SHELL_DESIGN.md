@@ -212,6 +212,14 @@ DPI: Per-Monitor v2 매니페스트 + WM_DPICHANGED에서 메트릭 재계산 �
 - **풀스크린 회피**: 포그라운드 창 rect가 모니터 전체를 덮으면 바 숨김(게임/동영상).
   explorer도 같은 휴리스틱.
 
+**SHIPPED 추가 (0721, 3494f71) — 빈 영역 우클릭 메뉴**: 버튼/트레이/상태 셀 밖 우클릭
+= 작업 관리자 / glide-shell 다시 시작 / glide-shell 종료. 다시 시작 =
+`current_exe` respawn(`CREATE_NO_WINDOW`) 후 PostQuitMessage — 새 인스턴스 appbar
+슬롯은 ABN_POSCHANGED로 자연 정착. 하우스 패턴(SFW → TrackPopupMenu
+TPM_RETURNCMD|TPM_BOTTOMALIGN, 프로세스-와이드 다크 메뉴) 그대로. 라이브 검증:
+유휴 게이트 + WM_RBUTTONUP 주입, 다크 렌더 + WM_CANCELMODE 해제 확인. 다시
+시작/종료 항목 자체는 스크립트 실행 금지(도그푸드 바가 죽음) — 도그푸드에서 검증.
+
 ### 6.2 tray — Shell_TrayWnd 프로토콜 (M2, 최고 난이도)
 
 모든 셸 대체 프로젝트가 쓰는 리버스드-그러나-30년-안정 프로토콜:
