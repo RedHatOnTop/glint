@@ -324,6 +324,29 @@ WM_LBUTTONDBLCLK 포워딩. explorer-kill 세션에서 Everything 트레이 클�
 축소 → 닫으면 원복. **RAM WS 84.5 / private 66.2 MB — 40 예산 초과.** 트림 경로 =
 바/팝업 Renderer 간 D3D 디바이스 공유(각자 디바이스+스왑체인 소유 중).
 
+### 6.6.2 상태 플라이아웃 (0721, 유저 요청 "Win10처럼")
+
+셀 클릭 → 클러스터 위 패널 1창(`flyout.rs`). preview와 달리 **입력을 받는** 팝업:
+NOACTIVATE/TRANSPARENT 없음, 포커스 잃으면/Esc/같은 셀 재클릭이면 닫힘(Win10 동작).
+SetForegroundWindow 거부 대비 1Hz 타이머가 상태 갱신 + 닫힘 폴백 겸용.
+
+- **볼륨**: 기본 엔드포인트 이름(IMMDevice property store) + 음소거 버튼 + 슬라이더
+  (드래그=해제 동반, 휠 병행) + % 라벨. 셀 클릭의 음소거 토글은 패널 안으로 이동.
+- **네트워크**: Wi-Fi 라디오 토글 pill(`WlanSetInterface` phy별 software state),
+  SSID 중복 제거 스캔 목록(신호 4단계 글리프/자물쇠/연결됨), 저장 프로필 클릭 =
+  `WlanConnect`, 미저장 = ms-settings 이관, 하단 설정 딥링크. `wifi.rs` = wlanapi
+  래퍼(첫 인터페이스만).
+- **배터리**: % 크게 + 상태 + `BatteryLifeTime` 잔여 추정 + 전원 설정 딥링크.
+
+함정 재확인: **WM_MOUSELEAVE는 WindowsAndMessaging 미수출 — match 패턴에 쓰면
+전부 잡아먹는 바인딩이 됨**(taskbar.rs처럼 로컬 const). WlanConnect는
+`Win32_NetworkManagement_Ndis` 피처 게이트.
+
+라이브 검증 0721: 볼륨(장치명 "헤드폰(WF-1000XM5)"·실제 40% 위치), 네트워크(실
+SSID 5개·연결됨 표시·신호별 글리프·토글 on), 배터리(51%·"약 48분 사용 가능"),
+바깥 클릭 닫힘. 미검증: 슬라이더 드래그, Wi-Fi 토글 off/on(통화 중 회선이라 불가),
+프로필 connect. RAM private 79.2MB — D3D 디바이스 3개째, 공유가 트림 경로.
+
 ### 6.7 알림 (M4, 스왑 전 필수 — 유저 확정 0721)
 
 - tray 벌룬(NIF_INFO): §6.2-5, 자체 팝업.

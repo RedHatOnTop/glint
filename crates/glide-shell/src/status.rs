@@ -143,15 +143,6 @@ impl Status {
         }
     }
 
-    pub fn toggle_mute(&mut self) {
-        unsafe {
-            if let (Some(ep), Some((_, muted))) = (&self.endpoint, self.volume) {
-                let _ = ep.SetMute(!muted, std::ptr::null());
-            }
-        }
-        self.poll_volume();
-    }
-
     /// Wheel over the volume cell: ±steps of 2%.
     pub fn adjust_volume(&mut self, steps: f32) {
         unsafe {

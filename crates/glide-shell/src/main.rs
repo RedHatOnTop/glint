@@ -4,6 +4,7 @@
 //! above the stock bar). `--spike-toasts` is the M4 gating spike, kept for
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
+mod flyout;
 mod icons;
 mod preview;
 mod render;
@@ -12,6 +13,7 @@ mod status;
 mod taskbar;
 mod theme;
 mod tray;
+mod wifi;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -139,6 +139,7 @@ pub struct Bar {
     status: crate::status::Status,
     status_hover: Option<usize>,
     preview: crate::preview::Preview,
+    flyout: crate::flyout::Flyout,
 }
 
 /// Cells in the status cluster, left→right; presence varies (no battery on
@@ -234,6 +235,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             status: crate::status::Status::new(),
             status_hover: None,
             preview: crate::preview::Preview::new(dpi)?,
+            flyout: crate::flyout::Flyout::new(dpi)?,
         };
         bar.refresh();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
@@ -524,12 +526,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 } else if let Some(s) = bar.status_hit(x) {
                     match bar.status_cells().get(s) {
-                        Some(StatusCell::Vol) => {
-                            bar.status.toggle_mute();
-                            bar.paint();
-                        }
                         Some(StatusCell::Ime) => crate::status::send_hangul_key(),
-                        _ => {}
+                        // Win10-style flyout panels; mute moved into the
+                        // volume panel's speaker button.
+                        Some(StatusCell::Vol) => {
+                            bar.flyout_toggle(hwnd, crate::flyout::Kind::Volume)
+                        }
+                        Some(StatusCell::Net) => {
+                            bar.flyout_toggle(hwnd, crate::flyout::Kind::Network)
+                        }
+                        Some(StatusCell::Bat) => {
+                            bar.flyout_toggle(hwnd, crate::flyout::Kind::Battery)
+                        }
+                        None => {}
                     }
                 }
                 LRESULT(0)
@@ -920,8 +929,30 @@ impl Bar {
         }
     }
 
+    /// Toggle a status-cell flyout: same cell closes, another cell switches.
+    fn flyout_toggle(&mut self, hwnd: HWND, kind: crate::flyout::Kind) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+        }
+        self.preview.hide();
+        if self.flyout.kind == Some(kind) {
+            self.flyout.hide();
+        } else {
+            let mut rect = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(self.hwnd, &mut rect);
+            }
+            self.flyout.open(kind, rect);
+        }
+    }
+
     /// Hover settled or moved: open/retarget/close the preview popup.
     fn schedule_preview(&mut self, hwnd: HWND) {
+        // No tooltips while a flyout panel is up — they'd fight for the same
+        // spot above the status cluster.
+        if self.flyout.kind.is_some() {
+            return;
+        }
         unsafe {
             if self.hover.is_none() && self.tray_hover.is_none() && self.status_hover.is_none() {
                 let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
@@ -1005,8 +1036,8 @@ impl Bar {
                     }
                 }
                 StatusCell::Vol => match self.status.volume {
-                    Some((_, true)) => "음소거 — 클릭하여 해제".to_string(),
-                    Some((v, false)) => format!("볼륨 {:.0}% — 휠로 조절", v * 100.0),
+                    Some((_, true)) => "음소거".to_string(),
+                    Some((v, false)) => format!("볼륨 {:.0}%", v * 100.0),
                     None => "오디오 장치 없음".to_string(),
                 },
                 StatusCell::Bat => match self.status.battery {
