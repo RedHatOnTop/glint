@@ -21,6 +21,32 @@ pub fn window_icon(dc: &ID2D1DeviceContext, hwnd: HWND) -> Option<ID2D1Bitmap1> 
     hicon_to_bitmap(dc, hicon)
 }
 
+/// Icon extracted from an exe on disk, for pinned launchers. Unlike window
+/// icons (owned by the target app), this HICON is ours and must be destroyed.
+pub fn exe_icon(dc: &ID2D1DeviceContext, path: &str) -> Option<ID2D1Bitmap1> {
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGetFileInfoW};
+    use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+    use windows::core::PCWSTR;
+    unsafe {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sfi = SHFILEINFOW::default();
+        let ok = SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut sfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if ok == 0 || sfi.hIcon.is_invalid() {
+            return None;
+        }
+        let bmp = hicon_to_bitmap(dc, sfi.hIcon);
+        let _ = DestroyIcon(sfi.hIcon);
+        bmp
+    }
+}
+
 fn query_hicon(hwnd: HWND) -> Option<HICON> {
     unsafe {
         for kind in [ICON_SMALL2, ICON_SMALL, ICON_BIG] {
