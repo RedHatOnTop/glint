@@ -10,6 +10,7 @@ mod flyout;
 mod icons;
 mod preview;
 mod render;
+mod shellmenu;
 mod spike_toasts;
 mod status;
 mod taskbar;

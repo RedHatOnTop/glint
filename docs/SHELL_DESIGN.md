@@ -290,8 +290,24 @@ M7 스왑의 예행연습이 된다.
   무효화 + 벽지 재스케일.
 - 진단 스위치: `GLIDE_DESK_OFF=1`(창 자체 생략), `GLIDE_DESK_BARE=1`(벽지·아이콘
   생략) — RAM 3단 측정용(41.4 / 45.0 / 92.4MB).
-- v1 미포함(다음 라운드): 우클릭 IContextMenu, 아이콘 위치 저장(탐색기 ItemPos
-  블롭 미사용 — 자동 정렬), 파일 워처 새로고침, 키보드, 빈 곳 더블클릭 glide 열기.
+- **우클릭 구현됨 (0721, shellmenu.rs)** — glide shellmenu.rs 이식판.
+  아이템 = 셸 verb 전부 유지(자체 파일 연산 없음 → 필터 없음), 다중 선택은
+  클릭 아이템과 같은 부모의 선택 항목들을 child pidl 배열로 하나의
+  GetUIObjectOf에 전달(유저/공용 Desktop 혼합 선택은 클릭 쪽 부모만).
+  배경 = CreateViewObject + 커스텀(새로 고침/glide로 열기/디스플레이·개인 설정,
+  §6.3 원설계). 보기/정렬은 DefView 전용이라 원래 안 나옴(수용).
+  다크 메뉴 = uxtheme ordinal 135 SetPreferredAppMode(AllowDark)+136
+  FlushMenuThemes, GetProcAddress 가드(실패=밝은 메뉴). NOACTIVATE 창의 모달
+  메뉴: SetForegroundWindow 선행 + Track 후 WM_NULL 포스트. **wndproc 재진입
+  주의**: TrackPopupMenuEx가 이 wndproc을 펌프하므로 desk &mut 빌림을 메뉴
+  호출 전에 끊고 결과 처리 때 GWLP_USERDATA 재역참조. 검증: 배경 메뉴
+  라이브(유휴 15s 게이트 + WM_CANCELMODE 강제 해제 rig) — 다크+커스텀+셸 확장
+  항목 렌더 확인; 셸 확장 하나가 index 0에 "새 폴더"를 끼워 커스텀 위에 뜸
+  (코스메틱 수용). **아이템 메뉴는 라이브 미검증**(위험 verb 때문에 rig 금지 —
+  유저 자연 사용으로 검증). 메뉴 verb 실행 후 refresh_all(시그니처 무효화+
+  재로드).
+- v1 미포함(다음 라운드): 아이콘 위치 저장(탐색기 ItemPos 블롭 미사용 — 자동
+  정렬), 파일 워처 새로고침, 키보드, 빈 곳 더블클릭 glide 열기.
 - **glide-shell.exe는 콘솔 서브시스템** — 직접 실행하면 콘솔 창이 뜬다. 도그푸드
   실행은 `Start-Process -WindowStyle Hidden`(stderr 리다이렉트 겸용).
 

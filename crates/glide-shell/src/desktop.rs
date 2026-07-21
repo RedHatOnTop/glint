@@ -4,10 +4,10 @@
 //! stock desktop (same items, our rendering), after the swap it IS the
 //! desktop.
 //!
-//! v1 scope: select (click / Ctrl / marquee), double-click open, wallpaper
-//! reload on WM_SETTINGCHANGE. Not yet: explorer's saved icon positions
-//! (undocumented ItemPos blobs — we auto-arrange), context menu, drag,
-//! keyboard. Recorded in §6.3.
+//! v1 scope: select (click / Ctrl / marquee), double-click open, right-click
+//! shell context menu (shellmenu.rs), wallpaper reload on WM_SETTINGCHANGE.
+//! Not yet: explorer's saved icon positions (undocumented ItemPos blobs — we
+//! auto-arrange), drag, keyboard. Recorded in §6.3.
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +48,19 @@ use crate::render::Renderer;
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+// Background context menu, our own entries (SHELL_DESIGN §6.3).
+const ID_REFRESH: u32 = 1;
+const ID_GLIDE: u32 = 2;
+const ID_DISPLAY: u32 = 3;
+const ID_PERSONAL: u32 = 4;
+const BG_CUSTOM: [crate::shellmenu::CustomItem; 5] = [
+    (ID_REFRESH, "새로 고침", true),
+    (ID_GLIDE, "glide로 열기", true),
+    (0, "", true),
+    (ID_DISPLAY, "디스플레이 설정", true),
+    (ID_PERSONAL, "개인 설정", true),
+];
 
 const CELL_W: f32 = 84.0;
 const CELL_H: f32 = 98.0;
@@ -167,6 +180,7 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
         });
         desk.load_wallpaper();
         desk.load_items();
+        crate::shellmenu::enable_dark_menus();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::leak(desk) as *mut Desktop as isize);
 
         let _ = SetWindowPos(
@@ -457,6 +471,14 @@ impl Desktop {
         }
     }
 
+    /// Folder contents changed under us (shell verb, user request).
+    fn refresh_all(&mut self) {
+        self.items_sig.0.clear();
+        self.load_items();
+        self.load_wallpaper();
+        self.paint();
+    }
+
     fn marquee_apply(&mut self) {
         let Some(m) = &self.marquee else { return };
         let (l, t) = (m.x0.min(m.x1), m.y0.min(m.y1));
@@ -480,6 +502,50 @@ fn fill_round(r: &Renderer, rc: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
                 &b,
             );
         }
+    }
+}
+
+fn open_uri(uri: &str) {
+    unsafe {
+        let wide: Vec<u16> = uri.encode_utf16().chain(std::iter::once(0)).collect();
+        ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+/// Sibling glide.exe on the Desktop folder; its single-instance pipe folds
+/// repeat opens into tabs.
+fn open_glide() {
+    let Some(dir) = std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Desktop"))
+    else {
+        return;
+    };
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("glide.exe")))
+        .filter(|p| p.exists())
+    else {
+        eprintln!("glide-shell: glide.exe not found next to shell");
+        return;
+    };
+    unsafe {
+        let exe_w: Vec<u16> = exe
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let arg_w: Vec<u16> = format!("\"{}\"", dir.display())
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(exe_w.as_ptr()),
+            PCWSTR(arg_w.as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -681,6 +747,82 @@ extern "system" fn desktop_wndproc(
             WM_CAPTURECHANGED => {
                 if desk.marquee.take().is_some() {
                     desk.paint();
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                // Explorer semantics: right-press retargets the selection.
+                let (x, y) = (lx(desk), ly(desk));
+                match desk.hit(x, y) {
+                    Some(i) if !desk.items[i].selected => {
+                        for it in &mut desk.items {
+                            it.selected = false;
+                        }
+                        desk.items[i].selected = true;
+                        desk.paint();
+                    }
+                    None => {
+                        let any = desk.items.iter().any(|it| it.selected);
+                        for it in &mut desk.items {
+                            it.selected = false;
+                        }
+                        if any {
+                            desk.paint();
+                        }
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = (lx(desk), ly(desk));
+                let hit = desk.hit(x, y);
+                let paths: Vec<PathBuf> = match hit {
+                    Some(i) => {
+                        // Whole selection, but only siblings of the clicked
+                        // item — one IShellFolder serves the menu.
+                        let parent = desk.items[i].path.parent().map(Path::to_path_buf);
+                        let mut sel: Vec<PathBuf> = desk
+                            .items
+                            .iter()
+                            .filter(|it| {
+                                it.selected
+                                    && it.path.parent().map(Path::to_path_buf) == parent
+                            })
+                            .map(|it| it.path.clone())
+                            .collect();
+                        if sel.is_empty() {
+                            sel.push(desk.items[i].path.clone());
+                        }
+                        sel
+                    }
+                    None => Vec::new(),
+                };
+                // Menus on a NOACTIVATE window only dismiss properly with
+                // foreground; the user's click grants us the SFW right.
+                let _ = SetForegroundWindow(hwnd);
+                // TrackPopupMenuEx pumps this wndproc reentrantly — the desk
+                // borrow must not live across it (last use was `paths`).
+                let outcome = if hit.is_some() {
+                    crate::shellmenu::show_item_menu(hwnd, &paths)
+                } else {
+                    match std::env::var("USERPROFILE") {
+                        Ok(p) => crate::shellmenu::show_background_menu(
+                            hwnd,
+                            &PathBuf::from(p).join("Desktop"),
+                            &BG_CUSTOM,
+                        ),
+                        Err(_) => return LRESULT(0),
+                    }
+                };
+                let desk = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop);
+                use crate::shellmenu::MenuOutcome;
+                match outcome {
+                    MenuOutcome::Invoked | MenuOutcome::Custom(ID_REFRESH) => desk.refresh_all(),
+                    MenuOutcome::Custom(ID_GLIDE) => open_glide(),
+                    MenuOutcome::Custom(ID_DISPLAY) => open_uri("ms-settings:display"),
+                    MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
+                    _ => {}
                 }
                 LRESULT(0)
             }
