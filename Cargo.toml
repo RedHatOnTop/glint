@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/glint", "crates/glide", "crates/glint-core"]
+
+[workspace.dependencies]
+glint-core = { path = "crates/glint-core" }
+egui = "0.33.3"
+eframe = "0.33.3"
+anyhow = "1.0.104"
+open = "5.4.0"
+winreg = "0.56.0"
+raw-window-handle = "0.6"
+log = "0.4.33"
+env_logger = "0.11.11"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_UI_Shell_Common",
+    "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Registry",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

@@ -1,0 +1,12 @@
+[package]
+name = "glint"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glint-core.workspace = true
+egui.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+log.workspace = true
+global-hotkey = "0.8.0"

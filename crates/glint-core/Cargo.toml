@@ -1,0 +1,14 @@
+[package]
+name = "glint-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+open.workspace = true
+winreg.workspace = true
+raw-window-handle.workspace = true
+windows.workspace = true
+everything-sdk = "0.0.6"

@@ -1,0 +1,14 @@
+[package]
+name = "glide"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glint-core.workspace = true
+egui.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+open.workspace = true
+chrono = "0.4"
+windows.workspace = true
+winreg.workspace = true
