@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows_numerics::Vector2;
 use windows::Win32::Graphics::Direct2D::{
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
 };
@@ -21,7 +22,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ValidateRect,
+    GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ScreenToClient,
+    ValidateRect,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -44,6 +46,8 @@ const WM_APPBAR: u32 = WM_APP + 1;
 // In windows-rs metadata this lives in Win32_UI_Controls; not worth the
 // feature for one message id.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Shell_NotifyIcon v4 event codes (WM_USER-relative on the wire).
+const NIN_SELECT: u32 = 0x0400;
 const ABN_POSCHANGED_ID: usize = 1;
 const TIMER_CLOCK: usize = 1;
 const TIMER_ANIM: usize = 2;
@@ -51,6 +55,7 @@ const TIMER_RESYNC: usize = 3;
 const CLOCK_W: f32 = 84.0;
 const LAUNCHER_W: f32 = 40.0;
 const TRAY_CELL_W: f32 = 24.0;
+const STATUS_CELL_W: f32 = 26.0;
 const MENU_PIN: usize = 1;
 const MENU_UNPIN: usize = 2;
 const MENU_CLOSE: usize = 3;
@@ -125,13 +130,32 @@ pub struct Bar {
     width: f32, // logical
     tray_icons: Vec<TrayIcon>,
     tray_hover: Option<usize>,
+    status: crate::status::Status,
+    status_hover: Option<usize>,
+}
+
+/// Cells in the status cluster, left→right; presence varies (no battery on
+/// desktops, no 한/영 on non-Korean layouts).
+#[derive(Clone, Copy, PartialEq)]
+enum StatusCell {
+    Ime,
+    Net,
+    Vol,
+    Bat,
 }
 
 pub fn run(claim_tray: bool) -> anyhow::Result<()> {
     unsafe {
+        // Status cluster (volume/network) talks COM on this thread.
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
         let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
         let class = w!("glide_shell_bar");
         let wc = WNDCLASSW {
+            // CS_DBLCLKS: legacy tray icons act on WM_LBUTTONDBLCLK.
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance.into(),
             lpszClassName: class,
@@ -197,6 +221,8 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             width: w_px as f32 / scale,
             tray_icons: Vec::new(),
             tray_hover: None,
+            status: crate::status::Status::new(),
+            status_hover: None,
         };
         bar.refresh();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
@@ -328,7 +354,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_ERASEBKGND => LRESULT(1),
             WM_TIMER => {
                 match wparam.0 {
-                    TIMER_CLOCK => bar.paint(),
+                    TIMER_CLOCK => {
+                        bar.status.poll();
+                        bar.paint();
+                    }
                     TIMER_ANIM => bar.tick_anims(),
                     TIMER_RESYNC => bar.resync(),
                     _ => {}
@@ -341,11 +370,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     bar.drag_move(x);
                 } else {
                     let th = bar.tray_hit(x);
-                    if th != bar.tray_hover {
+                    let sh = bar.status_hit(x);
+                    if th != bar.tray_hover || sh != bar.status_hover {
                         bar.tray_hover = th;
+                        bar.status_hover = sh;
                         bar.paint();
                     }
-                    bar.set_hover(if th.is_none() { bar.hit_test(x) } else { None });
+                    bar.set_hover(if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None });
                 }
                 if !bar.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
@@ -362,6 +393,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_MOUSELEAVE => {
                 bar.tracking_leave = false;
+                if bar.tray_hover.take().is_some() | bar.status_hover.take().is_some() {
+                    bar.paint();
+                }
                 bar.set_hover(None);
                 LRESULT(0)
             }
@@ -369,6 +403,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(t) = bar.tray_hit(x) {
                     bar.tray_forward(t, WM_LBUTTONDOWN);
+                } else if let Some(i) = bar.hit_test(x) {
+                    bar.drag = Some(Drag {
+                        idx: i,
+                        press_x: x,
+                        cur_x: x,
+                        offset: x - bar.entry_left(i),
+                        active: false,
+                    });
+                    SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                // CS_DBLCLKS swallows the second LBUTTONDOWN of a fast pair;
+                // tray icons get the dblclk, entries treat it as another press.
+                let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
+                if let Some(t) = bar.tray_hit(x) {
+                    bar.tray_forward(t, WM_LBUTTONDBLCLK);
                 } else if let Some(i) = bar.hit_test(x) {
                     bar.drag = Some(Drag {
                         idx: i,
@@ -393,6 +445,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 } else if let Some(t) = bar.tray_hit(x) {
                     bar.tray_forward(t, WM_LBUTTONUP);
+                    // v4 apps act on NIN_SELECT, not the raw button pair —
+                    // explorer's taskbar sends it after LBUTTONUP.
+                    if bar.tray_icons.get(t).is_some_and(|i| i.version >= 4) {
+                        bar.tray_forward(t, NIN_SELECT);
+                    }
+                } else if let Some(s) = bar.status_hit(x) {
+                    match bar.status_cells().get(s) {
+                        Some(StatusCell::Vol) => {
+                            bar.status.toggle_mute();
+                            bar.paint();
+                        }
+                        Some(StatusCell::Ime) => crate::status::send_hangul_key(),
+                        _ => {}
+                    }
                 }
                 LRESULT(0)
             }
@@ -414,6 +480,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 } else if let Some(i) = bar.hit_test(x) {
                     bar.context_menu(i);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                // Unlike the other mouse messages, wheel lParam is in SCREEN
+                // coordinates.
+                let mut pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let x = pt.x as f32 / bar.scale();
+                if let Some(s) = bar.status_hit(x) {
+                    if bar.status_cells().get(s) == Some(&StatusCell::Vol) {
+                        let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                        bar.status.adjust_volume(delta);
+                        bar.paint();
+                    }
                 }
                 LRESULT(0)
             }
@@ -557,9 +641,37 @@ impl Bar {
             .collect()
     }
 
+    fn status_cells(&self) -> Vec<StatusCell> {
+        let mut cells = Vec::with_capacity(4);
+        if self.status.ime_hangul.is_some() {
+            cells.push(StatusCell::Ime);
+        }
+        cells.push(StatusCell::Net);
+        cells.push(StatusCell::Vol);
+        if self.status.battery.is_some() {
+            cells.push(StatusCell::Bat);
+        }
+        cells
+    }
+
+    /// Logical x of the status cluster's left edge (right of it: clock).
+    fn status_left(&self) -> f32 {
+        self.width - CLOCK_W - (self.status_cells().len() as f32 * STATUS_CELL_W) - 2.0
+    }
+
+    /// x → index into status_cells().
+    fn status_hit(&self, x: f32) -> Option<usize> {
+        let cells = self.status_cells();
+        let left = self.status_left();
+        if x < left || x >= left + cells.len() as f32 * STATUS_CELL_W {
+            return None;
+        }
+        Some(((x - left) / STATUS_CELL_W) as usize)
+    }
+
     /// Logical x of the tray area's left edge.
     fn tray_left(&self) -> f32 {
-        self.width - CLOCK_W - (self.tray_visible().len() as f32 * TRAY_CELL_W) - 4.0
+        self.status_left() - (self.tray_visible().len() as f32 * TRAY_CELL_W) - 4.0
     }
 
     /// x → index into tray_icons.
@@ -584,6 +696,14 @@ impl Bar {
             return;
         }
         unsafe {
+            // We are WS_EX_NOACTIVATE, so the click never made anyone
+            // foreground — hand our received-last-input right to the owner or
+            // its ShowWindow/SetForegroundWindow response gets denied.
+            let mut pid = 0u32;
+            let _ = GetWindowThreadProcessId(t.owner, Some(&mut pid));
+            if pid != 0 {
+                let _ = AllowSetForegroundWindow(pid);
+            }
             if event == WM_RBUTTONDOWN {
                 // Owner's popup menu must be able to take foreground.
                 let _ = SetForegroundWindow(t.owner);
@@ -1075,6 +1195,111 @@ impl Bar {
         }
     }
 
+    /// Status cluster between tray and clock: [한/A][net][vol][batt].
+    fn draw_status(&self) {
+        let r = &self.renderer;
+        let bar_h = theme::BAR_HEIGHT;
+        let cells = self.status_cells();
+        let left = self.status_left();
+        unsafe {
+            for (i, cell) in cells.iter().enumerate() {
+                let cx = left + i as f32 * STATUS_CELL_W;
+                let rect = D2D_RECT_F {
+                    left: cx,
+                    top: 0.0,
+                    right: cx + STATUS_CELL_W,
+                    bottom: bar_h,
+                };
+                if self.status_hover == Some(i) {
+                    if let Ok(b) = r.brush(theme::rgba(255, 255, 255, theme::HOVER_FILL.a)) {
+                        r.dc.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: cx,
+                                    top: 7.0,
+                                    right: cx + STATUS_CELL_W,
+                                    bottom: bar_h - 7.0,
+                                },
+                                radiusX: 4.0,
+                                radiusY: 4.0,
+                            },
+                            &b,
+                        );
+                    }
+                }
+                let draw_glyph = |ch: u16, color| {
+                    if let Ok(b) = r.brush(color) {
+                        r.dc.DrawText(
+                            &[ch],
+                            &r.fmt_glyph,
+                            &rect,
+                            &b,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                };
+                match cell {
+                    StatusCell::Ime => {
+                        let hangul = self.status.ime_hangul == Some(true);
+                        let (s, color) = if hangul {
+                            ("한", theme::ACCENT)
+                        } else {
+                            ("A", theme::TEXT)
+                        };
+                        let utf16: Vec<u16> = s.encode_utf16().collect();
+                        if let Ok(b) = r.brush(color) {
+                            r.dc.DrawText(
+                                &utf16,
+                                &r.fmt_status,
+                                &rect,
+                                &b,
+                                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                        }
+                    }
+                    StatusCell::Net => {
+                        if self.status.net_connected {
+                            draw_glyph(crate::status::GLYPH_WIFI, theme::TEXT);
+                        } else {
+                            draw_glyph(
+                                crate::status::GLYPH_WIFI,
+                                theme::with_alpha(theme::TEXT_DIM, 0.55),
+                            );
+                            if let Ok(b) = r.brush(theme::FLASH) {
+                                r.dc.DrawLine(
+                                    Vector2 { X: cx + 6.0, Y: bar_h - 12.0 },
+                                    Vector2 { X: cx + STATUS_CELL_W - 6.0, Y: 12.0 },
+                                    &b,
+                                    1.5,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    StatusCell::Vol => {
+                        let dim = matches!(self.status.volume, None | Some((_, true)));
+                        let color = if dim { theme::TEXT_DIM } else { theme::TEXT };
+                        draw_glyph(crate::status::volume_glyph(self.status.volume), color);
+                    }
+                    StatusCell::Bat => {
+                        if let Some((pct, on_ac)) = self.status.battery {
+                            let color = if on_ac {
+                                theme::ACCENT
+                            } else if pct <= 20 {
+                                theme::FLASH
+                            } else {
+                                theme::TEXT
+                            };
+                            draw_glyph(crate::status::battery_glyph(pct, on_ac), color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn paint(&mut self) {
         let r = &self.renderer;
         let scale = self.scale();
@@ -1172,6 +1397,8 @@ impl Bar {
                     }
                 }
             }
+
+            self.draw_status();
 
             // Clock block, right-aligned: HH:MM over M/D (요일).
             let now = chrono::Local::now();

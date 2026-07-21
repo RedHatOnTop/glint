@@ -7,6 +7,7 @@
 mod icons;
 mod render;
 mod spike_toasts;
+mod status;
 mod taskbar;
 mod theme;
 mod tray;

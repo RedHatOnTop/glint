@@ -24,6 +24,8 @@ pub struct Renderer {
     pub fmt_title: IDWriteTextFormat,
     pub fmt_clock: IDWriteTextFormat,
     pub fmt_date: IDWriteTextFormat,
+    pub fmt_glyph: IDWriteTextFormat,
+    pub fmt_status: IDWriteTextFormat,
     pub dpi: f32,
 }
 
@@ -97,6 +99,15 @@ impl Renderer {
             let fmt_date = mk(family, 10.5, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe UI"), 10.5, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_date.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            // Status cluster: Fluent glyphs (MDL2 codepoints) + 한/A letter.
+            let fmt_glyph = mk(w!("Segoe Fluent Icons"), 13.0, DWRITE_FONT_WEIGHT_NORMAL)
+                .or_else(|_| mk(w!("Segoe MDL2 Assets"), 13.0, DWRITE_FONT_WEIGHT_NORMAL))?;
+            fmt_glyph.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_glyph.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_status = mk(family, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+                .or_else(|_| mk(w!("Segoe UI"), 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
+            fmt_status.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_status.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             let mut r = Renderer {
                 _d3d: d3d,
@@ -108,6 +119,8 @@ impl Renderer {
                 fmt_title,
                 fmt_clock,
                 fmt_date,
+                fmt_glyph,
+                fmt_status,
                 dpi,
             };
             r.bind_backbuffer()?;
