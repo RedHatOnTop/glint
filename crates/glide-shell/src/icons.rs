@@ -21,6 +21,15 @@ pub fn window_icon(dc: &ID2D1DeviceContext, hwnd: HWND) -> Option<ID2D1Bitmap1> 
     hicon_to_bitmap(dc, hicon)
 }
 
+/// Convert a borrowed HICON (owned by another process — tray senders) without
+/// destroying it. GetIconInfo copies the bitmaps, so no lifetime issues.
+pub fn hicon_bitmap(dc: &ID2D1DeviceContext, hicon: HICON) -> Option<ID2D1Bitmap1> {
+    if hicon.is_invalid() {
+        return None;
+    }
+    hicon_to_bitmap(dc, hicon)
+}
+
 /// Icon extracted from an exe on disk, for pinned launchers. Unlike window
 /// icons (owned by the target app), this HICON is ours and must be destroyed.
 pub fn exe_icon(dc: &ID2D1DeviceContext, path: &str) -> Option<ID2D1Bitmap1> {

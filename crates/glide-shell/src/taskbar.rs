@@ -50,9 +50,20 @@ const TIMER_ANIM: usize = 2;
 const TIMER_RESYNC: usize = 3;
 const CLOCK_W: f32 = 84.0;
 const LAUNCHER_W: f32 = 40.0;
+const TRAY_CELL_W: f32 = 24.0;
 const MENU_PIN: usize = 1;
 const MENU_UNPIN: usize = 2;
 const MENU_CLOSE: usize = 3;
+
+struct TrayIcon {
+    owner: HWND,
+    uid: u32,
+    callback: u32,
+    version: u32,
+    bitmap: Option<ID2D1Bitmap1>,
+    tip: String,
+    hidden: bool,
+}
 
 struct Entry {
     /// None = pinned exe with no window (launcher slot).
@@ -91,7 +102,7 @@ struct Drag {
     active: bool,
 }
 
-struct Bar {
+pub struct Bar {
     hwnd: HWND,
     renderer: Renderer,
     entries: Vec<Entry>,
@@ -112,9 +123,11 @@ struct Bar {
     last_tick: Instant,
     shellhook_msg: u32,
     width: f32, // logical
+    tray_icons: Vec<TrayIcon>,
+    tray_hover: Option<usize>,
 }
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(claim_tray: bool) -> anyhow::Result<()> {
     unsafe {
         let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
         let class = w!("glide_shell_bar");
@@ -182,9 +195,14 @@ pub fn run() -> anyhow::Result<()> {
             last_tick: Instant::now(),
             shellhook_msg,
             width: w_px as f32 / scale,
+            tray_icons: Vec::new(),
+            tray_hover: None,
         };
         bar.refresh();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
+        if claim_tray {
+            crate::tray::claim(&mut bar as *mut Bar)?;
+        }
 
         SetTimer(Some(hwnd), TIMER_CLOCK, 1000, None);
         SetTimer(Some(hwnd), TIMER_RESYNC, 2000, None);
@@ -322,7 +340,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if bar.drag.is_some() {
                     bar.drag_move(x);
                 } else {
-                    bar.set_hover(bar.hit_test(x));
+                    let th = bar.tray_hit(x);
+                    if th != bar.tray_hover {
+                        bar.tray_hover = th;
+                        bar.paint();
+                    }
+                    bar.set_hover(if th.is_none() { bar.hit_test(x) } else { None });
                 }
                 if !bar.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
@@ -344,7 +367,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_LBUTTONDOWN => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
-                if let Some(i) = bar.hit_test(x) {
+                if let Some(t) = bar.tray_hit(x) {
+                    bar.tray_forward(t, WM_LBUTTONDOWN);
+                } else if let Some(i) = bar.hit_test(x) {
                     bar.drag = Some(Drag {
                         idx: i,
                         press_x: x,
@@ -358,6 +383,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_LBUTTONUP => {
                 let _ = ReleaseCapture();
+                let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(d) = bar.drag.take() {
                     if d.active {
                         save_pins(&bar.pins);
@@ -365,6 +391,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     } else {
                         bar.click(d.idx);
                     }
+                } else if let Some(t) = bar.tray_hit(x) {
+                    bar.tray_forward(t, WM_LBUTTONUP);
                 }
                 LRESULT(0)
             }
@@ -377,7 +405,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_RBUTTONUP => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
-                if let Some(i) = bar.hit_test(x) {
+                if let Some(t) = bar.tray_hit(x) {
+                    // Standard sequence the owner expects for its menu.
+                    bar.tray_forward(t, WM_RBUTTONDOWN);
+                    bar.tray_forward(t, WM_RBUTTONUP);
+                    if bar.tray_icons.get(t).is_some_and(|i| i.version >= 4) {
+                        bar.tray_forward(t, WM_CONTEXTMENU);
+                    }
+                } else if let Some(i) = bar.hit_test(x) {
                     bar.context_menu(i);
                 }
                 LRESULT(0)
@@ -446,6 +481,124 @@ impl Bar {
         current.sort_unstable();
         if current != fresh {
             self.refresh();
+        }
+        // Tray icons whose owner died without NIM_DELETE (crashed apps).
+        let before = self.tray_icons.len();
+        self.tray_icons.retain(|t| unsafe { IsWindow(Some(t.owner)).as_bool() });
+        if self.tray_icons.len() != before {
+            self.paint();
+        }
+    }
+
+    /// Called from the Shell_TrayWnd wndproc (same thread).
+    pub fn on_tray_event(&mut self, ev: crate::tray::TrayEvent) {
+        use crate::tray::*;
+        match ev.message {
+            NIM_ADD | NIM_MODIFY => {
+                let idx = self
+                    .tray_icons
+                    .iter()
+                    .position(|t| t.owner == ev.owner && t.uid == ev.uid)
+                    .unwrap_or_else(|| {
+                        // NIM_MODIFY before ADD happens in the wild; upsert.
+                        self.tray_icons.push(TrayIcon {
+                            owner: ev.owner,
+                            uid: ev.uid,
+                            callback: 0,
+                            version: 0,
+                            bitmap: None,
+                            tip: String::new(),
+                            hidden: false,
+                        });
+                        self.tray_icons.len() - 1
+                    });
+                let hicon = ev.hicon;
+                let flags = ev.flags;
+                if flags & NIF_ICON != 0 {
+                    let bmp = crate::icons::hicon_bitmap(
+                        &self.renderer.dc,
+                        windows::Win32::UI::WindowsAndMessaging::HICON(hicon as *mut _),
+                    );
+                    self.tray_icons[idx].bitmap = bmp;
+                }
+                let t = &mut self.tray_icons[idx];
+                if flags & NIF_MESSAGE != 0 {
+                    t.callback = ev.callback;
+                }
+                if flags & NIF_TIP != 0 {
+                    t.tip = ev.tip;
+                }
+                if flags & NIF_STATE != 0 && ev.state_mask & NIS_HIDDEN != 0 {
+                    t.hidden = ev.state & NIS_HIDDEN != 0;
+                }
+                self.paint();
+            }
+            NIM_DELETE => {
+                self.tray_icons
+                    .retain(|t| !(t.owner == ev.owner && t.uid == ev.uid));
+                self.paint();
+            }
+            NIM_SETVERSION => {
+                if let Some(t) = self
+                    .tray_icons
+                    .iter_mut()
+                    .find(|t| t.owner == ev.owner && t.uid == ev.uid)
+                {
+                    t.version = ev.version;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tray_visible(&self) -> Vec<usize> {
+        (0..self.tray_icons.len())
+            .filter(|i| !self.tray_icons[*i].hidden)
+            .collect()
+    }
+
+    /// Logical x of the tray area's left edge.
+    fn tray_left(&self) -> f32 {
+        self.width - CLOCK_W - (self.tray_visible().len() as f32 * TRAY_CELL_W) - 4.0
+    }
+
+    /// x → index into tray_icons.
+    fn tray_hit(&self, x: f32) -> Option<usize> {
+        let visible = self.tray_visible();
+        if visible.is_empty() {
+            return None;
+        }
+        let left = self.tray_left();
+        if x < left || x >= left + visible.len() as f32 * TRAY_CELL_W {
+            return None;
+        }
+        let cell = ((x - left) / TRAY_CELL_W) as usize;
+        visible.get(cell).copied()
+    }
+
+    /// Version-aware Shell_NotifyIcon callback: v4 packs coords in wParam and
+    /// (event, uid) in lParam; v0-v3 use (uid, event).
+    fn tray_forward(&self, idx: usize, event: u32) {
+        let Some(t) = self.tray_icons.get(idx) else { return };
+        if t.callback == 0 {
+            return;
+        }
+        unsafe {
+            if event == WM_RBUTTONDOWN {
+                // Owner's popup menu must be able to take foreground.
+                let _ = SetForegroundWindow(t.owner);
+            }
+            let (wparam, lparam) = if t.version >= 4 {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                (
+                    WPARAM((((pt.y as u32 as usize) & 0xFFFF) << 16) | (pt.x as u32 as usize & 0xFFFF)),
+                    LPARAM((((t.uid as isize) & 0xFFFF) << 16) | (event as isize & 0xFFFF)),
+                )
+            } else {
+                (WPARAM(t.uid as usize), LPARAM(event as isize))
+            };
+            let _ = SendNotifyMessageW(t.owner, t.callback, wparam, lparam);
         }
     }
 
@@ -966,6 +1119,54 @@ impl Bar {
                                 right: px + 2.5,
                                 bottom: bar_h - 12.0,
                             },
+                            &b,
+                        );
+                    }
+                }
+            }
+
+            // Tray cells, right of the running section, left of the clock.
+            {
+                let visible = self.tray_visible();
+                let left = self.tray_left();
+                for (cell, idx) in visible.iter().enumerate() {
+                    let t = &self.tray_icons[*idx];
+                    let cx = left + cell as f32 * TRAY_CELL_W;
+                    if self.tray_hover == Some(*idx) {
+                        if let Ok(b) = r.brush(theme::rgba(255, 255, 255, theme::HOVER_FILL.a)) {
+                            r.dc.FillRoundedRectangle(
+                                &D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: cx,
+                                        top: 7.0,
+                                        right: cx + TRAY_CELL_W,
+                                        bottom: bar_h - 7.0,
+                                    },
+                                    radiusX: 4.0,
+                                    radiusY: 4.0,
+                                },
+                                &b,
+                            );
+                        }
+                    }
+                    let icon_rect = D2D_RECT_F {
+                        left: cx + (TRAY_CELL_W - 16.0) / 2.0,
+                        top: (bar_h - 16.0) / 2.0,
+                        right: cx + (TRAY_CELL_W + 16.0) / 2.0,
+                        bottom: (bar_h + 16.0) / 2.0,
+                    };
+                    if let Some(bmp) = &t.bitmap {
+                        r.dc.DrawBitmap(
+                            bmp,
+                            Some(&icon_rect),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_LINEAR,
+                            None,
+                            None,
+                        );
+                    } else if let Ok(b) = r.brush(theme::with_alpha(theme::TEXT_DIM, 0.6)) {
+                        r.dc.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT { rect: icon_rect, radiusX: 8.0, radiusY: 8.0 },
                             &b,
                         );
                     }
