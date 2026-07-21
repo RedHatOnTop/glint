@@ -16,7 +16,7 @@ explorer.exe를 이 계정 한정(HKCU)으로 `glide-shell.exe`로 교체한다.
 
 | 결정 | 선택 | 근거 |
 |---|---|---|
-| 상주 셸 UI 스택 | raw win32 + GDI (egui 아님) | release egui 앱 실측 WS 127MB(§4). 24/7 상주에 100MB는 이 박스에서 불가. 목표 <20MB. 게다가 tray는 `Shell_TrayWnd`라는 **정확한 클래스명**의 창이 필요한데 winit은 클래스명을 못 정함 |
+| 상주 셸 UI 스택 | raw win32 + **Direct2D/DirectWrite/DirectComposition** + DWM acrylic (egui 아님, GDI 아님, 웹뷰는 논외) | UI/UX 철학(§1) "쉽고 빠르고 **아름답게**". egui는 release 실측 WS 127MB(§4)로 상주 불가 + tray는 `Shell_TrayWnd` **정확한 클래스명** 창이 필요한데 winit은 클래스명을 못 정함. GDI는 가볍지만 AA/알파/애니메이션 미감 상한이 낮아 "아름답게" 탈락. D2D = GPU 가속 + 진짜 AA + DComp 컴포지터 애니메이션 + acrylic, RAM 목표 <40MB (M1에서 실측 게이트) |
 | 스왑 범위 | HKCU `Winlogon\Shell`만 | 타 계정·세이프모드 복구 경로 보존. HKLM은 절대 안 건드림 |
 | **스왑 게이트** | **광범위 v1 완성 전 스왑 금지** (유저 확정 0721) | 토스트·데스크톱 아이콘·볼륨 OSD·양 패널 바까지 **전부 스왑 전 필수 스코프**. 최소 v1로 스왑했다가 반쪽 셸로 생활하는 시나리오 자체를 배제 |
 | 알림(토스트) | **스왑 전 필수 (M4)** | Action Center는 explorer 생태계 소속. 카톡·디스코드 상주 실측 → NIF_INFO 벌룬 + `UserNotificationListener` 자체 토스트 렌더러까지 갖춰야 스왑. 이 API가 막히면 스왑 보류하고 재논의 |
@@ -29,8 +29,11 @@ explorer.exe를 이 계정 한정(HKCU)으로 `glide-shell.exe`로 교체한다.
   (Cairo/ManagedShell이 이 모드가 성립함을 증명함 — §부록 B).
 - **원칙 3 — 상주는 가볍게**: 상주 프로세스는 raw win32. egui는 온디맨드 창(glint 오버레이,
   glide)에만.
-- **원칙 4 — 보이는 디자인**: 기본 Win11을 흉내내지 않는다. glide teal(`theme.rs` ACCENT)
-  기반의 독자 룩. "stock 같으면 실패" 기준은 Zetile과 동일.
+- **원칙 4 — UI/UX 철학 (유저 확정 0721): "쉽고, 빠르고, 아름답게"**. 셋 다 게이트다 —
+  하나라도 죽이는 선택은 기각. MS가 시스템 앱을 웹뷰로 재작성한 길("빠르고"의 시체)은
+  금지: 셸 어디에도 WebView2/Tauri/HTML 없음. "아름답게"는 GDI를 기각시킨다(§5 렌더링).
+  기본 Win11을 흉내내지 않는다 — glide teal(`theme.rs` ACCENT) 기반의 독자 룩,
+  "stock 같으면 실패" 기준은 Zetile과 동일.
 
 ## 2. 현재 자산 (이미 있는 것)
 
@@ -103,8 +106,10 @@ explorer.exe를 이 계정 한정(HKCU)으로 `glide-shell.exe`로 교체한다.
 | glide (**release**, exe 4.3MB) | **127 MB** | **94 MB** |
 
 - **egui 상주 = ~100MB급이 release에서도 유지됨** → 상주 셸은 raw win32 확정.
-- 목표 예산: glide-shell **<20MB**, glint 상주(egui, 어쩔 수 없음) ~100MB,
-  glide는 온디맨드. 합계 ≈ 120~150MB로 explorer 생태계 712MB 대비 **~550MB 순절감**.
+- 목표 예산: glide-shell **<40MB** (D2D/D3D 디바이스 비용 포함 — 정직한 숫자.
+  GDI였으면 <20MB지만 "아름답게"에 지불하는 값이고, egui 127MB의 1/3. M1 게이트에서 실측),
+  glint 상주(egui, 어쩔 수 없음) ~100MB, glide는 온디맨드.
+  합계 ≈ 140~170MB로 explorer 생태계 712MB 대비 **~550MB 순절감**.
   16GB(실측 free 3.2GB) 박스에서 이게 이 프로젝트의 실질 보상.
 
 ### 레지스트리 현황
@@ -119,7 +124,7 @@ explorer.exe를 이 계정 한정(HKCU)으로 `glide-shell.exe`로 교체한다.
 ### 프로세스 모델
 
 ```
-winlogon ── Shell= ──► glide-shell.exe  (raw win32, <20MB, 단일 프로세스)
+winlogon ── Shell= ──► glide-shell.exe  (raw win32 + D2D, <40MB, 단일 프로세스)
                         ├─ taskbar 스레드: 바 창 + 메시지 루프
                         ├─ tray: Shell_TrayWnd 창 (같은 루프)
                         ├─ desktop: 최하단 배경 창
@@ -138,7 +143,8 @@ winlogon ── Shell= ──► glide-shell.exe  (raw win32, <20MB, 단일 프�
 ```
 crates/glide-shell/
   src/main.rs        — 엔트리, 메시지 루프, watchdog, 크래시 카운터
-  src/taskbar.rs     — 바 창, appbar 예약, 창 목록, 렌더(GDI)
+  src/render.rs      — D2D 팩토리/디바이스, DirectWrite, DComp 공유 (창들이 함께 씀)
+  src/taskbar.rs     — 바 창, appbar 예약, 창 목록, 렌더(Direct2D)
   src/tray.rs        — Shell_TrayWnd, WM_COPYDATA 프로토콜, 아이콘 스토어
   src/desktop.rs     — 배경 창, 벽지 렌더, 우클릭 메뉴
   src/autostart.rs   — Run/RunOnce 키 + shell:startup 실행
@@ -151,10 +157,33 @@ crates/glide-shell/
 egui 의존 **없음** — glint-core에서 아이콘 부분이 egui 타입을 반환하면 raw RGBA 반환
 헬퍼를 분리한다(icons.rs는 이미 HICON→RGBA 변환을 갖고 있어 분리 쉬움).
 
-### 렌더링
+### 렌더링 — Direct2D + DirectWrite + DirectComposition (원칙 4가 강제)
 
-GDI 더블버퍼(CreateCompatibleDC + BitBlt). 다크 솔리드 배경(#17181C, glide SURFACE),
-Segoe Fluent Icons 글리프, 활성 창 teal 언더라인, DirectWrite는 v2(글자 품질 불만 시).
+**v1 스택** (초안의 "GDI 더블버퍼, DirectWrite는 v2"를 유저 UI/UX 철학 확정으로 상향):
+
+- **Direct2D 1.1** (D3D11 디바이스 위): 도형 전부 진짜 AA — 라운드 사각, 알파 브러시,
+  그라디언트. GDI 기각 사유: AA 없는 도형, per-pixel 알파 합성 고통(UpdateLayeredWindow
+  수동 조립), 애니메이션 = 타이머 강제 리드로 → "아름답게" 상한 미달.
+- **DirectWrite**: 글자 품질을 "불만 시 v2"로 미루지 않는다. 셸 바는 하루 종일 보는
+  글자다 — 처음부터 ClearType/grayscale AA 제대로.
+- **DirectComposition**: 애니메이션을 컴포지터가 구동 — CPU가 바빠도(cargo -j 2 중에도)
+  toast 슬라이드·호버 페이드가 안 끊긴다. 타이머-리드로 방식은 셸 프로세스가 바쁘면
+  바로 janky — 이 박스 워크로드(RAM 포화 + 빌드 상주)에선 실질 차이.
+- **DWM acrylic 백드롭**: glint이 이미 쓰는 acrylic 경로 재사용 — 바/toast 카드가
+  반투명 블러 위 teal 액센트. 웹뷰 한 줄 없이 "예쁜 셸"의 재료는 OS에 다 있다.
+- 비용: D3D 디바이스 ~15-25MB WS. 예산 <40MB(§4), M1 게이트에서 실측으로 검증.
+  windows crate에 D2D/DWrite/DComp 전체 바인딩 있음 — 추가 의존성 0.
+
+**디자인 언어** (glint/glide/glide-shell 3앱 공통 — 파편화되면 "아름답게" 실패):
+
+- 팔레트: glide `theme.rs` 그대로 — SURFACE #17181C 계열 + teal ACCENT. 수동 동기화가
+  아니라 glide-shell `theme.rs`에 상수 복제 후 주석으로 원본 명시(egui 의존 못 가져옴).
+- 타이포: Segoe UI Variable(라틴) + 맑은 고딕 폴백(한글) — DirectWrite 폰트 폴백 체인.
+- 글리프: Segoe Fluent Icons (glide 사이드바와 동일 계보).
+- 모션: 120~180ms ease-out 단일 어휘. glide `animation_time 0.12`와 체감 일치 —
+  호버 페이드, 활성 언더라인 폭 성장(glide 액센트 필과 같은 제스처), toast 슬라이드+페이드.
+- 레이어: acrylic 바탕 → 솔리드 카드 → teal 액센트. 3겹 이상 안 쌓는다.
+
 DPI: Per-Monitor v2 매니페스트 + WM_DPICHANGED에서 메트릭 재계산 — 이 머신 150% 스케일이
 기본 테스트 케이스.
 
@@ -218,9 +247,11 @@ M7 스왑의 예행연습이 된다.
 - **아이콘 그리드 = M3 스코프**(유저 확정: 광범위 v1). Desktop 폴더를 glide grid
   뷰(아이콘·다중선택·마키·더블클릭·우클릭 shellmenu 전부 기존 코드)로 배경 창에 호스팅.
   단 desktop 창은 raw win32, glide grid는 egui — v1 절충: **desktop 아이콘은 별도
-  glide 모드(`glide.exe --desktop`)로 배경 창 위에 자식으로 얹는 방안 vs GDI로
+  glide 모드(`glide.exe --desktop`)로 배경 창 위에 자식으로 얹는 방안 vs D2D로
   아이콘+라벨만 재구현하는 방안 중 M3 착수 시 스파이크로 결정** (전자는 egui 상주
   +100MB 비용, 후자는 구현 비용 — 트레이드오프를 코드로 확인 후 선택).
+  D2D 상향으로 후자의 구현 비용이 GDI 시절보다 내려감: AA 라벨 텍스트(DirectWrite),
+  알파 선택 사각/마키가 공짜 — taskbar 렌더 코드(§5)와 같은 `render.rs`를 그대로 씀.
 
 ### 6.4 start = glint 통합 (M3)
 
@@ -259,7 +290,7 @@ HKCU: Discord, KakaoTalk, Docker Desktop, Parsec / HKLM: SecurityHealth(트레�
 
 - tray 벌룬(NIF_INFO): §6.2-5, 자체 팝업.
 - **WNS 토스트**: `UserNotificationListener`(WinRT)로 알림 스트림 구독 → 자체 토스트
-  카드(다크, teal 액센트, 우하단 슬라이드) 렌더. 권한 동의 UI 필요 + 접근 거부 사례가
+  카드(acrylic 다크, teal 액센트, 우하단 DComp 슬라이드+페이드 — §5 디자인 언어) 렌더. 권한 동의 UI 필요 + 접근 거부 사례가
   있는 API — **M4 첫 작업으로 스파이크**(explorer 살아있는 상태에서 리스너 단독 검증
   가능). 스파이크 실패 시 스왑 전면 보류하고 유저와 재논의(대안: 앱별 웹훅/브리지는
   범용성이 없어 기본 계획 아님).
@@ -293,7 +324,8 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
 |---|---|---|
 | 한글 IME | **검증 필수** | 메커니즘은 이 박스에 존재 확인(0721 실측: `MsCtfMonitor` 태스크 등록 + ctfmon/TextInputHost 실행 중 — explorer가 아니라 태스크 스케줄러 소관). 다만 **explorer 부재 세션에서의 동작은 미실측** → M2/M3의 explorer-kill 게이트에서 선행 확인, M7 체크리스트 1번 유지. 실패 시 스왑 중단 사유 |
 | `UserNotificationListener` 스파이크 실패 | **높음** | 권한 거부/빌드별 차단 사례가 있는 API. 유저 확정: 자체 토스트 없이는 스왑 안 함(§10-6) → 스파이크 실패 = 스왑 보류 + 재논의. M4 첫 작업으로 앞당겨 조기 판정 |
-| 데스크톱 아이콘 스택 미정 | 중간 | egui-자식(+100MB 상주) vs GDI 재구현(구현 비용) — M3 착수 스파이크로 결정(§6.3). 어느 쪽이든 M3 게이트는 동일 |
+| 데스크톱 아이콘 스택 미정 | 중간 | egui-자식(+100MB 상주) vs D2D 재구현(구현 비용, GDI 시절보다 하락) — M3 착수 스파이크로 결정(§6.3). 어느 쪽이든 M3 게이트는 동일 |
+| D2D/DComp 구현 비용 | 낮음~중간 | GDI 대비 초기 셋업(디바이스/스왑체인/타겟) 코드가 김. windows crate 전체 바인딩 + COM은 이미 일상(tray/shellmenu) → 학습 리스크보다 M1 일정 +0.5세션 정도. RAM 실측이 40MB 초과하면 acrylic/DComp만 끄는 격하 경로 있음(D2D 자체는 유지) |
 | 스냅 레이아웃 호버 UI | unknown | OS 소관인지 explorer 소관인지 미확인. 스냅 자체(Win+화살표)는 OS |
 | Win+V 클립보드 히스토리 | unknown | TextInputHost 소관으로 추정, 미실측 |
 | OneDrive/클라우드 상태 아이콘 | 낮음 | tray 프로토콜로 수용 가능, 오버레이 아이콘(체크마크)은 glide 쪽 v2 |
@@ -308,15 +340,17 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
 각 M은 "빌드 green"이 아니라 **라이브 검증 게이트** 통과가 완료 조건 (프로젝트 룰).
 광범위 v1 확정(0721)에 따라 M1~M6 **전부**가 스왑(M7)의 선행 조건이다.
 
-- **M1 — taskbar alongside** (1~2세션)
-  scaffold + 바 창(하단, per-monitor 구조로 시작) + appbar 예약 + 창 목록/활성/클릭 +
-  시계. explorer 바는 자동 숨김으로 공존. 게이트: 하루 도그푸드 — 창 전환을 우리 바로만.
+- **M1 — taskbar alongside** (1~2세션, D2D 셋업 포함으로 +0.5세션 가능)
+  scaffold + `render.rs`(D2D/DWrite/DComp) + 바 창(하단, per-monitor 구조로 시작) +
+  appbar 예약 + 창 목록/활성/클릭 + 시계. explorer 바는 자동 숨김으로 공존.
+  게이트: 하루 도그푸드 — 창 전환을 우리 바로만 — **+ 미감 게이트**(acrylic + teal +
+  호버/활성 애니메이션이 보일 것; stock 흉내면 실패 — 원칙 4) **+ RAM 실측 <40MB**(§4).
 - **M2 — tray + 상태** (2~3세션, 최고 난이도)
   Shell_TrayWnd 프로토콜 전체 + 벌룬 + 상태 글리프. 게이트: explorer 죽인 세션에서
   TaskbarCreated 브로드캐스트 → 기존 앱 아이콘 등장, 클릭 메뉴 정상, 벌룬 렌더.
   (이 게이트가 M7 예행연습.)
 - **M3 — desktop + 아이콘 + autostart + 키** (2~3세션)
-  배경 창 + 우클릭 + **데스크톱 아이콘**(§6.3 스파이크로 egui-자식 vs GDI 재구현 결정),
+  배경 창 + 우클릭 + **데스크톱 아이콘**(§6.3 스파이크로 egui-자식 vs D2D 재구현 결정),
   Run/Startup 실행기, Win키→glint, Win+E→glide.
   게이트: explorer 죽인 세션에서 데스크톱 아이콘 조작/키/자동시작 전부 동작 —
   특히 **Everything 자동 기동 + glide Ctrl+P 검색 성공**(§6.5), 한글 입력 정상.
@@ -348,6 +382,9 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
 5. **Win키**: bare-Win → glint 확정 (Win+E/D/화살표 조합키 유지).
 6. **토스트**: 손실 수용 안 함 — `UserNotificationListener` 자체 토스트가 스왑 전 필수
    (M4). 스파이크 실패 시 스왑 보류하고 재논의.
+7. **UI/UX 철학**: "쉽고, 빠르고, 아름답게" + 웹뷰 전면 금지. 설계 반영: 렌더링 스택
+   GDI → Direct2D/DirectWrite/DirectComposition 상향(§5), RAM 예산 <20 → <40MB 정직
+   조정(§4), M1에 미감 게이트 추가(§9), 디자인 언어 3앱 공통 명문화(§5).
 
 ## 부록 A — tray 프로토콜 메시지 요약
 
