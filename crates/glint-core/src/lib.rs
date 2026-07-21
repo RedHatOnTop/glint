@@ -2,3 +2,4 @@
 pub mod icons;
 pub mod platform;
 pub mod sources;
+pub mod toggle_pipe;

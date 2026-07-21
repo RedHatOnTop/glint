@@ -16,6 +16,7 @@ mod taskbar;
 mod theme;
 mod tray;
 mod wifi;
+mod winkey;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

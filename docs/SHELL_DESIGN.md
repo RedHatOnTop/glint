@@ -307,6 +307,28 @@ M7 스왑의 예행연습이 된다.
   메뉴 패널이 최종 목표. 팝업 기계(preview/flyout) 위에 얹는다. 스왑 게이트에는
   미포함, 로드맵에는 존재.
 
+**구현됨 (0721, winkey.rs + glint-core/toggle_pipe.rs).**
+
+- 훅: `WH_KEYBOARD_LL`, bare-Win 판정 = Win down→up 사이에 다른 키 없음
+  (injected 이벤트는 장부에서 제외). bare 릴리즈는 **삼키고** dummy(VK 0xFF)
+  down/up + Win up을 SendInput으로 재합성 — 시스템은 Win+dummy 콤보로 보므로
+  스톡 시작 메뉴가 안 뜨고, Win 키 up은 전달되어 키 상태 안 꼬임 (PowerToys
+  마스킹 기법). Win+콤보는 그대로 통과. 콜백은 플래그+PostMessage(WM_APP+2)만.
+- 토글: UI 스레드에서 `\\.\pipe\glint-toggle`에 write; 파이프 없으면(글린트
+  미실행) 셸 옆의 glint.exe를 ShellExecuteW로 스폰 (시작 시 보이는 상태라 첫
+  bare-Win = "메뉴 열림"으로 읽힘). glint 쪽 리스너는 glint-core
+  `toggle_pipe::listen`(연결 자체가 신호, 페이로드 무시) → 핫키 핸들러와 동일
+  토글. **파이프 이름은 glide-shell에 문자열 중복** — egui 워크스페이스 절반에
+  의존하지 않기 위해 의도적.
+- 검증: PostMessage(WM_WINKEY) 4연타로 스폰→숨김→표시→숨김 전부 스크린샷 확인.
+  **물리 Win 키 경로(훅 판정+dummy 주입+시작메뉴 억제)는 미검증** — 훅이
+  injected를 무시하므로 SendInput으로 못 흉내냄, 실제 키만 가능. 도그푸드에서
+  자연 검증.
+- 주의: glide-shell 실행 중엔 bare-Win이 스톡 시작 메뉴 대신 glint을 연다
+  (설계 의도). 셸 종료 시 훅도 사라져 스톡 동작 복귀.
+- v1 미포함: glint 감시/재스폰 (죽으면 다음 bare-Win이 다시 스폰하므로 사실상
+  커버), Win 길게 눌러 다른 동작 등.
+
 ### 6.5 autostart 실행기 (M3, 잊으면 큰일 나는 것)
 
 explorer가 셸 기동 시 하던 일. 우리가 안 하면 **아무도 안 한다**:

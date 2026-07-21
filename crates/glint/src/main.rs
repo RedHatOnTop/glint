@@ -58,6 +58,18 @@ fn main() -> eframe::Result {
                 }
             }));
 
+            // glide-shell's Win-key hook toggles us over a named pipe —
+            // identical effect to the hotkey path above.
+            let ctx = cc.egui_ctx.clone();
+            glint_core::toggle_pipe::listen(move || {
+                let hwnd = app::WINDOW_HWND.load(Ordering::SeqCst);
+                let show = !app::VISIBLE.load(Ordering::SeqCst);
+                platform::set_window_visible(hwnd, show);
+                app::VISIBLE.store(show, Ordering::SeqCst);
+                app::HOTKEY_PRESSED.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+            });
+
             Ok(Box::new(app::GlintApp::new(cc, manager)))
         }),
     )

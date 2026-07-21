@@ -249,6 +249,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         if let Err(e) = crate::desktop::spawn(dpi) {
             eprintln!("glide-shell: desktop window failed: {e}");
         }
+        crate::winkey::install(hwnd);
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         bar.paint();
@@ -591,6 +592,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if wparam.0 == ABN_POSCHANGED_ID {
                     bar.reposition();
                 }
+                LRESULT(0)
+            }
+            crate::winkey::WM_WINKEY => {
+                crate::winkey::toggle_glint();
                 LRESULT(0)
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE => {
