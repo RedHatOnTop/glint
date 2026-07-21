@@ -4,6 +4,7 @@
 //! above the stock bar). `--spike-toasts` is the M4 gating spike, kept for
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
+mod autostart;
 mod flyout;
 mod icons;
 mod preview;
@@ -25,6 +26,11 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(30);
             spike_toasts::run(wait_secs)
         }
+        Some("--autostart-list") => {
+            autostart::list();
+            Ok(())
+        }
+        Some("--autostart-selftest") => autostart::selftest(),
         None | Some("--tray-claim") => {
             // --tray-claim: also register as Shell_TrayWnd. Racy while
             // explorer lives — meant for explorer-kill sessions (M2 gate).
@@ -34,10 +40,18 @@ fn main() -> anyhow::Result<()> {
                     windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
                 );
             }
+            // Shell duty (SHELL_DESIGN §6.5): the Run keys and Startup folders
+            // only fire from here once Winlogon Shell= points at us; while
+            // explorer is the shell this is a no-op, never a double launch.
+            if autostart::is_system_shell() {
+                std::thread::spawn(autostart::run_all);
+            }
             taskbar::run(claim)
         }
         _ => {
-            eprintln!("usage: glide-shell [--tray-claim] [--spike-toasts [wait_secs]]");
+            eprintln!(
+                "usage: glide-shell [--tray-claim] [--spike-toasts [wait_secs]] [--autostart-list] [--autostart-selftest]"
+            );
             Ok(())
         }
     }

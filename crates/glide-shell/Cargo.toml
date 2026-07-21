@@ -8,3 +8,4 @@ windows.workspace = true
 windows-numerics.workspace = true
 anyhow.workspace = true
 chrono = "0.4"
+winreg.workspace = true

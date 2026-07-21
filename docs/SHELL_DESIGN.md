@@ -265,6 +265,10 @@ M7 스왑의 예행연습이 된다.
   훅 콜백은 <1ms 유지(무거우면 OS가 훅 강제 해제).
 - glint 쪽은 기존 Alt+Space 경로 재사용 — 셸 쪽에서 named pipe로 "토글" 신호만 보냄
   (glide ipc.rs 패턴 복사).
+- **유저 확정 0721: "언젠가 시작 메뉴도 구현해야 함"** — glint 런처 통합은 중간
+  단계고, 앱 목록(시작 메뉴 폴더 열거 + UWP)·전원 메뉴·핀 그리드를 갖춘 진짜 시작
+  메뉴 패널이 최종 목표. 팝업 기계(preview/flyout) 위에 얹는다. 스왑 게이트에는
+  미포함, 로드맵에는 존재.
 
 ### 6.5 autostart 실행기 (M3, 잊으면 큰일 나는 것)
 
@@ -283,6 +287,19 @@ HKCU: Discord, KakaoTalk, Docker Desktop, Parsec / HKLM: SecurityHealth(트레�
 **Everything이 여기 있음** → autostart 실행기가 빠지면 Everything이 안 떠서
 **glint 파일 검색과 glide Ctrl+P 파인더가 같이 죽는다**. autostart는 완전성 항목이
 아니라 자기 기능 의존성. M3 게이트에 "Everything 자동 기동 + Ctrl+P 동작" 명시.
+
+**출하 0721 (`autostart.rs`)**: enumerate = HKCU/HKLM Run(64/32 뷰) + RunOnce +
+Startup 폴더 2종. **StartupApproved 존중이 핵심** — Task Manager에서 끈 항목은 Run
+키에 그대로 남고 `Explorer\StartupApproved\{Run,Run32,StartupFolder}`의 12바이트
+blob 첫 바이트 홀수=disabled 로만 거부된다. 이걸 무시하면 유저가 디블로트로 죽인
+시작 앱이 전부 부활(이 박스 12개 중 8개가 disabled). 실행 = 레지스트리 항목은
+`CreateProcessW`(인자 포함 커맨드라인, env 확장), 폴더 항목은 `ShellExecuteW`(.lnk).
+RunOnce는 실행 전 값 삭제. 기동 와이어링 = `is_system_shell()`(Winlogon Shell= 이
+우리를 가리킬 때만, HKCU 우선) → 오늘은 explorer라 무동작, M7 스왑 순간부터 살아남.
+검증: `--autostart-list` 12항목 전원 StartupApproved 원본과 일치(짝수 first_byte=6
+케이스 포함), `--autostart-selftest` = 합성 HKCU Run 값 심고 enumerate→execute→마커
+파일 확인→자체 정리, PASS. 미구현: 세션당 1회 마커(CreateEvent) — 셸 재시작 시나리오,
+M6 안전망과 같이. '!'-접두 RunOnce(성공 후 삭제 시맨틱)는 v1 미지원(플레인만).
 
 ### 6.6 상태 영역 (M2)
 
