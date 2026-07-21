@@ -160,6 +160,8 @@ pub struct GlideApp {
     // Cached content snippet for the details panel (text files only), keyed by
     // the currently-shown path so we re-read only when the selection changes.
     text_prev: Option<(PathBuf, String)>,
+    // Folder args handed over by later glide launches (single-instance pipe).
+    ipc_rx: mpsc::Receiver<Vec<PathBuf>>,
 }
 
 impl GlideApp {
@@ -176,6 +178,8 @@ impl GlideApp {
             tabs.push(Pane::new(crate::pane::this_pc(), false));
         }
         let (ops_tx, ops_rx) = mpsc::channel();
+        let (ipc_tx, ipc_rx) = mpsc::channel();
+        crate::ipc::listen(ipc_tx, cc.egui_ctx.clone());
         Self {
             tabs,
             tab: 0,
@@ -203,6 +207,7 @@ impl GlideApp {
             file_search: sources::FileSearch::spawn(cc.egui_ctx.clone()),
             finder: None,
             text_prev: None,
+            ipc_rx,
         }
     }
 
@@ -565,6 +570,23 @@ impl eframe::App for GlideApp {
         // Refresh panes when a background shell op (copy/move/recycle) finishes.
         while self.ops_rx.try_recv().is_ok() {
             self.refresh_all();
+        }
+
+        // Another launch handed us its folder args → open as tabs, come to front.
+        let mut handed_over = false;
+        while let Ok(paths) = self.ipc_rx.try_recv() {
+            handed_over = true;
+            if paths.is_empty() {
+                self.new_tab(crate::pane::this_pc());
+            }
+            for p in paths {
+                if p.is_dir() {
+                    self.new_tab(p);
+                }
+            }
+        }
+        if handed_over {
+            ops::bring_to_front(self.hwnd);
         }
 
         // Recomputed every frame while an internal drag is live.
@@ -1161,6 +1183,16 @@ impl eframe::App for GlideApp {
                                 .changed()
                             {
                                 let _ = crate::register::set_folder_handler(fh);
+                            }
+                            let mut cm = crate::register::context_menu_enabled();
+                            if ui
+                                .checkbox(&mut cm, "우클릭 메뉴 'glide에서 열기'")
+                                .on_hover_text(
+                                    "Win11 기본 메뉴에서는 '더 많은 옵션 표시' 아래에 표시",
+                                )
+                                .changed()
+                            {
+                                let _ = crate::register::set_context_menu(cm);
                             }
                             ui.add_space(4.0);
                             ui.label(

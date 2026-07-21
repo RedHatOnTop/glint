@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod ipc;
 mod ops;
 mod pane;
 mod preview;
@@ -12,6 +13,12 @@ mod theme;
 
 fn main() -> eframe::Result {
     env_logger::init();
+    // Single instance: hand our args to a running glide (they become tabs
+    // there) and bow out, instead of spawning another full process.
+    let args: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
+    if ipc::send_to_existing(&args) {
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1150.0, 720.0])

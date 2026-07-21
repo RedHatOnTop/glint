@@ -69,3 +69,40 @@ pub fn set_folder_handler(on: bool) -> io::Result<()> {
     }
     Ok(())
 }
+
+// Right-click "glide에서 열기" verb: (class, arg placeholder). %1 = the clicked
+// item, %V = the folder whose background was clicked. Shows in Win11's legacy
+// menu ("더 많은 옵션 표시" / Shift+F10) — the modern top level needs a packaged
+// IExplorerCommand, out of scope here.
+const VERB_CLASSES: [(&str, &str); 3] = [
+    ("Directory", "%1"),
+    (r"Directory\Background", "%V"),
+    ("Drive", "%1"),
+];
+
+/// True when the context-menu verb points at this exe.
+pub fn context_menu_enabled() -> bool {
+    let Ok(exe) = exe_path() else { return false };
+    default_value(r"Software\Classes\Directory\shell\glide\command")
+        .map(|v| v.to_lowercase().contains(&exe.to_lowercase()))
+        .unwrap_or(false)
+}
+
+pub fn set_context_menu(on: bool) -> io::Result<()> {
+    if on {
+        let exe = exe_path()?;
+        for (class, arg) in VERB_CLASSES {
+            let (k, _) = hkcu().create_subkey(format!(r"Software\Classes\{class}\shell\glide"))?;
+            k.set_value("", &"glide에서 열기")?;
+            k.set_value("Icon", &exe)?;
+            let (c, _) =
+                hkcu().create_subkey(format!(r"Software\Classes\{class}\shell\glide\command"))?;
+            c.set_value("", &format!("\"{exe}\" \"{arg}\""))?;
+        }
+    } else {
+        for (class, _) in VERB_CLASSES {
+            let _ = hkcu().delete_subkey_all(format!(r"Software\Classes\{class}\shell\glide"));
+        }
+    }
+    Ok(())
+}

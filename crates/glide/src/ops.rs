@@ -12,7 +12,9 @@ use windows::Win32::UI::Shell::{
     FO_COPY, FO_DELETE, FO_MOVE, FOF_ALLOWUNDO, FOF_RENAMEONCOLLISION, IShellFolder,
     SHBindToParent, SHDoDragDrop, SHFILEOPSTRUCTW, SHFileOperationW, SHParseDisplayName,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetWindowRect, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+};
 use windows::core::PCWSTR;
 
 // pFrom/pTo want double-null-terminated path lists.
@@ -103,6 +105,18 @@ pub fn cursor_outside_window(hwnd: isize) -> bool {
             return false;
         }
         pt.x < rc.left || pt.x > rc.right || pt.y < rc.top || pt.y > rc.bottom
+    }
+}
+
+/// Restore (if minimized) and foreground the window — used when another glide
+/// launch hands its folders to this instance.
+pub fn bring_to_front(hwnd: isize) {
+    unsafe {
+        let h = HWND(hwnd as *mut core::ffi::c_void);
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
     }
 }
 
