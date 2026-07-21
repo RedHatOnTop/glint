@@ -63,6 +63,9 @@ const STATUS_CELL_W: f32 = 26.0;
 const MENU_PIN: usize = 1;
 const MENU_UNPIN: usize = 2;
 const MENU_CLOSE: usize = 3;
+const MENU_TASKMGR: usize = 4;
+const MENU_RESTART: usize = 5;
+const MENU_QUIT: usize = 6;
 
 struct TrayIcon {
     owner: HWND,
@@ -567,6 +570,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 } else if let Some(i) = bar.hit_test(x) {
                     bar.context_menu(i);
+                } else if bar.status_hit(x).is_none() {
+                    bar.bar_menu();
                 }
                 LRESULT(0)
             }
@@ -1242,6 +1247,60 @@ impl Bar {
                         let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
                 }
+                _ => {}
+            }
+        }
+    }
+
+    /// Empty-bar right-click: shell housekeeping (the stock bar's own menu
+    /// is Settings-only on Win11; ours earns its keep while dogfooding).
+    fn bar_menu(&mut self) {
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let add = |id: usize, label: &str| {
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(wide.as_ptr()));
+            };
+            add(MENU_TASKMGR, "작업 관리자");
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            add(MENU_RESTART, "glide-shell 다시 시작");
+            add(MENU_QUIT, "glide-shell 종료");
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetForegroundWindow(self.hwnd);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_BOTTOMALIGN,
+                pt.x,
+                pt.y,
+                Some(0),
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            match cmd.0 as usize {
+                MENU_TASKMGR => {
+                    windows::Win32::UI::Shell::ShellExecuteW(
+                        None,
+                        w!("open"),
+                        w!("taskmgr.exe"),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+                MENU_RESTART => {
+                    // New instance first; the appbar slots resolve via
+                    // ABN_POSCHANGED once this one exits.
+                    if let Ok(exe) = std::env::current_exe() {
+                        use std::os::windows::process::CommandExt;
+                        let _ = std::process::Command::new(exe)
+                            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                            .spawn();
+                    }
+                    PostQuitMessage(0);
+                }
+                MENU_QUIT => PostQuitMessage(0),
                 _ => {}
             }
         }
