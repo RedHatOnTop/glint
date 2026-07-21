@@ -291,6 +291,20 @@ HKCU: Discord, KakaoTalk, Docker Desktop, Parsec / HKLM: SecurityHealth(트레�
 클릭 → 각각 ms-settings 딥링크(glint 테이블 재사용). 한/영 표시(현재 입력 로케일,
 `GetKeyboardLayout`) 포함 — IME 상태가 안 보이면 이 유저 워크플로에서 불편.
 
+**출하 0721 (`bc322a1`)**: 셀 4종(한영/넷/볼륨/배터리, 없는 정보는 셀 탈락) +
+Fluent 글리프 DWrite 포맷, 1초 시계 타이머에 폴링. 볼륨 좌클릭=음소거 토글(라이브
+검증), 휠=±2%(휠 lParam은 화면좌표 — 다른 마우스 메시지와 다름), 한영 클릭=VK_HANGUL
+탭. IME 판정 = 포그라운드 스레드 `GetKeyboardLayout`==0x412 + `ImmGetDefaultIMEWnd`에
+`IMC_GETOPENSTATUS`. ms-settings 딥링크는 아직 없음(넷/배터리 클릭 무동작).
+
+**트레이 클릭 포워딩 라이브 증명 0721 (같은 커밋)**: 핵심 함정 — 우리 바는
+`WS_EX_NOACTIVATE`라 클릭해도 포그라운드가 안 바뀌어서 owner 앱의
+ShowWindow/SetForegroundWindow가 조용히 거부됨. **received-last-input 자격으로
+`AllowSetForegroundWindow(owner pid)` 선행이 해법** (탐색기 태스크바가 하는 일).
+추가로 v4 아이콘엔 LBUTTONUP 뒤 `NIN_SELECT`(0x400), 구식 아이콘엔 `CS_DBLCLKS` +
+WM_LBUTTONDBLCLK 포워딩. explorer-kill 세션에서 Everything 트레이 클릭 → 창 열림 →
+셸훅으로 러닝 버튼 등장까지 전체 루프 확인.
+
 ### 6.7 알림 (M4, 스왑 전 필수 — 유저 확정 0721)
 
 - tray 벌룬(NIF_INFO): §6.2-5, 자체 팝업.
