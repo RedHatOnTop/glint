@@ -1373,6 +1373,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "glide-shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "glint"
 version = "0.1.0"
 dependencies = [

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glint", "crates/glide", "crates/glint-core"]
+members = ["crates/glint", "crates/glide", "crates/glint-core", "crates/glide-shell"]
 
 [workspace.dependencies]
 glint-core = { path = "crates/glint-core" }
@@ -28,6 +28,11 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Pipes",
     "Win32_System_IO",
     "Win32_Security",
+    "Foundation",
+    "Foundation_Collections",
+    "ApplicationModel",
+    "UI_Notifications",
+    "UI_Notifications_Management",
 ] }
 
 [profile.release]

@@ -290,10 +290,15 @@ HKCU: Discord, KakaoTalk, Docker Desktop, Parsec / HKLM: SecurityHealth(트레�
 
 - tray 벌룬(NIF_INFO): §6.2-5, 자체 팝업.
 - **WNS 토스트**: `UserNotificationListener`(WinRT)로 알림 스트림 구독 → 자체 토스트
-  카드(acrylic 다크, teal 액센트, 우하단 DComp 슬라이드+페이드 — §5 디자인 언어) 렌더. 권한 동의 UI 필요 + 접근 거부 사례가
-  있는 API — **M4 첫 작업으로 스파이크**(explorer 살아있는 상태에서 리스너 단독 검증
-  가능). 스파이크 실패 시 스왑 전면 보류하고 유저와 재논의(대안: 앱별 웹훅/브리지는
-  범용성이 없어 기본 계획 아님).
+  카드(acrylic 다크, teal 액센트, 우하단 DComp 슬라이드+페이드 — §5 디자인 언어) 렌더.
+  **스파이크 완료 0721 (`glide-shell --spike-toasts`, M1보다 먼저 실행): PASS-POLLING.**
+  이 박스 실측: 언패키지드에서 접근 = Allowed(동의 UI 없이), 열거 완전 동작(실토스트
+  13건 앱명+본문 추출 — Discord/휴대폰과 연결/Claude 등), 라이브로 발사한 토스트를
+  폴링이 잡음. 단 `NotificationChanged` 이벤트는 `0x80070490 요소가 없습니다`
+  (언패키지드 한계) → **v1 = 500ms~1s 폴링, `UserNotification.Id` diff로 신규 검출**.
+  이벤트 업그레이드(sparse-MSIX 패키지 아이덴티티)는 M4 선택 실험, 게이트 아님.
+  스파이크가 드러낸 추가 한계: 타 앱 토스트의 **액션 실행(버튼/딥링크 활성화)은
+  리스너로 불가** — 카드 클릭 = 소스 앱 창 포커스 + `RemoveNotification(id)`로 해제까지.
 - 볼륨/밝기 OSD: 하드웨어 키 입력 시 자체 오버레이. 볼륨 = IAudioEndpointVolume
   변경 콜백, 밝기 = WMI `WmiMonitorBrightnessEvent`. tray 볼륨 글리프 클릭 = 슬라이더.
 
@@ -323,7 +328,7 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
 | 항목 | 등급 | 내용 |
 |---|---|---|
 | 한글 IME | **검증 필수** | 메커니즘은 이 박스에 존재 확인(0721 실측: `MsCtfMonitor` 태스크 등록 + ctfmon/TextInputHost 실행 중 — explorer가 아니라 태스크 스케줄러 소관). 다만 **explorer 부재 세션에서의 동작은 미실측** → M2/M3의 explorer-kill 게이트에서 선행 확인, M7 체크리스트 1번 유지. 실패 시 스왑 중단 사유 |
-| `UserNotificationListener` 스파이크 실패 | **높음** | 권한 거부/빌드별 차단 사례가 있는 API. 유저 확정: 자체 토스트 없이는 스왑 안 함(§10-6) → 스파이크 실패 = 스왑 보류 + 재논의. M4 첫 작업으로 앞당겨 조기 판정 |
+| `UserNotificationListener` 스파이크 실패 | ~~높음~~ **해소 (0721 실측)** | PASS-POLLING: 접근 Allowed + 열거/본문 추출 전부 동작, 이벤트만 언패키지드 불가(0x80070490) → v1 폴링 확정(§6.7). 스왑 게이트에서 제거. 잔여: 타 앱 토스트 액션 실행 불가(포커스+해제로 갈음) |
 | 데스크톱 아이콘 스택 미정 | 중간 | egui-자식(+100MB 상주) vs D2D 재구현(구현 비용, GDI 시절보다 하락) — M3 착수 스파이크로 결정(§6.3). 어느 쪽이든 M3 게이트는 동일 |
 | D2D/DComp 구현 비용 | 낮음~중간 | GDI 대비 초기 셋업(디바이스/스왑체인/타겟) 코드가 김. windows crate 전체 바인딩 + COM은 이미 일상(tray/shellmenu) → 학습 리스크보다 M1 일정 +0.5세션 정도. RAM 실측이 40MB 초과하면 acrylic/DComp만 끄는 격하 경로 있음(D2D 자체는 유지) |
 | 스냅 레이아웃 호버 UI | unknown | OS 소관인지 explorer 소관인지 미확인. 스냅 자체(Win+화살표)는 OS |
@@ -354,9 +359,10 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   Run/Startup 실행기, Win키→glint, Win+E→glide.
   게이트: explorer 죽인 세션에서 데스크톱 아이콘 조작/키/자동시작 전부 동작 —
   특히 **Everything 자동 기동 + glide Ctrl+P 검색 성공**(§6.5), 한글 입력 정상.
-- **M4 — 알림 + OSD** (1~2세션 + 선행 스파이크)
-  **첫 작업 = UserNotificationListener 스파이크** (실패 = 스왑 보류 + 재논의).
-  자체 토스트 카드 + 볼륨/밝기 OSD + 볼륨 슬라이더 팝업.
+- **M4 — 알림 + OSD** (1~2세션)
+  ~~첫 작업 = UserNotificationListener 스파이크~~ → **스파이크 0721 완료, PASS-POLLING**
+  (§6.7 — M1보다 먼저 실행해 스왑 블로커 조기 해소).
+  자체 토스트 카드(폴링 diff) + 볼륨/밝기 OSD + 볼륨 슬라이더 팝업.
   게이트: 카톡/디스코드 실메시지가 자체 토스트로 뜸, 볼륨 키에 OSD 뜸.
 - **M5 — Duo 멀티모니터** (1세션)
   양 패널 바 + 키보드 도킹 탈착 전환(WM_DISPLAYCHANGE 재예약) + 150% DPI.
