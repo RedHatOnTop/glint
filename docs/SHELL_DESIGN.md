@@ -258,6 +258,43 @@ M7 스왑의 예행연습이 된다.
   D2D 상향으로 후자의 구현 비용이 GDI 시절보다 내려감: AA 라벨 텍스트(DirectWrite),
   알파 선택 사각/마키가 공짜 — taskbar 렌더 코드(§5)와 같은 `render.rs`를 그대로 씀.
 
+**구현됨 (0721, desktop.rs) — 스파이크 결정: D2D 재구현안 채택.** egui 상주안은
+기각(RAM). 실측으로 확정한 사실들:
+
+- **GPU 공유 선행 리팩터**: 창마다 자체 D3D/D2D/DComp 디바이스를 만들던 것을
+  thread-local `render::gpu()`(D3D+D2D+DXGI+DComp+DWrite+WIC 한 벌, per-window는
+  DeviceContext+스왑체인만)로 통합. 효과 실측: 데스크톱 없이 private
+  79.2→**41.4MB**. 정직한 40MB 목표를 바 스택이 달성.
+- 창: 풀 모니터 `WS_POPUP`+`WS_EX_NOACTIVATE|TOOLWINDOW|NOREDIRECTIONBITMAP`,
+  `WM_WINDOWPOSCHANGING`에서 `hwndInsertAfter=HWND_BOTTOM` 강제(+`SWP_NOZORDER`
+  비트 제거 — 안 하면 강제가 무시됨). 탐색기 공존 상태에서 Progman **위**,
+  일반 창 아래 레이어로 검증됨(WindowFromPoint 3지점 = glide_shell_desktop).
+  `SetShellWindow`는 아직 안 함(스왑 시점 M7에서).
+- 벽지: WIC 디코드 → **`IWICBitmapScaler`(Fant)로 cover 크기까지 축소 후 업로드
+  필수.** ASUS Duo 자산이 3600×3600(16.9MB PNG)이라 풀해상도 경로는 private
+  167.9MB를 만들었다. 스케일러 적용 후 92.4MB. 나머지 비용은 셸 아이콘 추출
+  머신저리(SHCreateItemFromParsingName이 셸 네임스페이스 그래프를 in-proc 로드).
+- 아이콘: `IShellItemImageFactory::GetImage`(RESIZETOFIT|BIGGERSIZEOK, 2×
+  논리 48px) → HBITMAP → GetDIBits 32bpp → 알파 전-0이면 불투명 처리 →
+  premultiply → D2D 비트맵 (icons.rs 패턴). 그림 파일은 실제 썸네일이 나옴.
+- 그리드: 유저+공용 Desktop 병합, 숨김/desktop.ini 제외, 폴더 우선 정렬,
+  작업영역 안에서 세로 컬럼(셀 84×98, 아이콘 48, `.lnk/.url`은 stem 라벨).
+  라벨 = DWrite 11.5 center + ellipsis trimming + 1.2px 오프셋 그림자 이중 드로우.
+- 입력: 호버 워시/클릭 선택/Ctrl 토글/빈 곳 마퀴(ACCENT)/더블클릭
+  ShellExecuteW/`WM_MOUSEACTIVATE=MA_NOACTIVATE`. 선택 렌더는 SendMessage 주입 +
+  PrintWindow로 검증(전역 입력 오염 없이). 호버는 캡처 불가 — TrackMouseEvent가
+  실커서 위치를 보고 즉시 WM_MOUSELEAVE를 쏨. **마퀴·더블클릭은 라이브 미검증**
+  (유저 활동 중 입력 주입 금지 규칙).
+- `WM_SETTINGCHANGE` 방어: ScreenXpert가 스팸 → 아이템 시그니처(경로 목록+작업
+  영역)와 벽지 경로+mtime이 같으면 재추출 스킵. `WM_DISPLAYCHANGE`는 시그니처
+  무효화 + 벽지 재스케일.
+- 진단 스위치: `GLIDE_DESK_OFF=1`(창 자체 생략), `GLIDE_DESK_BARE=1`(벽지·아이콘
+  생략) — RAM 3단 측정용(41.4 / 45.0 / 92.4MB).
+- v1 미포함(다음 라운드): 우클릭 IContextMenu, 아이콘 위치 저장(탐색기 ItemPos
+  블롭 미사용 — 자동 정렬), 파일 워처 새로고침, 키보드, 빈 곳 더블클릭 glide 열기.
+- **glide-shell.exe는 콘솔 서브시스템** — 직접 실행하면 콘솔 창이 뜬다. 도그푸드
+  실행은 `Start-Process -WindowStyle Hidden`(stderr 리다이렉트 겸용).
+
 ### 6.4 start = glint 통합 (M3)
 
 - glide-shell이 glint를 스폰·감시.

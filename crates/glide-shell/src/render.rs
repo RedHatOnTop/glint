@@ -2,6 +2,12 @@
 //! (SHELL_DESIGN §5 렌더링). The swapchain is a composition swapchain with
 //! premultiplied alpha so the DWM acrylic backdrop shows through wherever we
 //! draw translucent color.
+//!
+//! All windows share one GPU stack (D3D device, D2D device, DComp device,
+//! DWrite/WIC factories) via a thread-local — with four windows alive the
+//! per-window device cost was the biggest slice of the RAM budget overrun.
+
+use std::cell::OnceCell;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -12,25 +18,38 @@ use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::{Interface, Result, w};
 
-pub struct Renderer {
-    _d3d: ID3D11Device,
-    pub dc: ID2D1DeviceContext,
-    swapchain: IDXGISwapChain1,
-    _dcomp: IDCompositionDevice,
-    _dcomp_target: IDCompositionTarget,
+#[derive(Clone)]
+pub struct Gpu {
+    pub d3d: ID3D11Device,
+    pub d2d: ID2D1Device,
+    pub dxgi: IDXGIFactory2,
+    pub dcomp: IDCompositionDevice,
     pub dwrite: IDWriteFactory,
-    pub fmt_title: IDWriteTextFormat,
-    pub fmt_clock: IDWriteTextFormat,
-    pub fmt_date: IDWriteTextFormat,
-    pub fmt_glyph: IDWriteTextFormat,
-    pub fmt_status: IDWriteTextFormat,
-    pub dpi: f32,
+    pub wic: IWICImagingFactory,
 }
 
-impl Renderer {
-    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: f32) -> Result<Self> {
+thread_local! {
+    static GPU: OnceCell<Gpu> = const { OnceCell::new() };
+}
+
+/// Shared GPU stack for this (UI) thread, created on first use.
+pub fn gpu() -> Result<Gpu> {
+    GPU.with(|cell| {
+        if let Some(g) = cell.get() {
+            return Ok(g.clone());
+        }
+        let g = Gpu::new()?;
+        let _ = cell.set(g.clone());
+        Ok(g)
+    })
+}
+
+impl Gpu {
+    fn new() -> Result<Self> {
         unsafe {
             let mut d3d: Option<ID3D11Device> = None;
             D3D11CreateDevice(
@@ -49,10 +68,39 @@ impl Renderer {
 
             let d2d_factory: ID2D1Factory1 =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
-            let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let d2d = d2d_factory.CreateDevice(&dxgi_device)?;
 
-            let dxgi_factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let dxgi: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let wic: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+
+            Ok(Gpu { d3d, d2d, dxgi, dcomp, dwrite, wic })
+        }
+    }
+}
+
+pub struct Renderer {
+    _gpu: Gpu,
+    pub dc: ID2D1DeviceContext,
+    swapchain: IDXGISwapChain1,
+    _dcomp_target: IDCompositionTarget,
+    pub dwrite: IDWriteFactory,
+    pub fmt_title: IDWriteTextFormat,
+    pub fmt_clock: IDWriteTextFormat,
+    pub fmt_date: IDWriteTextFormat,
+    pub fmt_glyph: IDWriteTextFormat,
+    pub fmt_status: IDWriteTextFormat,
+    pub dpi: f32,
+}
+
+impl Renderer {
+    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: f32) -> Result<Self> {
+        unsafe {
+            let gpu = gpu()?;
+            let dc = gpu.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -65,16 +113,15 @@ impl Renderer {
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
                 ..Default::default()
             };
-            let swapchain = dxgi_factory.CreateSwapChainForComposition(&d3d, &desc, None)?;
+            let swapchain = gpu.dxgi.CreateSwapChainForComposition(&gpu.d3d, &desc, None)?;
 
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
-            let dcomp_target = dcomp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = dcomp.CreateVisual()?;
+            let dcomp_target = gpu.dcomp.CreateTargetForHwnd(hwnd, true)?;
+            let visual = gpu.dcomp.CreateVisual()?;
             visual.SetContent(&swapchain)?;
             dcomp_target.SetRoot(&visual)?;
-            dcomp.Commit()?;
+            gpu.dcomp.Commit()?;
 
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let dwrite = gpu.dwrite.clone();
             let mk = |family: windows::core::PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT| {
                 dwrite.CreateTextFormat(
                     family,
@@ -110,10 +157,9 @@ impl Renderer {
             fmt_status.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             let mut r = Renderer {
-                _d3d: d3d,
+                _gpu: gpu,
                 dc,
                 swapchain,
-                _dcomp: dcomp,
                 _dcomp_target: dcomp_target,
                 dwrite,
                 fmt_title,

@@ -246,6 +246,10 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         SetTimer(Some(hwnd), TIMER_CLOCK, 1000, None);
         SetTimer(Some(hwnd), TIMER_RESYNC, 2000, None);
 
+        if let Err(e) = crate::desktop::spawn(dpi) {
+            eprintln!("glide-shell: desktop window failed: {e}");
+        }
+
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         bar.paint();
 
