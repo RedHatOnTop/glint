@@ -108,6 +108,11 @@ explorer.exe를 이 계정 한정(HKCU)으로 `glide-shell.exe`로 교체한다.
 - **egui 상주 = ~100MB급이 release에서도 유지됨** → 상주 셸은 raw win32 확정.
 - 목표 예산: glide-shell **<40MB** (D2D/D3D 디바이스 비용 포함 — 정직한 숫자.
   GDI였으면 <20MB지만 "아름답게"에 지불하는 값이고, egui 127MB의 1/3. M1 게이트에서 실측),
+  **M1 첫 컷 실측(0721, release): WS 60MB / Private 41MB — WS 기준 예산 초과.**
+  본체는 D3D 디바이스 인프라(스왑체인 자체는 바 폭 기준 ~0.7MB×2). 최적화 후보:
+  창 늘어날 때 디바이스 공유(트레이/토스트가 같은 디바이스 쓰면 증분 ~0),
+  `PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`, 아이콘 캐시 상한. Private 41은 예산 턱걸이 —
+  게이트 판정은 M1 마감 시 재실측으로,
   glint 상주(egui, 어쩔 수 없음) ~100MB, glide는 온디맨드.
   합계 ≈ 140~170MB로 explorer 생태계 712MB 대비 **~550MB 순절감**.
   16GB(실측 free 3.2GB) 박스에서 이게 이 프로젝트의 실질 보상.
@@ -350,6 +355,13 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   appbar 예약 + 창 목록/활성/클릭 + 시계. explorer 바는 자동 숨김으로 공존.
   게이트: 하루 도그푸드 — 창 전환을 우리 바로만 — **+ 미감 게이트**(acrylic + teal +
   호버/활성 애니메이션이 보일 것; stock 흉내면 실패 — 원칙 4) **+ RAM 실측 <40MB**(§4).
+  **첫 컷 SHIPPED 0721**: 전 스택(D2D/DWrite/DComp/acrylic) + appbar 스택 공존 +
+  창 목록/아이콘/활성 teal 언더라인/FLASH amber/시계(한글 요일) 라이브 렌더 검증,
+  활성 추적 실시간 동작 스크린샷 확인. 잔여: 도그푸드, 호버/클릭 육안 검증(스크립트
+  클릭은 유저 사용 중이라 미실행), RAM 초과분(§4), alongside 모드에서 explorer 바와의
+  갭 밴드(코스메틱, explorer-kill 세션에서 재확인). 함정 기록: windows-rs에서
+  `WM_MOUSELEAVE`는 `Win32_UI_Controls` 소속 — 스코프에 없으면 match에서 바인딩
+  패턴으로 전락해 **이후 모든 arm을 삼킴**(클릭/appbar 콜백 전사). 로컬 const로 해결.
 - **M2 — tray + 상태** (2~3세션, 최고 난이도)
   Shell_TrayWnd 프로토콜 전체 + 벌룬 + 상태 글리프. 게이트: explorer 죽인 세션에서
   TaskbarCreated 브로드캐스트 → 기존 앱 아이콘 등장, 클릭 메뉴 정상, 벌룬 렌더.

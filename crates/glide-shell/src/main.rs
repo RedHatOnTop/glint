@@ -1,11 +1,14 @@
 //! glide-shell — resident shell replacement (design: docs/SHELL_DESIGN.md).
 //!
-//! Current state: M4 gating spike only. `--spike-toasts` verifies that
-//! `UserNotificationListener` works from an unpackaged win32 process on this
-//! machine — per SHELL_DESIGN §6.7 / §8, spike failure puts the whole swap
-//! on hold, which is why this runs before M1.
+//! Default run = M1 taskbar (alongside explorer; the appbar system stacks us
+//! above the stock bar). `--spike-toasts` is the M4 gating spike, kept for
+//! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
+mod icons;
+mod render;
 mod spike_toasts;
+mod taskbar;
+mod theme;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,8 +20,16 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(30);
             spike_toasts::run(wait_secs)
         }
+        None => {
+            unsafe {
+                let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                    windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                );
+            }
+            taskbar::run()
+        }
         _ => {
-            eprintln!("usage: glide-shell --spike-toasts [wait_secs]");
+            eprintln!("usage: glide-shell [--spike-toasts [wait_secs]]");
             Ok(())
         }
     }
