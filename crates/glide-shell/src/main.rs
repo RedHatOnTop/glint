@@ -5,6 +5,7 @@
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
 mod autostart;
+mod config;
 mod desktop;
 mod flyout;
 mod icons;
@@ -13,6 +14,7 @@ mod preview;
 mod render;
 mod safety;
 mod secondary;
+mod settings;
 mod shellmenu;
 mod spike_toasts;
 mod startmenu;
@@ -42,6 +44,31 @@ fn main() -> anyhow::Result<()> {
         Some("--register") => safety::register(),
         Some("--unregister") => safety::unregister(),
         Some("--selftest-crashloop") => safety::selftest_crashloop(),
+        Some("--settings") => {
+            // Standalone settings window (dev/verification; normally the bar
+            // menu opens it in-process). Changes still land in settings.txt;
+            // a running bar picks them up on its next WM_SETTINGS_CHANGED.
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                );
+                let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                    windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                );
+                let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem() as f32;
+                let mut app = settings::SettingsApp::new(dpi)?;
+                app.open(windows::Win32::Foundation::HWND(std::ptr::null_mut()));
+                let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+                while windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0)
+                    .into()
+                {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                }
+            }
+            Ok(())
+        }
         None | Some("--tray-claim") => {
             // --tray-claim: also register as Shell_TrayWnd. Racy while
             // explorer lives — meant for explorer-kill sessions (M2 gate).

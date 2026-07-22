@@ -68,6 +68,7 @@ const MENU_TASKMGR: usize = 4;
 const MENU_RESTART: usize = 5;
 const MENU_QUIT: usize = 6;
 const MENU_NEWWIN: usize = 7;
+const MENU_SETTINGS: usize = 8;
 /// Win10 show-desktop sliver at the far right edge.
 const DESK_W: f32 = 8.0;
 /// Rescue hotkeys (§7 ladder 4): Ctrl+Alt+Shift+E / +R.
@@ -162,6 +163,8 @@ pub struct Bar {
     desk_hover: bool,
     /// Windows minimized by the show-desktop sliver, restored on re-click.
     desk_stash: Vec<isize>,
+    cfg: crate::config::Settings,
+    settings: crate::settings::SettingsApp,
 }
 
 /// Cells in the status cluster, left→right; presence varies (no battery on
@@ -263,6 +266,8 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             start_hover: false,
             desk_hover: false,
             desk_stash: Vec::new(),
+            cfg: crate::config::load(),
+            settings: crate::settings::SettingsApp::new(dpi)?,
         };
         bar.refresh();
         bar.rebuild_secondaries();
@@ -700,7 +705,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             crate::winkey::WM_WINKEY => {
+                // Win = start menu (Win10 muscle memory, settings-switchable);
+                // the pre-0722 glint binding lives on Win+S.
+                if bar.cfg.winkey_start {
+                    bar.start_toggle(hwnd);
+                } else {
+                    crate::winkey::toggle_glint();
+                }
+                LRESULT(0)
+            }
+            crate::winkey::WM_WINKEY_S => {
                 crate::winkey::toggle_glint();
+                LRESULT(0)
+            }
+            crate::settings::WM_SETTINGS_CHANGED => {
+                bar.cfg = crate::config::load();
+                bar.refresh();
+                bar.rebuild_secondaries();
+                bar.paint();
                 LRESULT(0)
             }
             WM_HOTKEY => {
@@ -871,17 +893,31 @@ impl Bar {
         cells
     }
 
+    /// Sliver width, 0 when disabled in settings.
+    fn desk_w(&self) -> f32 {
+        if self.cfg.desk_sliver { DESK_W } else { 0.0 }
+    }
+
+    /// Clock cell width; seconds need the wider cut.
+    fn clock_w(&self) -> f32 {
+        if self.cfg.clock_seconds { 110.0 } else { CLOCK_W }
+    }
+
     /// Logical x of the status cluster's left edge (right of it: clock).
     fn status_left(&self) -> f32 {
-        self.width - DESK_W - CLOCK_W - (self.status_cells().len() as f32 * STATUS_CELL_W) - 2.0
+        self.width
+            - self.desk_w()
+            - self.clock_w()
+            - (self.status_cells().len() as f32 * STATUS_CELL_W)
+            - 2.0
     }
 
     fn desk_hit(&self, x: f32) -> bool {
-        x >= self.width - DESK_W
+        self.cfg.desk_sliver && x >= self.width - DESK_W
     }
 
     fn clock_hit(&self, x: f32) -> bool {
-        x >= self.width - DESK_W - CLOCK_W && x < self.width - DESK_W
+        x >= self.width - self.desk_w() - self.clock_w() && x < self.width - self.desk_w()
     }
 
     /// Show-desktop toggle: first click minimizes everything visible, second
@@ -1080,6 +1116,9 @@ impl Bar {
     /// or off is just this list changing.
     fn rebuild_secondaries(&mut self) {
         self.secondaries.clear();
+        if !self.cfg.secondary_bars {
+            return;
+        }
         for (mon, primary) in crate::secondary::monitors() {
             if primary {
                 continue;
@@ -1100,7 +1139,11 @@ impl Bar {
         let text_w = self
             .renderer
             .text_width(&title, &self.renderer.fmt_title, theme::BUTTON_MAX_W);
-        let width = (10.0 + 20.0 + 8.0 + text_w + 12.0).min(theme::BUTTON_MAX_W);
+        let width = if self.cfg.labels {
+            (10.0 + 20.0 + 8.0 + text_w + 12.0).min(theme::BUTTON_MAX_W)
+        } else {
+            BUTTON_MIN_W
+        };
         self.icon_cache
             .entry(key)
             .or_insert_with(|| icons::window_icon(&self.renderer.dc, h));
@@ -1482,6 +1525,7 @@ impl Bar {
                 let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(wide.as_ptr()));
             };
+            add(MENU_SETTINGS, "작업 표시줄 설정");
             add(MENU_TASKMGR, "작업 관리자");
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             add(MENU_RESTART, "glide-shell 다시 시작");
@@ -1500,6 +1544,10 @@ impl Bar {
             );
             let _ = DestroyMenu(menu);
             match cmd.0 as usize {
+                MENU_SETTINGS => {
+                    let hwnd = self.hwnd;
+                    self.settings.open(hwnd);
+                }
                 MENU_TASKMGR => {
                     windows::Win32::UI::Shell::ShellExecuteW(
                         None,
@@ -1643,9 +1691,13 @@ impl Bar {
                 }
             }
 
-            // Icon 20×20: left-aligned in window buttons, centered in
-            // launcher slots. Launchers render dimmed.
-            let icon_left = if e.hwnd.is_some() { cx + 10.0 } else { cx + (e.width - 20.0) / 2.0 };
+            // Icon 20×20: left-aligned in labeled window buttons, centered in
+            // launcher slots and icon-only mode. Launchers render dimmed.
+            let icon_left = if e.hwnd.is_some() && self.cfg.labels {
+                cx + 10.0
+            } else {
+                cx + (e.width - 20.0) / 2.0
+            };
             let icon_rect = D2D_RECT_F {
                 left: icon_left,
                 top: (bar_h - 20.0) / 2.0,
@@ -1673,8 +1725,8 @@ impl Bar {
                 );
             }
 
-            // Title (window buttons only), clipped to the button.
-            if e.hwnd.is_some() {
+            // Title (labeled window buttons only), clipped to the button.
+            if e.hwnd.is_some() && self.cfg.labels {
                 let text_color = if e.flash { theme::FLASH } else { theme::TEXT };
                 if let Ok(b) = r.brush(text_color) {
                     let text_rect = D2D_RECT_F {
@@ -1976,7 +2028,11 @@ impl Bar {
 
             // Clock block, right-aligned: HH:MM over M/D (요일).
             let now = chrono::Local::now();
-            let hhmm: Vec<u16> = now.format("%H:%M").to_string().encode_utf16().collect();
+            let hhmm: Vec<u16> = now
+                .format(if self.cfg.clock_seconds { "%H:%M:%S" } else { "%H:%M" })
+                .to_string()
+                .encode_utf16()
+                .collect();
             let wd = ["월", "화", "수", "목", "금", "토", "일"]
                 [chrono::Datelike::weekday(&now).num_days_from_monday() as usize];
             let date: Vec<u16> = format!(
@@ -1986,8 +2042,8 @@ impl Bar {
             )
             .encode_utf16()
             .collect();
-            let clock_left = self.width - DESK_W - CLOCK_W;
-            let clock_right = self.width - DESK_W - 8.0;
+            let clock_left = self.width - self.desk_w() - self.clock_w();
+            let clock_right = self.width - self.desk_w() - 8.0;
             if let Ok(b) = r.brush(theme::TEXT) {
                 r.dc.DrawText(
                     &hhmm,
@@ -2010,27 +2066,31 @@ impl Bar {
             }
 
             // Show-desktop sliver: hairline divider, fills on hover (Win10).
-            let sx = self.width - DESK_W;
-            if self.desk_hover {
-                if let Ok(b) = r.brush(theme::rgba(255, 255, 255, theme::HOVER_FILL.a)) {
+            if self.cfg.desk_sliver {
+                let sx = self.width - DESK_W;
+                if self.desk_hover {
+                    if let Ok(b) = r.brush(theme::rgba(255, 255, 255, theme::HOVER_FILL.a)) {
+                        r.dc.FillRectangle(
+                            &D2D_RECT_F { left: sx, top: 0.0, right: self.width, bottom: theme::BAR_HEIGHT },
+                            &b,
+                        );
+                    }
+                }
+                if let Ok(b) = r.brush(theme::rgba(255, 255, 255, 0.10)) {
                     r.dc.FillRectangle(
-                        &D2D_RECT_F { left: sx, top: 0.0, right: self.width, bottom: theme::BAR_HEIGHT },
+                        &D2D_RECT_F { left: sx, top: 8.0, right: sx + 1.0, bottom: theme::BAR_HEIGHT - 8.0 },
                         &b,
                     );
                 }
-            }
-            if let Ok(b) = r.brush(theme::rgba(255, 255, 255, 0.10)) {
-                r.dc.FillRectangle(
-                    &D2D_RECT_F { left: sx, top: 8.0, right: sx + 1.0, bottom: theme::BAR_HEIGHT - 8.0 },
-                    &b,
-                );
             }
 
             // Dragged button floats on top, following the cursor.
             if let Some((di, float_left)) = dragging {
                 let w = self.entries[di].width;
-                let left = float_left
-                    .clamp(ENTRY_X0, (self.width - DESK_W - CLOCK_W - w - 4.0).max(ENTRY_X0));
+                let left = float_left.clamp(
+                    ENTRY_X0,
+                    (self.width - self.desk_w() - self.clock_w() - w - 4.0).max(ENTRY_X0),
+                );
                 self.draw_entry(di, left, true);
             }
 

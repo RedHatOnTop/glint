@@ -26,15 +26,19 @@ use windows::core::PCWSTR;
 
 /// Posted to the bar window when a bare Win release was captured.
 pub const WM_WINKEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
+/// Posted when Win+S was captured (search — glint).
+pub const WM_WINKEY_S: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
 
 // PowerToys' masking key: reserved VK, no app reacts to it, but its presence
 // between Win-down and Win-up stops explorer treating the Win press as bare.
 const VK_DUMMY: u16 = 0xFF;
+const VK_S: u32 = 0x53;
 
 thread_local! {
     static BAR: Cell<isize> = const { Cell::new(0) };
     static WIN_DOWN: Cell<bool> = const { Cell::new(false) };
     static OTHER_KEY: Cell<bool> = const { Cell::new(false) };
+    static SWALLOW_S: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Install the hook on the current (taskbar) thread; `bar` receives
@@ -63,7 +67,32 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                             OTHER_KEY.set(false);
                         }
                     }
-                    WM_KEYDOWN | WM_SYSKEYDOWN => OTHER_KEY.set(true),
+                    WM_KEYDOWN | WM_SYSKEYDOWN => {
+                        // Win+S: ours (glint search), never the stock search
+                        // pane. Swallow every S repeat while Win is held and
+                        // mask once with the dummy so the Win release that
+                        // follows doesn't read as bare.
+                        if WIN_DOWN.get() && kb.vkCode == VK_S {
+                            OTHER_KEY.set(true);
+                            if !SWALLOW_S.get() {
+                                SWALLOW_S.set(true);
+                                send_keys(&[(VK_DUMMY, false), (VK_DUMMY, true)]);
+                                let _ = PostMessageW(
+                                    Some(HWND(BAR.get() as *mut _)),
+                                    WM_WINKEY_S,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            }
+                            return LRESULT(1);
+                        }
+                        OTHER_KEY.set(true);
+                    }
+                    WM_KEYUP | WM_SYSKEYUP if kb.vkCode == VK_S && SWALLOW_S.get() => {
+                        // The matching release of a swallowed S press.
+                        SWALLOW_S.set(false);
+                        return LRESULT(1);
+                    }
                     WM_KEYUP | WM_SYSKEYUP if win => {
                         let bare = WIN_DOWN.get() && !OTHER_KEY.get();
                         WIN_DOWN.set(false);
