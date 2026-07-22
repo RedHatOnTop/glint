@@ -143,6 +143,13 @@ impl Status {
         }
     }
 
+    /// Default render device changed (flyout switch): the cached endpoint
+    /// still points at the old device and would keep answering for it.
+    pub fn rebind_volume(&mut self) {
+        self.endpoint = None;
+        self.poll_volume();
+    }
+
     /// Wheel over the volume cell: ±steps of 2%.
     pub fn adjust_volume(&mut self, steps: f32) {
         unsafe {

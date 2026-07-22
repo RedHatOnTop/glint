@@ -44,6 +44,9 @@ use crate::render::Renderer;
 use crate::{icons, theme};
 
 pub(crate) const WM_APPBAR: u32 = WM_APP + 1;
+/// Posted by the volume flyout after a default-device switch so the status
+/// cluster's cached endpoint follows (the OSD gets its own WM_APP_REBIND).
+pub(crate) const WM_AUDIO_REBIND: u32 = WM_APP + 17;
 // In windows-rs metadata this lives in Win32_UI_Controls; not worth the
 // feature for one message id.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -587,7 +590,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(t) = bar.tray_hit(x) {
                     bar.tray_forward(t, WM_LBUTTONDBLCLK);
                 } else if bar.start_hit(x) {
-                    bar.start_toggle(hwnd);
+                    // Deliberately nothing: the pair's own UPs already toggle
+                    // once each; acting here too made a fast double-click net
+                    // out to "menu stays open".
                 } else if let Some(i) = bar.hit_test(x) {
                     bar.drag = Some(Drag {
                         idx: i,
@@ -624,7 +629,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         bar.tray_forward(t, NIN_SELECT);
                     }
                 } else if bar.start_hit(x) {
-                    bar.start_toggle(hwnd);
+                    bar.start_toggle(hwnd, true);
                 } else if let Some(s) = bar.status_hit(x) {
                     match bar.status_cells().get(s) {
                         Some(StatusCell::Ime) => crate::status::send_hangul_key(),
@@ -718,7 +723,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // Win = start menu (Win10 muscle memory, settings-switchable);
                 // the pre-0722 glint binding lives on Win+S.
                 if bar.cfg.winkey_start {
-                    bar.start_toggle(hwnd);
+                    bar.start_toggle(hwnd, false);
                 } else {
                     crate::winkey::toggle_glint();
                 }
@@ -726,6 +731,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             crate::winkey::WM_WINKEY_S => {
                 crate::winkey::toggle_glint();
+                LRESULT(0)
+            }
+            WM_AUDIO_REBIND => {
+                bar.status.rebind_volume();
+                bar.paint();
                 LRESULT(0)
             }
             crate::clickaway::WM_CLICKAWAY => {
@@ -1228,11 +1238,16 @@ impl Bar {
         {
             return;
         }
-        self.close_popups();
+        self.start.dismiss();
+        self.flyout.dismiss();
+        self.paint();
     }
 
     /// Toggle the start menu from its bar button; closes the other popups.
-    fn start_toggle(&mut self, hwnd: HWND) {
+    /// `mouse` marks button-driven toggles: their DOWN may already have
+    /// dismissed the menu (WA_INACTIVE/click-away fire before the UP gets
+    /// here), and reopening then would undo the user's close.
+    fn start_toggle(&mut self, hwnd: HWND, mouse: bool) {
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
         }
@@ -1240,7 +1255,7 @@ impl Bar {
         self.flyout.hide();
         if self.start.open {
             self.start.hide();
-        } else {
+        } else if !(mouse && self.start.just_dismissed()) {
             let mut rect = RECT::default();
             unsafe {
                 let _ = GetWindowRect(self.hwnd, &mut rect);
@@ -1251,6 +1266,8 @@ impl Bar {
     }
 
     /// Toggle a status-cell flyout: same cell closes, another cell switches.
+    /// Always mouse-driven — a fresh dismissal of the same kind swallows the
+    /// toggle (see start_toggle), a different kind still switches panels.
     fn flyout_toggle(&mut self, hwnd: HWND, kind: crate::flyout::Kind) {
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
@@ -1259,7 +1276,7 @@ impl Bar {
         self.start.hide();
         if self.flyout.kind == Some(kind) {
             self.flyout.hide();
-        } else {
+        } else if !self.flyout.just_dismissed(kind) {
             let mut rect = RECT::default();
             unsafe {
                 let _ = GetWindowRect(self.hwnd, &mut rect);

@@ -21,9 +21,12 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender};
+use windows::Win32::Media::Audio::{
+    DEVICE_STATE_ACTIVE, EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+    eMultimedia, eRender,
+};
 use windows::Win32::System::Com::StructuredStorage::PropVariantToString;
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, STGM_READ};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::System::Power::GetSystemPowerStatus;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -44,6 +47,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_REFRESH: usize = 1;
 const W: f32 = 344.0;
 const ROW_H: f32 = 42.0;
+/// Audio device rows (volume panel) are a little tighter than Wi-Fi rows.
+const DEV_ROW_H: f32 = 34.0;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -59,11 +64,21 @@ enum Act {
     Slider,
     WifiToggle,
     Row(usize),
+    OutDev(usize),
+    InDev(usize),
     NetSettings,
     PowerSettings,
     CalPrev,
     CalNext,
     CalToday,
+}
+
+/// One render/capture endpoint in the volume panel.
+struct AudioDev {
+    /// Null-terminated MMDevice endpoint ID, ready for IPolicyConfig.
+    id: Vec<u16>,
+    name: String,
+    default: bool,
 }
 
 pub struct Flyout {
@@ -75,6 +90,11 @@ pub struct Flyout {
     fmt_g16: IDWriteTextFormat,
     fmt_g30: IDWriteTextFormat,
     pub kind: Option<Kind>,
+    /// Set by dismiss(): a real click's mouse-down killed the panel via
+    /// WA_INACTIVE/click-away before the click's UP reached the bar. The
+    /// bar's toggle consults this so that UP doesn't reopen what its own
+    /// DOWN just closed.
+    last_dismissed: Option<(Kind, std::time::Instant)>,
     scale: f32,
     w: f32,
     h: f32,
@@ -90,6 +110,8 @@ pub struct Flyout {
     endpoint: Option<IAudioEndpointVolume>,
     vol: Option<(f32, bool)>,
     device: String,
+    outs: Vec<AudioDev>,
+    ins: Vec<AudioDev>,
     // network
     wifi: Option<crate::wifi::Wifi>,
     nets: Vec<crate::wifi::Net>,
@@ -197,6 +219,7 @@ impl Flyout {
                 fmt_g16,
                 fmt_g30,
                 kind: None,
+                last_dismissed: None,
                 scale: dpi / 96.0,
                 w: 0.0,
                 h: 0.0,
@@ -211,6 +234,8 @@ impl Flyout {
                 endpoint: None,
                 vol: None,
                 device: String::new(),
+                outs: Vec::new(),
+                ins: Vec::new(),
                 wifi: None,
                 nets: Vec::new(),
                 radio_on: false,
@@ -241,6 +266,7 @@ impl Flyout {
             Kind::Volume => {
                 self.poll_volume();
                 self.device = device_name().unwrap_or_else(|| "스피커".to_string());
+                self.poll_devices();
             }
             Kind::Network => {
                 if self.wifi.is_none() {
@@ -291,9 +317,31 @@ impl Flyout {
         self.hover = None;
     }
 
+    /// Hide caused by the user clicking elsewhere (WA_INACTIVE, click-away)
+    /// rather than by a toggle — stamps the kind so the same click's UP on
+    /// the status cell doesn't reopen the panel it just closed.
+    pub fn dismiss(&mut self) {
+        if let Some(k) = self.kind {
+            self.last_dismissed = Some((k, std::time::Instant::now()));
+        }
+        self.hide();
+    }
+
+    /// True while a fresh dismissal of `kind` should swallow the toggle.
+    pub fn just_dismissed(&self, kind: Kind) -> bool {
+        self.last_dismissed
+            .is_some_and(|(k, t)| k == kind && t.elapsed().as_millis() < 400)
+    }
+
     fn measure(&self) -> (f32, f32) {
         match self.kind {
-            Some(Kind::Volume) => (W, 86.0),
+            Some(Kind::Volume) => {
+                // 출력/입력 device sections above the slider block.
+                let sect = |n: usize| {
+                    if n == 0 { 0.0 } else { 24.0 + n as f32 * DEV_ROW_H + 6.0 }
+                };
+                (W, 8.0 + sect(self.outs.len()) + sect(self.ins.len()) + 6.0 + 36.0 + 8.0)
+            }
             Some(Kind::Network) => {
                 let rows = if self.radio_on { self.nets.len().max(1) } else { 1 };
                 (W, 56.0 + rows as f32 * ROW_H + 17.0 + 40.0 + 8.0)
@@ -354,6 +402,85 @@ impl Flyout {
         }
     }
 
+    /// Enumerate active render/capture endpoints and mark the defaults.
+    fn poll_devices(&mut self) {
+        unsafe {
+            let Ok(enumerator) =
+                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            else {
+                return;
+            };
+            let list = |flow: EDataFlow| -> Vec<AudioDev> {
+                let take_id = |p: windows::core::PWSTR| {
+                    let v = p.as_wide().to_vec();
+                    CoTaskMemFree(Some(p.0 as _));
+                    v
+                };
+                let default_id = enumerator
+                    .GetDefaultAudioEndpoint(flow, eMultimedia)
+                    .ok()
+                    .and_then(|d| d.GetId().ok().map(take_id))
+                    .unwrap_or_default();
+                let mut devs = Vec::new();
+                let Ok(col) = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) else {
+                    return devs;
+                };
+                for i in 0..col.GetCount().unwrap_or(0) {
+                    let Ok(dev) = col.Item(i) else { continue };
+                    let Ok(idp) = dev.GetId() else { continue };
+                    let mut id = take_id(idp);
+                    let default = id == default_id;
+                    let name = dev
+                        .OpenPropertyStore(STGM_READ)
+                        .ok()
+                        .and_then(|ps| ps.GetValue(&PKEY_Device_FriendlyName).ok())
+                        .and_then(|pv| {
+                            let mut buf = [0u16; 128];
+                            PropVariantToString(&pv, &mut buf).ok()?;
+                            let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+                            let s = String::from_utf16_lossy(&buf[..len]);
+                            (!s.is_empty()).then_some(s)
+                        })
+                        .unwrap_or_else(|| "오디오 장치".to_string());
+                    id.push(0); // PCWSTR for IPolicyConfig
+                    devs.push(AudioDev { id, name, default });
+                }
+                devs
+            };
+            self.outs = list(eRender);
+            self.ins = list(eCapture);
+        }
+    }
+
+    /// Device row clicked: make it the default and rebind everything that
+    /// watches the (old) default.
+    fn set_default_device(&mut self, id: Vec<u16>) {
+        if let Err(e) = crate::audiopolicy::set_default_endpoint(&id) {
+            eprintln!("glide-shell: SetDefaultEndpoint failed: {e:?}");
+            return;
+        }
+        // The slider endpoint and the OSD's change subscription both point at
+        // the previous default; drop ours, tell the OSD to resubscribe.
+        self.endpoint = None;
+        self.poll_volume();
+        self.device = device_name().unwrap_or_else(|| "스피커".to_string());
+        self.poll_devices();
+        unsafe {
+            if let Ok(osd) = FindWindowW(w!("glide_shell_osd"), PCWSTR::null()) {
+                let _ = PostMessageW(Some(osd), crate::osd::WM_APP_REBIND, WPARAM(0), LPARAM(0));
+            }
+            if let Ok(bar) = FindWindowW(w!("glide_shell_bar"), PCWSTR::null()) {
+                let _ = PostMessageW(
+                    Some(bar),
+                    crate::taskbar::WM_AUDIO_REBIND,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+        self.relayout();
+    }
+
     fn poll_battery(&mut self) {
         unsafe {
             let mut sps = Default::default();
@@ -375,7 +502,7 @@ impl Flyout {
             // and the user moved on, WA_INACTIVE never comes — close here.
             let fg = GetForegroundWindow();
             if fg != self.hwnd && fg != self.fg_at_open {
-                self.hide();
+                self.dismiss();
                 return;
             }
         }
@@ -493,6 +620,22 @@ impl Flyout {
                     }
                 }
             }
+            Act::OutDev(i) => {
+                if let Some(d) = self.outs.get(i) {
+                    if !d.default {
+                        let id = d.id.clone();
+                        self.set_default_device(id);
+                    }
+                }
+            }
+            Act::InDev(i) => {
+                if let Some(d) = self.ins.get(i) {
+                    if !d.default {
+                        let id = d.id.clone();
+                        self.set_default_device(id);
+                    }
+                }
+            }
             Act::NetSettings => {
                 open_settings("ms-settings:network");
                 self.hide();
@@ -586,11 +729,47 @@ impl Flyout {
     }
 
     fn paint_volume(&mut self) {
-        let name = self.device.clone();
-        self.text(&name, &self.renderer.fmt_title.clone(), rect(16.0, 6.0, 328.0, 34.0), theme::TEXT_DIM);
+        // 출력/입력 device sections, default marked with a check; clicking a
+        // non-default row switches the default endpoint (IPolicyConfig).
+        let mut y = 8.0;
+        let sections: [(&str, Vec<(String, bool)>, fn(usize) -> Act); 2] = [
+            (
+                "출력",
+                self.outs.iter().map(|d| (d.name.clone(), d.default)).collect(),
+                Act::OutDev as fn(usize) -> Act,
+            ),
+            (
+                "입력",
+                self.ins.iter().map(|d| (d.name.clone(), d.default)).collect(),
+                Act::InDev as fn(usize) -> Act,
+            ),
+        ];
+        for (title, devs, mk) in sections {
+            if devs.is_empty() {
+                continue;
+            }
+            self.text(title, &self.fmt_head.clone(), rect(16.0, y, 200.0, y + 24.0), theme::TEXT_DIM);
+            y += 24.0;
+            for (i, (name, default)) in devs.iter().enumerate() {
+                let row = rect(8.0, y, 336.0, y + DEV_ROW_H);
+                if self.hover == Some(mk(i)) {
+                    self.fill_round(row, 6.0, theme::HOVER_FILL);
+                }
+                if *default {
+                    self.glyph(0xE73E, &self.fmt_g16.clone(), rect(14.0, y, 44.0, y + DEV_ROW_H), theme::ACCENT);
+                }
+                let tc = if *default { theme::TEXT } else { theme::TEXT_DIM };
+                self.text(name, &self.renderer.fmt_title.clone(), rect(52.0, y, 330.0, y + DEV_ROW_H), tc);
+                self.hits.push((row, mk(i)));
+                y += DEV_ROW_H;
+            }
+            y += 6.0;
+        }
+        self.fill_round(rect(14.0, y, 330.0, y + 1.0), 0.0, theme::rgba(255, 255, 255, 0.08));
+        y += 6.0;
 
         let (v, muted) = self.vol.unwrap_or((0.0, true));
-        let btn = rect(14.0, 38.0, 50.0, 74.0);
+        let btn = rect(14.0, y, 50.0, y + 36.0);
         if self.hover == Some(Act::Mute) {
             self.fill_round(btn, 6.0, theme::HOVER_FILL);
         }
@@ -598,7 +777,7 @@ impl Flyout {
         self.glyph(g, &self.fmt_g16.clone(), btn, theme::TEXT);
         self.hits.push((btn, Act::Mute));
 
-        let track = rect(62.0, 54.0, 282.0, 58.0);
+        let track = rect(62.0, y + 16.0, 282.0, y + 20.0);
         self.slider = track;
         self.fill_round(track, 2.0, theme::rgba(255, 255, 255, 0.16));
         let fx = track.left + (track.right - track.left) * v;
@@ -612,7 +791,7 @@ impl Flyout {
             if let Ok(b) = self.renderer.brush(color) {
                 self.renderer.dc.FillEllipse(
                     &D2D1_ELLIPSE {
-                        point: Vector2 { X: fx, Y: 56.0 },
+                        point: Vector2 { X: fx, Y: y + 18.0 },
                         radiusX: 8.0,
                         radiusY: 8.0,
                     },
@@ -620,10 +799,10 @@ impl Flyout {
                 );
             }
         }
-        self.hits.push((rect(54.0, 38.0, 290.0, 74.0), Act::Slider));
+        self.hits.push((rect(54.0, y, 290.0, y + 36.0), Act::Slider));
 
         let pct = format!("{:.0}", v * 100.0);
-        self.text(&pct, &self.fmt_pct.clone(), rect(290.0, 38.0, 334.0, 74.0), theme::TEXT);
+        self.text(&pct, &self.fmt_pct.clone(), rect(290.0, y, 334.0, y + 36.0), theme::TEXT);
     }
 
     fn paint_network(&mut self) {
@@ -922,7 +1101,7 @@ extern "system" fn flyout_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_ERASEBKGND => LRESULT(1),
             WM_ACTIVATE => {
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                    fly.hide();
+                    fly.dismiss();
                 }
                 LRESULT(0)
             }

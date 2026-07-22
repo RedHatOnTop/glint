@@ -221,6 +221,9 @@ pub struct StartMenu {
     fmt_section: IDWriteTextFormat,
     fmt_glyph: IDWriteTextFormat,
     pub open: bool,
+    /// See dismiss(): keeps a bar-button UP from reopening the menu its own
+    /// DOWN closed via WA_INACTIVE/click-away.
+    dismissed_at: Option<std::time::Instant>,
     scale: f32,
     w: f32,
     h: f32,
@@ -373,6 +376,7 @@ impl StartMenu {
                 fmt_section,
                 fmt_glyph,
                 open: false,
+                dismissed_at: None,
                 scale: dpi / 96.0,
                 w: 0.0,
                 h: 0.0,
@@ -472,6 +476,21 @@ impl StartMenu {
         }
         self.hover = None;
         self.drag = None;
+    }
+
+    /// Hide caused by the user clicking elsewhere (WA_INACTIVE, click-away):
+    /// stamps the moment so the same click's UP on the start button doesn't
+    /// reopen the menu its own DOWN just closed.
+    pub fn dismiss(&mut self) {
+        if self.open {
+            self.dismissed_at = Some(std::time::Instant::now());
+        }
+        self.hide();
+    }
+
+    pub fn just_dismissed(&self) -> bool {
+        self.dismissed_at
+            .is_some_and(|t| t.elapsed().as_millis() < 400)
     }
 
     // ---- data --------------------------------------------------------------
@@ -1322,7 +1341,7 @@ impl StartMenu {
             // and the user moved on, WA_INACTIVE never comes — close here.
             let fg = GetForegroundWindow();
             if fg != self.hwnd && fg != self.fg_at_open {
-                self.hide();
+                self.dismiss();
             }
         }
     }
@@ -2277,7 +2296,7 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_ACTIVATE => {
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                    sm.hide();
+                    sm.dismiss();
                 }
                 LRESULT(0)
             }

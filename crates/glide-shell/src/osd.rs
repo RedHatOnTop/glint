@@ -44,6 +44,9 @@ use crate::theme;
 
 const WM_APP_VOL: u32 = WM_APP + 12;
 const WM_APP_BRIGHT: u32 = WM_APP + 13;
+/// Posted by the volume flyout after switching the default endpoint: our
+/// change subscription still points at the old device, resubscribe.
+pub const WM_APP_REBIND: u32 = WM_APP + 16;
 const TIMER_HIDE: usize = 1;
 const TIMER_ANIM: usize = 2;
 /// RPC_C_AUTHN_WINNT — the constant lives in Win32_System_Rpc; not worth the
@@ -191,6 +194,34 @@ impl Osd {
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut Osd as isize);
         }
+        self.subscribe();
+        // Brightness watcher. The blocking Next() has no clean cancel; the
+        // thread dies with the process, which is when we'd want it gone.
+        let hwnd_raw = self.hwnd.0 as isize;
+        std::thread::spawn(move || bright_worker(hwnd_raw));
+    }
+
+    pub fn disarm(&mut self) {
+        if let (Some(ep), Some(cb)) = (&self._endpoint, &self._callback) {
+            unsafe {
+                let _ = ep.UnregisterControlChangeNotify(cb);
+            }
+        }
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+        }
+    }
+
+    /// (Re)subscribe to master-volume changes on the current default render
+    /// endpoint. WM_APP_REBIND lands here after a default-device switch.
+    fn subscribe(&mut self) {
+        if let (Some(ep), Some(cb)) = (&self._endpoint, &self._callback) {
+            unsafe {
+                let _ = ep.UnregisterControlChangeNotify(cb);
+            }
+        }
+        self._endpoint = None;
+        self._callback = None;
         let hooked = (|| -> windows::core::Result<(IAudioEndpointVolume, IAudioEndpointVolumeCallback)> {
             unsafe {
                 let enumerator: IMMDeviceEnumerator =
@@ -209,21 +240,6 @@ impl Osd {
                 self._callback = Some(cb);
             }
             Err(e) => eprintln!("glide-shell: volume OSD subscription failed: {e:?}"),
-        }
-        // Brightness watcher. The blocking Next() has no clean cancel; the
-        // thread dies with the process, which is when we'd want it gone.
-        let hwnd_raw = self.hwnd.0 as isize;
-        std::thread::spawn(move || bright_worker(hwnd_raw));
-    }
-
-    pub fn disarm(&mut self) {
-        if let (Some(ep), Some(cb)) = (&self._endpoint, &self._callback) {
-            unsafe {
-                let _ = ep.UnregisterControlChangeNotify(cb);
-            }
-        }
-        unsafe {
-            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
         }
     }
 
@@ -505,6 +521,10 @@ extern "system" fn osd_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_APP_BRIGHT => {
                 o.bump_bright(lparam.0 as u32);
+                LRESULT(0)
+            }
+            WM_APP_REBIND => {
+                o.subscribe();
                 LRESULT(0)
             }
             WM_TIMER => {
