@@ -752,6 +752,28 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   동일 재현 2회로 "제품 버그"처럼 보임. 셀 순서는 [Ime,Net,Vol,Bat]
   (Vol ≈ 디바이스 x1753).** 미검증(도그푸드): 실클릭 WA_INACTIVE 다리,
   실제 장치 전환(유저 라이브 오디오를 끊게 되어 리그 불가).
+- **Win10 통합형 알림 센터 SHIPPED 0722 (199b55b)** *(유저 "전자(Win10 QS+알림
+  통합)부터 하자 — BT/자동회전 등 바에 못 박는 세팅 수납처")*: 시계 오른쪽 벨 셀 →
+  단일 패널(위=놓친 토스트 백로그, 아래=Quick Settings 타일 그리드).
+  ① `actioncenter.rs` — flyout.rs 형제(해제 가드/click-away/WA_INACTIVE 해제/DWM
+  아크릴·라운드). 알림 목록 = 실제 OS 액션센터의 **라이브 뷰**(UserNotificationListener,
+  자체 히스토리 없음): 행 X = RemoveNotification, "모두 지우기" = ClearNotifications →
+  Windows에서도 사라짐. 안 들어가는 백로그는 "이전 알림 N개" 푸터로 접힘.
+  **모든 WinRT `.join()`·라디오 작업은 단명 MTA 워커 스레드**(창은 바 STA에 삶) →
+  워커가 WM_AC_REFRESH(WM_APP+18) post, UI가 스냅샷 drain → **페인트는 락을 절대
+  안 만짐**. ② `quicksettings.rs` — 타일 액추에이터: BT/비행기 = WinRT
+  Windows.Devices.Radios(**신규 Devices_Radios feature**), 자동 회전 = 비공개 user32
+  `GetAutoRotationState`/`SetAutoRotation` 쌍(문서화된 setter 없음 = 스톡 잠금 타일
+  경로), Wi-Fi = wifi.rs 재사용. 부재/미지원 라디오는 dim 렌더. ③ taskbar: 벨 셀
+  =시계와 슬리버 사이(레이아웃 산수 status_left/clock_right_edge에 NOTIF_CELL_W 반영),
+  ac_toggle는 start/flyout과 동일 가드, close_popups/click_away/상호배제에 합류.
+  clickaway: AC_OPEN이 훅 "팝업 열림" 조건에 합류. **검증(posted 리그+스크린샷):
+  벨 개폐, 실제 백로그 렌더(카드 5 + "이전 알림 14개"), Wi-Fi·BT 실제 라디오 상태
+  액센트-ON, 패널이 포그라운드 잡음(실 click-away 해제 성립), 2회차 벨 = 토글 닫힘.**
+  미검증(도그푸드 — 전 경로가 실상태 변경): 행 해제/모두 지우기(유저 실알림 삭제),
+  BT/비행기/자동회전 토글(연결 끊김·화면 회전), 야간/설정 딥링크, 실클릭 WA_INACTIVE
+  가드 다리. **함정: 새 PS 프로세스가 포그라운드를 뺏어 AC를 해제시킴 → 열기+스샷은
+  반드시 한 프로세스에서(같은 프로세스가 sleep만 하면 포커스 유지).**
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
