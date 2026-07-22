@@ -405,10 +405,15 @@ impl StartMenu {
         }
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn show(&mut self, bar_rect: RECT) {
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut StartMenu as isize);
         }
+        crate::clickaway::set_start_open(true);
         if self
             .loaded_at
             .is_none_or(|t| t.elapsed().as_secs() > STALE_SECS)
@@ -457,6 +462,7 @@ impl StartMenu {
     }
 
     pub fn hide(&mut self) {
+        crate::clickaway::set_start_open(false);
         if self.open {
             self.open = false;
             unsafe {

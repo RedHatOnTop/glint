@@ -15,8 +15,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VIRTUAL_KEY, VK_LWIN, VK_RWIN,
+    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, PostMessageW, SW_SHOWNORMAL,
@@ -71,8 +71,10 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                         // Win+S: ours (glint search), never the stock search
                         // pane. Swallow every S repeat while Win is held and
                         // mask once with the dummy so the Win release that
-                        // follows doesn't read as bare.
-                        if WIN_DOWN.get() && kb.vkCode == VK_S {
+                        // follows doesn't read as bare. Only the plain chord:
+                        // Win+Shift+S is the OS snipping shortcut (and any
+                        // other modifier isn't ours either).
+                        if WIN_DOWN.get() && kb.vkCode == VK_S && !modifier_down() {
                             OTHER_KEY.set(true);
                             if !SWALLOW_S.get() {
                                 SWALLOW_S.set(true);
@@ -121,6 +123,12 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         }
         CallNextHookEx(None, code, wparam, lparam)
     }
+}
+
+fn modifier_down() -> bool {
+    [VK_SHIFT, VK_CONTROL, VK_MENU]
+        .iter()
+        .any(|&vk| unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 })
 }
 
 fn send_keys(keys: &[(u16, bool)]) {

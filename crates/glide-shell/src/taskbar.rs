@@ -283,6 +283,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             eprintln!("glide-shell: desktop window failed: {e}");
         }
         crate::winkey::install(hwnd);
+        crate::clickaway::install(hwnd);
         // Rescue ladder rung 4 (§7): E = spawn explorer now, R = drop the
         // HKCU Shell= override for next logon. Registered always — they're
         // no-ops of low cost while explorer is still the shell.
@@ -607,6 +608,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let _ = ReleaseCapture();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(d) = pending {
+                    bar.close_popups();
                     if d.active {
                         save_pins(&bar.pins);
                         bar.paint();
@@ -614,6 +616,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         bar.click(d.idx);
                     }
                 } else if let Some(t) = bar.tray_hit(x) {
+                    bar.close_popups();
                     bar.tray_forward(t, WM_LBUTTONUP);
                     // v4 apps act on NIN_SELECT, not the raw button pair —
                     // explorer's taskbar sends it after LBUTTONUP.
@@ -639,14 +642,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         None => {}
                     }
                 } else if bar.desk_hit(x) {
+                    bar.close_popups();
                     bar.toggle_desktop();
                 } else if bar.clock_hit(x) {
                     bar.flyout_toggle(hwnd, crate::flyout::Kind::Calendar);
+                } else {
+                    // Empty bar area — same dismissal as clicking anywhere
+                    // else on screen.
+                    bar.close_popups();
                 }
                 LRESULT(0)
             }
             WM_MBUTTONUP => {
                 // Win10: middle-click a button = launch another instance.
+                bar.close_popups();
                 bar.preview.hide();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(i) = bar.hit_test(x) {
@@ -664,6 +673,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
+                bar.close_popups();
                 bar.preview.hide();
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(t) = bar.tray_hit(x) {
@@ -716,6 +726,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             crate::winkey::WM_WINKEY_S => {
                 crate::winkey::toggle_glint();
+                LRESULT(0)
+            }
+            crate::clickaway::WM_CLICKAWAY => {
+                let pt = POINT {
+                    x: wparam.0 as isize as i32,
+                    y: lparam.0 as i32,
+                };
+                bar.click_away(pt);
                 LRESULT(0)
             }
             crate::settings::WM_SETTINGS_CHANGED => {
@@ -1176,6 +1194,41 @@ impl Bar {
         for e in self.entries.iter_mut().filter(|e| e.hwnd.is_some()) {
             e.width = e.full_width.min(cap);
         }
+    }
+
+    /// Dismiss the start menu and any flyout (clicks on non-toggle targets;
+    /// the toggle buttons manage their own popup instead).
+    fn close_popups(&mut self) {
+        if self.start.open || self.flyout.kind.is_some() {
+            self.start.hide();
+            self.flyout.hide();
+            self.paint();
+        }
+    }
+
+    /// A mouse button went down somewhere on screen while a popup was open
+    /// (clickaway hook, screen coords). Clicks on the popup itself do
+    /// nothing, clicks on this bar are left to its own handlers (which
+    /// toggle), anything else dismisses.
+    fn click_away(&mut self, pt: POINT) {
+        if !self.start.open && self.flyout.kind.is_none() {
+            return;
+        }
+        let inside = |h: HWND| unsafe {
+            let mut r = RECT::default();
+            GetWindowRect(h, &mut r).is_ok()
+                && pt.x >= r.left
+                && pt.x < r.right
+                && pt.y >= r.top
+                && pt.y < r.bottom
+        };
+        if inside(self.hwnd)
+            || (self.start.open && inside(self.start.hwnd()))
+            || (self.flyout.kind.is_some() && inside(self.flyout.hwnd()))
+        {
+            return;
+        }
+        self.close_popups();
     }
 
     /// Toggle the start menu from its bar button; closes the other popups.

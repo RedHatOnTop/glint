@@ -5,6 +5,7 @@
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
 mod autostart;
+mod clickaway;
 mod config;
 mod desktop;
 mod flyout;

@@ -232,6 +232,7 @@ impl Flyout {
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut Flyout as isize);
         }
+        crate::clickaway::set_flyout_open(true);
         self.kind = Some(kind);
         self.hover = None;
         self.dragging = false;
@@ -279,6 +280,7 @@ impl Flyout {
     }
 
     pub fn hide(&mut self) {
+        crate::clickaway::set_flyout_open(false);
         if self.kind.take().is_some() {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), TIMER_REFRESH);
