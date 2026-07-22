@@ -40,8 +40,8 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMe
 use windows::Win32::System::Power::SetSuspendState;
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_RETURN,
-    VK_UP,
+    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, IEnumShellItems, IShellItem, IShellItemImageFactory,
@@ -91,6 +91,9 @@ const MENU_NEW_GROUP: usize = 90;
 const MENU_GROUP_BASE: usize = 100;
 /// Folder-view header row (back chip + group name) height.
 const FOLDER_HEAD: f32 = 44.0;
+/// Cursor travel (logical px) before a pressed tile becomes a drag; below
+/// this the press stays a click.
+const DRAG_SLOP: f32 = 4.0;
 /// Footer user chip width; folder shortcuts sit to its right.
 const USER_W: f32 = 108.0;
 
@@ -154,6 +157,49 @@ enum Act {
     Shutdown,
 }
 
+/// Drag payload, identity-based — tile/member indices go stale across the
+/// pin mutations a drop performs.
+enum DragSrc {
+    /// Loose pin tile, by parsing name.
+    Pin(String),
+    /// Folder tile, by group name.
+    Folder(String),
+    /// Pin inside the open folder.
+    Member(String),
+    /// Left-pane app row (parsing, display name); dropping it pins the app.
+    App(String, String),
+}
+
+/// Where the payload would land if released now.
+#[derive(Clone, Copy, PartialEq)]
+enum DropSpot {
+    /// Insert as items[i] in the main grid (i == len ⇒ append).
+    Before(usize),
+    /// Fold into items[i]: onto a single = new group, onto a folder = join.
+    Into(usize),
+    /// Insert as members[j] of the open folder.
+    MemberBefore(usize),
+    /// Folder-view header: pull the member out of the group.
+    OutOfFolder,
+}
+
+/// In-flight drag. Armed on LBUTTONDOWN over anything draggable; only
+/// becomes live past DRAG_SLOP, so plain clicks never notice it.
+struct Drag {
+    src: DragSrc,
+    /// Down point, for the slop check.
+    x0: f32,
+    y0: f32,
+    /// Cursor now.
+    x: f32,
+    y: f32,
+    /// Grab offset inside the tile so the ghost doesn't snap to the cursor.
+    gx: f32,
+    gy: f32,
+    live: bool,
+    spot: Option<DropSpot>,
+}
+
 enum Job {
     Apps { epoch: u32 },
     Icon { parsing: String },
@@ -210,6 +256,7 @@ pub struct StartMenu {
     user: Vec<u16>,
     hover: Option<Act>,
     tracking: bool,
+    drag: Option<Drag>,
 }
 
 impl StartMenu {
@@ -353,6 +400,7 @@ impl StartMenu {
                 user,
                 hover: None,
                 tracking: false,
+                drag: None,
             })
         }
     }
@@ -417,6 +465,7 @@ impl StartMenu {
             }
         }
         self.hover = None;
+        self.drag = None;
     }
 
     // ---- data --------------------------------------------------------------
@@ -896,6 +945,278 @@ impl StartMenu {
         None
     }
 
+    // ---- drag & drop --------------------------------------------------------
+
+    /// LBUTTONDOWN: remember what a drag from here would carry.
+    fn arm_drag(&mut self, x: f32, y: f32) {
+        let src = match self.hit(x, y) {
+            Some(Act::Tile(i)) => {
+                let items = self.tile_items();
+                let &(c, r, s) = &self.item_slots(&items)[i];
+                let rc = self.tile_rect(c, r, s, 0.0);
+                let src = match &items[i] {
+                    TileItem::Single(pi) => DragSrc::Pin(self.pins[*pi].parsing.clone()),
+                    TileItem::Folder(n, _) => DragSrc::Folder(n.clone()),
+                };
+                Some((src, x - rc.left, y - rc.top))
+            }
+            Some(Act::FolderItem(j)) => self.open_folder.clone().and_then(|f| {
+                let members = self.members(&f);
+                let &pi = members.get(j)?;
+                let &(c, r, s) = self.member_slots(&members).get(j)?;
+                let rc = self.tile_rect(c, r, s, FOLDER_HEAD);
+                Some((DragSrc::Member(self.pins[pi].parsing.clone()), x - rc.left, y - rc.top))
+            }),
+            Some(Act::App(i)) => self
+                .apps
+                .get(i)
+                .map(|a| (DragSrc::App(a.parsing.clone(), a.name.clone()), TILE / 2.0, TILE / 2.0)),
+            Some(Act::Freq(i)) => self
+                .freq
+                .get(i)
+                .map(|e| (DragSrc::App(e.parsing.clone(), e.name.clone()), TILE / 2.0, TILE / 2.0)),
+            Some(Act::Result(i)) => self
+                .results
+                .get(i)
+                .and_then(|&a| self.apps.get(a))
+                .map(|a| (DragSrc::App(a.parsing.clone(), a.name.clone()), TILE / 2.0, TILE / 2.0)),
+            _ => None,
+        };
+        self.drag = src.map(|(src, gx, gy)| Drag {
+            src,
+            x0: x,
+            y0: y,
+            x,
+            y,
+            gx,
+            gy,
+            live: false,
+            spot: None,
+        });
+    }
+
+    fn drag_move(&mut self, x: f32, y: f32) {
+        {
+            let Some(d) = &mut self.drag else { return };
+            d.x = x;
+            d.y = y;
+            if !d.live {
+                if (x - d.x0).abs() < DRAG_SLOP && (y - d.y0).abs() < DRAG_SLOP {
+                    return;
+                }
+                d.live = true;
+                self.hover = None;
+            }
+        }
+        let spot = self.drop_spot(x, y);
+        if let Some(d) = &mut self.drag {
+            d.spot = spot;
+        }
+        self.paint();
+    }
+
+    /// The dragged payload's own tile in the main grid, if it has one.
+    fn src_item_idx(&self, items: &[TileItem]) -> Option<usize> {
+        let d = self.drag.as_ref()?;
+        items.iter().position(|it| match (&d.src, it) {
+            (DragSrc::Pin(p) | DragSrc::App(p, _), TileItem::Single(pi)) => {
+                self.pins[*pi].parsing == *p
+            }
+            (DragSrc::Folder(f), TileItem::Folder(n, _)) => n == f,
+            _ => false,
+        })
+    }
+
+    fn drop_spot(&self, x: f32, y: f32) -> Option<DropSpot> {
+        let d = self.drag.as_ref()?;
+        if x < SPLIT_X || y < self.list_top() || y >= self.list_bottom() {
+            return None;
+        }
+        if let Some(f) = &self.open_folder {
+            // Folder view: members reorder; the header band pulls one out.
+            if !matches!(d.src, DragSrc::Member(_)) {
+                return None;
+            }
+            if y < self.list_top() + FOLDER_HEAD {
+                return Some(DropSpot::OutOfFolder);
+            }
+            let members = self.members(f);
+            for (j, &(c, r, s)) in self.member_slots(&members).iter().enumerate() {
+                let rc = self.tile_rect(c, r, s, FOLDER_HEAD);
+                if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                    let before = x < (rc.left + rc.right) / 2.0;
+                    return Some(DropSpot::MemberBefore(if before { j } else { j + 1 }));
+                }
+            }
+            return Some(DropSpot::MemberBefore(members.len()));
+        }
+        let items = self.tile_items();
+        let src_item = self.src_item_idx(&items);
+        for (i, &(c, r, s)) in self.item_slots(&items).iter().enumerate() {
+            let rc = self.tile_rect(c, r, s, 0.0);
+            if !(x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom) {
+                continue;
+            }
+            if Some(i) == src_item {
+                return None;
+            }
+            // Win10 gestures: tile onto tile makes a group, tile or app onto
+            // a folder joins it; folders never merge.
+            let combinable = matches!(
+                (&d.src, &items[i]),
+                (DragSrc::Pin(_), _) | (DragSrc::App(..), TileItem::Folder(..))
+            );
+            let fx = (x - rc.left) / (rc.right - rc.left);
+            return Some(if combinable && (0.25..0.75).contains(&fx) {
+                DropSpot::Into(i)
+            } else if fx < 0.5 {
+                DropSpot::Before(i)
+            } else {
+                DropSpot::Before(i + 1)
+            });
+        }
+        Some(DropSpot::Before(items.len()))
+    }
+
+    fn commit_drop(&mut self, d: Drag) {
+        match d.spot {
+            Some(DropSpot::Before(i)) => self.drop_before(&d.src, i),
+            Some(DropSpot::Into(i)) => self.drop_into(&d.src, i),
+            Some(DropSpot::MemberBefore(j)) => self.drop_member_before(&d.src, j),
+            Some(DropSpot::OutOfFolder) => {
+                if let DragSrc::Member(p) = &d.src {
+                    let p = p.clone();
+                    self.set_folder(&p, None);
+                }
+            }
+            None => self.paint(),
+        }
+    }
+
+    /// Reorder the main grid: pull the payload out of the item list, reinsert
+    /// before item `i`, flatten back to pin order.
+    fn drop_before(&mut self, src: &DragSrc, mut i: usize) {
+        // Dragging a pinned app row is moving its tile; if the pin lives in a
+        // folder, the drag pulls it out first.
+        if let DragSrc::Pin(p) | DragSrc::App(p, _) = src {
+            if let Some(e) = self.pins.iter_mut().find(|e| e.parsing == *p) {
+                e.folder = None;
+            }
+        }
+        let mut items = self.tile_items();
+        let si = match src {
+            DragSrc::Pin(p) | DragSrc::App(p, _) => items.iter().position(
+                |it| matches!(it, TileItem::Single(pi) if self.pins[*pi].parsing == *p),
+            ),
+            DragSrc::Folder(f) => items
+                .iter()
+                .position(|it| matches!(it, TileItem::Folder(n, _) if n == f)),
+            DragSrc::Member(_) => return,
+        };
+        let moved = match si {
+            Some(si) => {
+                if si < i {
+                    i -= 1;
+                }
+                items.remove(si)
+            }
+            None => match src {
+                // Unpinned app row: dropping it mints the pin right there.
+                DragSrc::App(p, n) => {
+                    self.pins.push(Entry::new(n.clone(), p.clone()));
+                    TileItem::Single(self.pins.len() - 1)
+                }
+                _ => return,
+            },
+        };
+        items.insert(i.min(items.len()), moved);
+        self.reflow(items);
+    }
+
+    /// Persist an item ordering: flatten back into pin order (folder members
+    /// come out contiguous, so the file stays tidy).
+    fn reflow(&mut self, items: Vec<TileItem>) {
+        let mut order: Vec<usize> = Vec::with_capacity(self.pins.len());
+        for it in &items {
+            match it {
+                TileItem::Single(pi) => order.push(*pi),
+                TileItem::Folder(_, ms) => order.extend(ms),
+            }
+        }
+        for pi in 0..self.pins.len() {
+            if !order.contains(&pi) {
+                order.push(pi);
+            }
+        }
+        let mut old: Vec<Option<Entry>> =
+            std::mem::take(&mut self.pins).into_iter().map(Some).collect();
+        self.pins = order.iter().map(|&i| old[i].take().unwrap()).collect();
+        save_start_pins(&self.pins);
+        self.rebuild_freq();
+        self.paint();
+    }
+
+    /// Fold the payload into items[i]: onto a single tile = fresh group at
+    /// the target's slot, onto a folder tile = join it.
+    fn drop_into(&mut self, src: &DragSrc, i: usize) {
+        let (parsing, name) = match src {
+            DragSrc::Pin(p) => (p.clone(), String::new()),
+            DragSrc::App(p, n) => (p.clone(), n.clone()),
+            _ => return,
+        };
+        let items = self.tile_items();
+        let group = match items.get(i) {
+            Some(TileItem::Folder(g, _)) => g.clone(),
+            Some(TileItem::Single(ti)) => {
+                let g = self.next_group_name();
+                self.pins[*ti].folder = Some(g.clone());
+                g
+            }
+            None => return,
+        };
+        if !self.pins.iter().any(|p| p.parsing == parsing) {
+            self.pins.push(Entry::new(name, parsing.clone()));
+        }
+        if let Some(p) = self.pins.iter_mut().find(|p| p.parsing == parsing) {
+            p.folder = Some(group.clone());
+        }
+        // The folder tile sits at its first member's pin slot; parking the
+        // dragged entry after the last existing member keeps that slot put.
+        if let Some(s) = self.pins.iter().position(|p| p.parsing == parsing) {
+            let entry = self.pins.remove(s);
+            match self.pins.iter().rposition(|p| p.folder.as_deref() == Some(group.as_str())) {
+                Some(m) => self.pins.insert(m + 1, entry),
+                None => self.pins.push(entry),
+            }
+        }
+        save_start_pins(&self.pins);
+        self.rebuild_freq();
+        self.paint();
+    }
+
+    /// Reorder within the open folder: same entries, new order, same slots.
+    fn drop_member_before(&mut self, src: &DragSrc, j: usize) {
+        let DragSrc::Member(parsing) = src else { return };
+        let Some(f) = self.open_folder.clone() else { return };
+        let slots = self.members(&f);
+        let Some(mj) = slots.iter().position(|&pi| self.pins[pi].parsing == *parsing) else {
+            return;
+        };
+        let mut order = slots.clone();
+        let moved = order.remove(mj);
+        let j = if mj < j { j - 1 } else { j };
+        order.insert(j.min(order.len()), moved);
+        let mut old: Vec<Option<Entry>> =
+            std::mem::take(&mut self.pins).into_iter().map(Some).collect();
+        let entries: Vec<Entry> = order.iter().map(|&i| old[i].take().unwrap()).collect();
+        for (slot, e) in slots.iter().zip(entries) {
+            old[*slot] = Some(e);
+        }
+        self.pins = old.into_iter().flatten().collect();
+        save_start_pins(&self.pins);
+        self.paint();
+    }
+
     /// Launch an entry, feed the 자주 사용 counter, close.
     fn launch_entry(&mut self, parsing: String, name: String, cmd: Vec<u16>) {
         launch(&cmd);
@@ -1182,8 +1503,103 @@ impl StartMenu {
                 self.text(&[glyph], &self.fmt_glyph, rc, theme::TEXT);
             }
 
+            if let Some(d) = &self.drag {
+                if d.live {
+                    self.paint_drag(d);
+                }
+            }
+
             let _ = r.dc.EndDraw(None, None);
             let _ = self.renderer.present();
+        }
+    }
+
+    /// Drop indicator + ghost tile at the cursor; painted over everything.
+    fn paint_drag(&self, d: &Drag) {
+        match d.spot {
+            Some(DropSpot::Before(i)) => {
+                let items = self.tile_items();
+                let slots = self.item_slots(&items);
+                let rc = if let Some(&(c, r, s)) = slots.get(i) {
+                    let t = self.tile_rect(c, r, s, 0.0);
+                    rect(t.left - 6.0, t.top, t.left - 2.0, t.bottom)
+                } else if let Some(&(c, r, s)) = slots.last() {
+                    let t = self.tile_rect(c, r, s, 0.0);
+                    rect(t.right + 2.0, t.top, t.right + 6.0, t.bottom)
+                } else {
+                    rect(TILES_X0 - 6.0, self.list_top(), TILES_X0 - 2.0, self.list_top() + TILE)
+                };
+                self.fill_round(rc, 2.0, theme::ACCENT);
+            }
+            Some(DropSpot::Into(i)) => {
+                let items = self.tile_items();
+                if let Some(&(c, r, s)) = self.item_slots(&items).get(i) {
+                    self.accent_outline(self.tile_rect(c, r, s, 0.0));
+                }
+            }
+            Some(DropSpot::MemberBefore(j)) => {
+                if let Some(f) = &self.open_folder {
+                    let slots = self.member_slots(&self.members(f));
+                    let rc = if let Some(&(c, r, s)) = slots.get(j) {
+                        let t = self.tile_rect(c, r, s, FOLDER_HEAD);
+                        rect(t.left - 6.0, t.top, t.left - 2.0, t.bottom)
+                    } else if let Some(&(c, r, s)) = slots.last() {
+                        let t = self.tile_rect(c, r, s, FOLDER_HEAD);
+                        rect(t.right + 2.0, t.top, t.right + 6.0, t.bottom)
+                    } else {
+                        return;
+                    };
+                    self.fill_round(rc, 2.0, theme::ACCENT);
+                }
+            }
+            Some(DropSpot::OutOfFolder) => {
+                let top = self.list_top();
+                self.accent_outline(rect(
+                    TILES_X0,
+                    top + 4.0,
+                    self.w - 12.0,
+                    top + FOLDER_HEAD - 4.0,
+                ));
+            }
+            None => {}
+        }
+        let span = match &d.src {
+            DragSrc::Pin(p) | DragSrc::Member(p) | DragSrc::App(p, _) => self
+                .pins
+                .iter()
+                .find(|e| e.parsing == *p)
+                .map_or(1, |e| if e.wide { 2 } else { 1 }),
+            DragSrc::Folder(_) => 1,
+        };
+        let w = span as f32 * TILE + (span - 1) as f32 * TILE_GUT;
+        let rc = rect(d.x - d.gx, d.y - d.gy, d.x - d.gx + w, d.y - d.gy + TILE);
+        match &d.src {
+            DragSrc::Folder(f) => self.paint_folder_tile(rc, f, &self.members(f), false),
+            DragSrc::Pin(p) | DragSrc::Member(p) | DragSrc::App(p, _) => {
+                match self.pins.iter().find(|e| e.parsing == *p) {
+                    Some(e) => self.paint_tile(rc, e, false),
+                    None => {
+                        // Unpinned app row: synthesize the tile it would become.
+                        if let DragSrc::App(p, n) = &d.src {
+                            self.paint_tile(rc, &Entry::new(n.clone(), p.clone()), false);
+                        }
+                    }
+                }
+            }
+        }
+        self.accent_outline(rc);
+    }
+
+    fn accent_outline(&self, rc: D2D_RECT_F) {
+        unsafe {
+            if let Ok(b) = self.renderer.brush(theme::ACCENT) {
+                self.renderer.dc.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rc, radiusX: 3.0, radiusY: 3.0 },
+                    &b,
+                    2.0,
+                    None,
+                );
+            }
         }
     }
 
@@ -1861,6 +2277,10 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_MOUSEMOVE => {
                 let (x, y) = (lx(sm), ly(sm));
+                if sm.drag.is_some() {
+                    sm.drag_move(x, y);
+                    return LRESULT(0);
+                }
                 let h = sm.hit(x, y);
                 if h != sm.hover {
                     sm.hover = h;
@@ -1879,6 +2299,21 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
                 LRESULT(0)
             }
+            WM_LBUTTONDOWN => {
+                let (x, y) = (lx(sm), ly(sm));
+                sm.arm_drag(x, y);
+                if sm.drag.is_some() {
+                    SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                // Capture stolen (alt-tab, menu) — the drag dies where it was.
+                if sm.drag.take().is_some() {
+                    sm.paint();
+                }
+                LRESULT(0)
+            }
             WM_MOUSELEAVE => {
                 sm.tracking = false;
                 if sm.hover.take().is_some() {
@@ -1888,8 +2323,20 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_LBUTTONUP => {
                 let (x, y) = (lx(sm), ly(sm));
-                if let Some(a) = sm.hit(x, y) {
-                    sm.act(a);
+                // Take the drag out first: ReleaseCapture reenters this proc
+                // as WM_CAPTURECHANGED, which must find nothing to cancel.
+                let drag = sm.drag.take();
+                if GetCapture() == hwnd {
+                    let _ = ReleaseCapture();
+                }
+                let sm = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu);
+                match drag {
+                    Some(d) if d.live => sm.commit_drop(d),
+                    _ => {
+                        if let Some(a) = sm.hit(x, y) {
+                            sm.act(a);
+                        }
+                    }
                 }
                 LRESULT(0)
             }
@@ -2072,7 +2519,17 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_KEYDOWN => {
                 if wparam.0 == VK_ESCAPE.0 as usize {
-                    // Esc backs out of search, then an open folder, then closes.
+                    // Esc backs out of a live drag, search, an open folder,
+                    // then closes.
+                    if sm.drag.take().is_some() {
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        let sm =
+                            &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu);
+                        sm.paint();
+                        return LRESULT(0);
+                    }
                     if !sm.query.is_empty() {
                         sm.query.clear();
                         sm.update_results();
