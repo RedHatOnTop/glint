@@ -376,6 +376,21 @@ M7 스왑의 예행연습이 된다.
 - 검증: 컴파일 0 경고 + 유저 실물 확인 ("오 괜찮네"). 아이콘 수정도 유저 확인
   ("오 아이콘 고쳤네").
 
+**타일 폴더 추가됨 (0722, `31253f1`) — Win10 그룹.**
+
+- 데이터: `Entry.folder: Option<String>` = start_pins.txt 4번째 탭 필드
+  (`splitn(4)` — 구 3필드 파일 그대로 읽힘, 하위 호환). 그리드는
+  `TileItem::{Single, Folder(name, members)}`로 승격, first-fit `pack(spans)`은
+  span 제네릭.
+- 폴더 타일 = 중립 슬래브 + 멤버 2×2 미니 아이콘 + 이름. 클릭 → 멤버 그리드
+  뷰(고정 FOLDER_HEAD 헤더 + back 칩, 타일이 헤더 밑으로 스크롤). Esc 순서 =
+  검색 → 폴더 → 숨김. 마지막 멤버 빠지면 폴더 자동 해체.
+- 우클릭 메뉴: 타일 "그룹에 추가 ▸"(기존 그룹 + 새 그룹), 폴더 타일 "그룹 해제",
+  멤버 "그룹에서 빼기". **TrackPopupMenu 재진입 펌프 동안 &self 무효 가능** →
+  대상은 owned `RTarget` enum으로 복사, 복귀 후 GWLP_USERDATA 재역참조.
+- 검증: 컴파일 + 재기동 + 유저 실핀 9개(구포맷) 정상 로드. 폴더 상호작용은
+  도그푸드 검증.
+
 explorer가 셸 기동 시 하던 일. 우리가 안 하면 **아무도 안 한다**:
 
 - `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 전 값 실행
@@ -503,6 +518,26 @@ SSID 5개·연결됨 표시·신호별 글리프·토글 on), 배터리(51%·"�
   **AUMID 활성화·호버 정지는 도그푸드 검증** (테스트 AUMID 미등록이라 실 카톡/
   디스코드 토스트 필요 — M4 게이트 그대로). 주의: 텍스트 없는 토스트로는 클릭
   경로 검증이 헛돈다(발사 실패가 무음) — fire.ps1은 제목 필수.
+
+**볼륨 OSD 구현됨 (0722, osd.rs, `129ad36`).**
+
+- 이벤트 구동, 유휴 비용 0: `#[implement(IAudioEndpointVolumeCallback)]` VolWatch를
+  `RegisterControlChangeNotify`로 등록, OnNotify가 WM_APP_VOL(WM_APP+12,
+  wparam=muted, lparam=vol*1000)만 post. 폴링 스레드 없음. Osd가 자체
+  enumerator/endpoint/callback 소유 — status.rs 폴러와 독립(글리프 모양만
+  `status::volume_glyph` 공유).
+- 필: 280×48 논리, 작업 영역 하단 중앙. 글리프 + 트랙 + fill + 퍼센트.
+  표시 1.5s, 페이드 0.15s cubic. 팝업 하우스 패턴 + WS_EX_NOACTIVATE/
+  MA_NOACTIVATE + 전면 HTTRANSPARENT — 포커스·클릭 절대 안 뺏음.
+  toasts와 같은 late-arm/disarm 생명주기.
+- **의존성 함정**: windows 0.62에 "implement" cargo feature는 **없다**(매크로는
+  기본 제공), 그러나 생성 코드가 `windows_core::` 경로를 참조 → 소비 크레이트에
+  `windows-core = "0.62"` 직접 의존 필수. 워크스페이스 + glide-shell에 추가.
+- 검증: 바 Vol 셀에 WM_MOUSEWHEEL 스윕 post(자체 창 한정) → OSD 창 visible,
+  device rect 785,970–1135,1030 (정확히 280×48@1.25 하단 중앙), 스크린샷으로
+  글리프/트랙/fill/숫자 렌더 확인, 2.5s 후 자동 숨김(vis=False), 미러 다운스윕으로
+  볼륨 원복. **하드웨어 볼륨 키는 동일 OnNotify 경로지만 미타건 — 도그푸드 검증.**
+  잔여 M4: 밝기 OSD(WMI WmiMonitorBrightnessEvent) + 볼륨 글리프 클릭 슬라이더.
 
 ## 7. 안전망 — 복구 사다리 (M6, 스왑 전 필수)
 
