@@ -66,6 +66,10 @@ const MENU_CLOSE: usize = 3;
 const MENU_TASKMGR: usize = 4;
 const MENU_RESTART: usize = 5;
 const MENU_QUIT: usize = 6;
+/// Start button: glyph square at the far left, entries begin after it.
+const START_X: f32 = 8.0;
+const START_BTN_W: f32 = 40.0;
+const ENTRY_X0: f32 = START_X + START_BTN_W + 4.0;
 
 struct TrayIcon {
     owner: HWND,
@@ -143,6 +147,8 @@ pub struct Bar {
     status_hover: Option<usize>,
     preview: crate::preview::Preview,
     flyout: crate::flyout::Flyout,
+    start: crate::startmenu::StartMenu,
+    start_hover: bool,
 }
 
 /// Cells in the status cluster, left→right; presence varies (no battery on
@@ -239,6 +245,8 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             status_hover: None,
             preview: crate::preview::Preview::new(dpi)?,
             flyout: crate::flyout::Flyout::new(dpi)?,
+            start: crate::startmenu::StartMenu::new(dpi)?,
+            start_hover: false,
         };
         bar.refresh();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
@@ -439,12 +447,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else {
                     let th = bar.tray_hit(x);
                     let sh = bar.status_hit(x);
+                    let sth = th.is_none() && sh.is_none() && bar.start_hit(x);
                     let eh = if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None };
                     let changed =
                         th != bar.tray_hover || sh != bar.status_hover || eh != bar.hover;
-                    if th != bar.tray_hover || sh != bar.status_hover {
+                    if th != bar.tray_hover || sh != bar.status_hover || sth != bar.start_hover {
                         bar.tray_hover = th;
                         bar.status_hover = sh;
+                        bar.start_hover = sth;
                         bar.paint();
                     }
                     bar.set_hover(eh);
@@ -469,7 +479,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 bar.tracking_leave = false;
                 let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
                 bar.preview.hide();
-                if bar.tray_hover.take().is_some() | bar.status_hover.take().is_some() {
+                if bar.tray_hover.take().is_some()
+                    | bar.status_hover.take().is_some()
+                    | std::mem::take(&mut bar.start_hover)
+                {
                     bar.paint();
                 }
                 bar.set_hover(None);
@@ -499,6 +512,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
                 if let Some(t) = bar.tray_hit(x) {
                     bar.tray_forward(t, WM_LBUTTONDBLCLK);
+                } else if bar.start_hit(x) {
+                    bar.start_toggle(hwnd);
                 } else if let Some(i) = bar.hit_test(x) {
                     bar.drag = Some(Drag {
                         idx: i,
@@ -532,6 +547,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if bar.tray_icons.get(t).is_some_and(|i| i.version >= 4) {
                         bar.tray_forward(t, NIN_SELECT);
                     }
+                } else if bar.start_hit(x) {
+                    bar.start_toggle(hwnd);
                 } else if let Some(s) = bar.status_hit(x) {
                     match bar.status_cells().get(s) {
                         Some(StatusCell::Ime) => crate::status::send_hangul_key(),
@@ -922,7 +939,7 @@ impl Bar {
         for e in &mut self.entries {
             e.width = e.full_width;
         }
-        let avail = self.tray_left() - 8.0 - 4.0;
+        let avail = self.tray_left() - ENTRY_X0 - 4.0;
         let total: f32 = self.entries.iter().map(|e| e.width + 4.0).sum();
         if total <= avail {
             return;
@@ -943,12 +960,32 @@ impl Bar {
         }
     }
 
+    /// Toggle the start menu from its bar button; closes the other popups.
+    fn start_toggle(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+        }
+        self.preview.hide();
+        self.flyout.hide();
+        if self.start.open {
+            self.start.hide();
+        } else {
+            let mut rect = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(self.hwnd, &mut rect);
+            }
+            self.start.show(rect);
+        }
+        self.paint();
+    }
+
     /// Toggle a status-cell flyout: same cell closes, another cell switches.
     fn flyout_toggle(&mut self, hwnd: HWND, kind: crate::flyout::Kind) {
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
         }
         self.preview.hide();
+        self.start.hide();
         if self.flyout.kind == Some(kind) {
             self.flyout.hide();
         } else {
@@ -1066,8 +1103,12 @@ impl Bar {
         }
     }
 
+    fn start_hit(&self, x: f32) -> bool {
+        x >= START_X - 4.0 && x < ENTRY_X0 - 2.0
+    }
+
     fn hit_test(&self, x: f32) -> Option<usize> {
-        let mut cx = 8.0;
+        let mut cx = ENTRY_X0;
         for (i, e) in self.entries.iter().enumerate() {
             if x >= cx && x < cx + e.width {
                 return Some(i);
@@ -1078,7 +1119,7 @@ impl Bar {
     }
 
     fn entry_left(&self, i: usize) -> f32 {
-        8.0 + self.entries[..i].iter().map(|e| e.width + 4.0).sum::<f32>()
+        ENTRY_X0 + self.entries[..i].iter().map(|e| e.width + 4.0).sum::<f32>()
     }
 
     fn drag_move(&mut self, x: f32) {
@@ -1605,6 +1646,53 @@ impl Bar {
         }
     }
 
+    /// Win11-logo start button: four rounded squares, accent when engaged.
+    fn draw_start(&self) {
+        let r = &self.renderer;
+        let engaged = self.start_hover || self.start.open;
+        unsafe {
+            if engaged {
+                let fill = if self.start_hover { theme::HOVER_FILL } else { theme::ACTIVE_FILL };
+                if let Ok(b) = r.brush(fill) {
+                    r.dc.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: START_X,
+                                top: 4.0,
+                                right: START_X + START_BTN_W,
+                                bottom: theme::BAR_HEIGHT - 4.0,
+                            },
+                            radiusX: theme::BUTTON_RADIUS,
+                            radiusY: theme::BUTTON_RADIUS,
+                        },
+                        &b,
+                    );
+                }
+            }
+            let color = if engaged { theme::ACCENT } else { theme::TEXT };
+            if let Ok(b) = r.brush(color) {
+                let cx = START_X + START_BTN_W / 2.0;
+                let cy = theme::BAR_HEIGHT / 2.0;
+                for (dx, dy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let (sx, sy) = (cx + dx * 4.5, cy + dy * 4.5);
+                    r.dc.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: sx - 3.5,
+                                top: sy - 3.5,
+                                right: sx + 3.5,
+                                bottom: sy + 3.5,
+                            },
+                            radiusX: 1.5,
+                            radiusY: 1.5,
+                        },
+                        &b,
+                    );
+                }
+            }
+        }
+    }
+
     fn paint(&mut self) {
         let r = &self.renderer;
         let scale = self.scale();
@@ -1626,7 +1714,8 @@ impl Bar {
                 .as_ref()
                 .filter(|d| d.active)
                 .map(|d| (d.idx, d.cur_x - d.offset));
-            let mut cx = 8.0;
+            self.draw_start();
+            let mut cx = ENTRY_X0;
             let mut pin_section_end: Option<f32> = None;
             for (i, e) in self.entries.iter().enumerate() {
                 if e.pinned {
@@ -1742,7 +1831,8 @@ impl Bar {
             // Dragged button floats on top, following the cursor.
             if let Some((di, float_left)) = dragging {
                 let w = self.entries[di].width;
-                let left = float_left.clamp(8.0, (self.width - CLOCK_W - w - 4.0).max(8.0));
+                let left =
+                    float_left.clamp(ENTRY_X0, (self.width - CLOCK_W - w - 4.0).max(ENTRY_X0));
                 self.draw_entry(di, left, true);
             }
 

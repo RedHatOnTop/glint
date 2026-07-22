@@ -1,0 +1,1744 @@
+//! The real start menu (SHELL_DESIGN §6.4 final goal). Win10 two-pane
+//! layout: app list (자주 사용 on top, 초성/A–Z sections below) on the left,
+//! pinned Metro tile grid on the right, independently scrolled.
+//! All shell work — the `shell:AppsFolder` enumeration (win32 Start
+//! Menu shortcuts and UWP packages in one pass) and every icon extraction —
+//! runs on a dedicated MTA COM worker thread: IShellItemImageFactory calls
+//! cost 5–50 ms each, and doing them on the UI thread froze hover repaints.
+//! The UI thread only turns finished pixel buffers into D2D bitmaps.
+//! Input-wise a Flyout sibling (activatable; dies on WA_INACTIVE, Esc,
+//! start-button re-click, 1s foreground-check fallback).
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_FAR,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat,
+};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND, DwmSetWindowAttribute,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, GetDIBits, GetObjectW, ScreenToClient, ValidateRect,
+};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
+use windows::Win32::System::Power::SetSuspendState;
+use windows::Win32::System::Shutdown::LockWorkStation;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_RETURN,
+    VK_UP,
+};
+use windows::Win32::UI::Shell::{
+    BHID_EnumItems, IEnumShellItems, IShellItem, IShellItemImageFactory,
+    SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+    SIIGBF_RESIZETOFIT, ShellExecuteW,
+};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{Interface, PCWSTR, w};
+
+use crate::render::Renderer;
+use crate::theme;
+
+const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Worker → UI: replies are waiting on the channel.
+const WM_APP_REPLY: u32 = WM_APP + 10;
+const TIMER_REFRESH: usize = 1;
+
+// Win10 two-pane layout: app list left, tile grid right.
+const W: f32 = 604.0;
+const HEADER_H: f32 = 46.0;
+const FOOTER_H: f32 = 56.0;
+const LIST_X0: f32 = 12.0;
+const LIST_W: f32 = 240.0;
+/// Divider between the list pane and the tile pane.
+const SPLIT_X: f32 = LIST_X0 + LIST_W + 6.0;
+const TILES_X0: f32 = SPLIT_X + 6.0;
+const ROW_H: f32 = 36.0;
+const SECTION_H: f32 = 28.0;
+const LIST_ICON: f32 = 24.0;
+/// Metro tile grid: 3 columns of square tiles, wide tiles span 2.
+const TILE_COLS: usize = 3;
+const TILE: f32 = 104.0;
+const TILE_GUT: f32 = 8.0;
+const TILE_ICON: f32 = 40.0;
+/// Device pixels requested from the shell; actual size read back via
+/// GetObjectW — assuming the request is honored corrupted every icon whose
+/// bitmap came back a different size.
+const ICON_PX: i32 = 64;
+/// App list re-enumeration threshold; installs are rare, opens are not.
+const STALE_SECS: u64 = 300;
+const MENU_TOGGLE_PIN: usize = 1;
+const MENU_TOGGLE_WIDE: usize = 2;
+/// Footer user chip width; folder shortcuts sit to its right.
+const USER_W: f32 = 108.0;
+
+struct Entry {
+    name: String,
+    wname: Vec<u16>,
+    /// Parsing name relative to AppsFolder — the icon-cache key and pin key.
+    parsing: String,
+    /// "shell:AppsFolder\{parsing}", NUL-terminated.
+    launch: Vec<u16>,
+    /// 2×1 Metro tile instead of 1×1; only pins persist this.
+    wide: bool,
+}
+
+impl Entry {
+    fn new(name: String, parsing: String) -> Self {
+        let launch = format!(r"shell:AppsFolder\{parsing}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let wname = name.encode_utf16().collect();
+        Entry { name, wname, parsing, launch, wide: false }
+    }
+}
+
+enum Row {
+    Section(Vec<u16>),
+    App(usize),
+    /// Index into `freq` — 자주 사용 rows at the top of the list pane.
+    Freq(usize),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Act {
+    App(usize),
+    Pin(usize),
+    /// Index into the "자주 사용" list (Win10-style frequent apps).
+    Freq(usize),
+    /// Index into the type-to-search results.
+    Result(usize),
+    User,
+    Docs,
+    Downloads,
+    Lock,
+    Sleep,
+    Restart,
+    Shutdown,
+}
+
+enum Job {
+    Apps { epoch: u32 },
+    Icon { parsing: String },
+}
+
+enum Reply {
+    Apps { epoch: u32, list: Vec<(String, String)> },
+    Icon { parsing: String, w: i32, h: i32, pixels: Vec<u8> },
+}
+
+pub struct StartMenu {
+    hwnd: HWND,
+    renderer: Renderer,
+    fmt_head: IDWriteTextFormat,
+    fmt_item: IDWriteTextFormat,
+    fmt_grid: IDWriteTextFormat,
+    fmt_center: IDWriteTextFormat,
+    fmt_tile: IDWriteTextFormat,
+    fmt_section: IDWriteTextFormat,
+    fmt_glyph: IDWriteTextFormat,
+    pub open: bool,
+    scale: f32,
+    w: f32,
+    h: f32,
+    fg_at_open: HWND,
+    apps: Vec<Entry>,
+    pins: Vec<Entry>,
+    rows: Vec<Row>,
+    /// rows[i] top offset inside the list content (mixed row heights).
+    row_pos: Vec<f32>,
+    loading: bool,
+    epoch: u32,
+    loaded_at: Option<std::time::Instant>,
+    /// Type-to-search: any printable key while the menu is open filters the
+    /// app list (Launchpad/GNOME behavior), with 초성 matching (ㅋㄹ → 크롬).
+    query: String,
+    /// apps indices matching `query`.
+    results: Vec<usize>,
+    selected: usize,
+    /// parsing → (launch count, display name); persisted, drives 자주 사용.
+    counts: HashMap<String, (u32, String)>,
+    freq: Vec<Entry>,
+    /// parsing name → decoded bitmap (None = extraction failed, draw fallback).
+    icons: HashMap<String, Option<ID2D1Bitmap1>>,
+    /// parsing name → tile background from the icon's dominant color.
+    tints: HashMap<String, D2D1_COLOR_F>,
+    requested: HashSet<String>,
+    jobs: Sender<Job>,
+    replies: Receiver<Reply>,
+    scroll_list: f32,
+    scroll_tiles: f32,
+    user: Vec<u16>,
+    hover: Option<Act>,
+    tracking: bool,
+}
+
+impl StartMenu {
+    pub fn new(dpi: f32) -> anyhow::Result<Self> {
+        unsafe {
+            let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
+            let class = w!("glide_shell_startmenu");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(start_wndproc),
+                hInstance: hinstance.into(),
+                lpszClassName: class,
+                hCursor: LoadCursorW(None, IDC_ARROW)?,
+                ..Default::default()
+            };
+            RegisterClassW(&wc); // 0 on re-register is fine
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
+                class,
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )?;
+            let dark: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const _ as _,
+                4,
+            );
+            let backdrop: i32 = 3; // DWMSBT_TRANSIENTWINDOW
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop as *const _ as _,
+                4,
+            );
+            let corner = DWMWCP_ROUND.0;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner as *const _ as _,
+                4,
+            );
+            let renderer = Renderer::new(hwnd, 64, 64, dpi)?;
+
+            let mk = |family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT| {
+                renderer.dwrite.CreateTextFormat(
+                    family,
+                    None,
+                    weight,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    size,
+                    w!("ko-kr"),
+                )
+            };
+            let family = w!("Segoe UI Variable");
+            let fmt_head = mk(family, 13.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+                .or_else(|_| mk(w!("Segoe UI"), 13.5, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
+            fmt_head.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt_head.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_item = mk(family, 12.5, DWRITE_FONT_WEIGHT_NORMAL)
+                .or_else(|_| mk(w!("Segoe UI"), 12.5, DWRITE_FONT_WEIGHT_NORMAL))?;
+            fmt_item.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt_item.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_grid = mk(family, 11.0, DWRITE_FONT_WEIGHT_NORMAL)
+                .or_else(|_| mk(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL))?;
+            fmt_grid.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt_grid.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_grid.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_center = mk(family, 12.5, DWRITE_FONT_WEIGHT_NORMAL)
+                .or_else(|_| mk(w!("Segoe UI"), 12.5, DWRITE_FONT_WEIGHT_NORMAL))?;
+            fmt_center.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_center.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            // Metro tile label: bottom-left inside the tile.
+            let fmt_tile = mk(family, 11.0, DWRITE_FONT_WEIGHT_NORMAL)
+                .or_else(|_| mk(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL))?;
+            fmt_tile.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt_tile.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR)?;
+            let fmt_section = mk(family, 11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+                .or_else(|_| mk(w!("Segoe UI"), 11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
+            fmt_section.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt_section.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_glyph = mk(w!("Segoe Fluent Icons"), 15.0, DWRITE_FONT_WEIGHT_NORMAL)
+                .or_else(|_| mk(w!("Segoe MDL2 Assets"), 15.0, DWRITE_FONT_WEIGHT_NORMAL))?;
+            fmt_glyph.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_glyph.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+
+            let user: Vec<u16> = std::env::var("USERNAME")
+                .unwrap_or_else(|_| "사용자".into())
+                .encode_utf16()
+                .collect();
+
+            let (jobs, job_rx) = channel::<Job>();
+            let (reply_tx, replies) = channel::<Reply>();
+            let hwnd_raw = hwnd.0 as isize;
+            std::thread::spawn(move || worker(job_rx, reply_tx, hwnd_raw));
+
+            Ok(StartMenu {
+                hwnd,
+                renderer,
+                fmt_head,
+                fmt_item,
+                fmt_grid,
+                fmt_center,
+                fmt_tile,
+                fmt_section,
+                fmt_glyph,
+                open: false,
+                scale: dpi / 96.0,
+                w: 0.0,
+                h: 0.0,
+                fg_at_open: HWND::default(),
+                apps: Vec::new(),
+                pins: load_start_pins(),
+                rows: Vec::new(),
+                row_pos: Vec::new(),
+                loading: false,
+                epoch: 0,
+                loaded_at: None,
+                query: String::new(),
+                results: Vec::new(),
+                selected: 0,
+                counts: load_counts(),
+                freq: Vec::new(),
+                icons: HashMap::new(),
+                tints: HashMap::new(),
+                requested: HashSet::new(),
+                jobs,
+                replies,
+                scroll_list: 0.0,
+                scroll_tiles: 0.0,
+                user,
+                hover: None,
+                tracking: false,
+            })
+        }
+    }
+
+    pub fn show(&mut self, bar_rect: RECT) {
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut StartMenu as isize);
+        }
+        if self
+            .loaded_at
+            .is_none_or(|t| t.elapsed().as_secs() > STALE_SECS)
+        {
+            self.epoch += 1;
+            self.loading = true;
+            let _ = self.jobs.send(Job::Apps { epoch: self.epoch });
+        }
+        self.open = true;
+        self.hover = None;
+        self.scroll_list = 0.0;
+        self.scroll_tiles = 0.0;
+        self.query.clear();
+        self.results.clear();
+        self.rebuild_freq();
+
+        self.w = W;
+        // As tall as fits above the bar, Win11-proportioned cap.
+        let avail = bar_rect.top as f32 / self.scale - 24.0;
+        self.h = avail.min(640.0);
+        let wd = (self.w * self.scale).round() as i32;
+        let hd = (self.h * self.scale).round() as i32;
+        unsafe {
+            self.fg_at_open = GetForegroundWindow();
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                bar_rect.left + (12.0 * self.scale) as i32,
+                bar_rect.top - (10.0 * self.scale) as i32 - hd,
+                wd,
+                hd,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        let _ = self
+            .renderer
+            .resize(wd as u32, hd as u32, self.scale * 96.0);
+        self.paint();
+        unsafe {
+            // Same rule as the flyouts: the start-button click grants us the
+            // foreground right; take it so WA_INACTIVE dismissal works.
+            let _ = SetForegroundWindow(self.hwnd);
+            SetTimer(Some(self.hwnd), TIMER_REFRESH, 1000, None);
+        }
+    }
+
+    pub fn hide(&mut self) {
+        if self.open {
+            self.open = false;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_REFRESH);
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+        self.hover = None;
+    }
+
+    // ---- data --------------------------------------------------------------
+
+    /// Worker finished something; drain and integrate.
+    fn on_replies(&mut self) {
+        let mut dirty = false;
+        while let Ok(rep) = self.replies.try_recv() {
+            match rep {
+                Reply::Apps { epoch, list } => {
+                    if epoch != self.epoch {
+                        continue;
+                    }
+                    self.apps = list
+                        .into_iter()
+                        .map(|(name, parsing)| Entry::new(name, parsing))
+                        .collect();
+                    self.rebuild_rows();
+                    self.loading = false;
+                    self.loaded_at = Some(std::time::Instant::now());
+                    dirty = true;
+                }
+                Reply::Icon { parsing, w, h, pixels } => {
+                    if let Some((r, g, b)) = tint_of(&pixels) {
+                        self.tints.insert(
+                            parsing.clone(),
+                            D2D1_COLOR_F { r, g, b, a: 1.0 },
+                        );
+                    }
+                    let bmp = self.make_bitmap(w, h, &pixels);
+                    self.icons.insert(parsing, bmp);
+                    dirty = true;
+                }
+            }
+        }
+        if dirty && self.open {
+            self.paint();
+        }
+    }
+
+    fn make_bitmap(&self, w: i32, h: i32, pixels: &[u8]) -> Option<ID2D1Bitmap1> {
+        if w <= 0 || h <= 0 || pixels.len() != (w * h * 4) as usize {
+            return None;
+        }
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            ..Default::default()
+        };
+        unsafe {
+            self.renderer
+                .dc
+                .CreateBitmap(
+                    D2D_SIZE_U { width: w as u32, height: h as u32 },
+                    Some(pixels.as_ptr() as *const _),
+                    (w * 4) as u32,
+                    &props,
+                )
+                .ok()
+        }
+    }
+
+    fn rebuild_rows(&mut self) {
+        self.rows.clear();
+        self.row_pos.clear();
+        let mut y = 0.0f32;
+        // Win10 keeps 자주 사용 at the top of the list pane.
+        if !self.freq.is_empty() {
+            self.row_pos.push(y);
+            self.rows.push(Row::Section("자주 사용".encode_utf16().collect()));
+            y += SECTION_H;
+            for i in 0..self.freq.len() {
+                self.row_pos.push(y);
+                self.rows.push(Row::Freq(i));
+                y += ROW_H;
+            }
+        }
+        let mut last: Option<(u8, char)> = None;
+        for (i, a) in self.apps.iter().enumerate() {
+            let sec = section_of(&a.name);
+            if last != Some(sec) {
+                last = Some(sec);
+                self.row_pos.push(y);
+                let mut buf = [0u16; 2];
+                self.rows.push(Row::Section(sec.1.encode_utf16(&mut buf).to_vec()));
+                y += SECTION_H;
+            }
+            self.row_pos.push(y);
+            self.rows.push(Row::App(i));
+            y += ROW_H;
+        }
+    }
+
+    fn request_icon(&mut self, parsing: &str) {
+        if self.icons.contains_key(parsing) || self.requested.contains(parsing) {
+            return;
+        }
+        self.requested.insert(parsing.to_string());
+        let _ = self.jobs.send(Job::Icon { parsing: parsing.to_string() });
+    }
+
+    fn toggle_pin(&mut self, parsing: &str, name: &str) {
+        if let Some(i) = self.pins.iter().position(|p| p.parsing == parsing) {
+            self.pins.remove(i);
+        } else {
+            self.pins.push(Entry::new(name.to_string(), parsing.to_string()));
+        }
+        save_start_pins(&self.pins);
+        self.rebuild_freq();
+        self.paint();
+    }
+
+    fn toggle_wide(&mut self, parsing: &str) {
+        if let Some(p) = self.pins.iter_mut().find(|p| p.parsing == parsing) {
+            p.wide = !p.wide;
+            save_start_pins(&self.pins);
+            self.paint();
+        }
+    }
+
+    fn bump_count(&mut self, parsing: &str, name: &str) {
+        let e = self
+            .counts
+            .entry(parsing.to_string())
+            .or_insert((0, name.to_string()));
+        e.0 += 1;
+        e.1 = name.to_string();
+        save_counts(&self.counts);
+    }
+
+    /// Top launched apps that aren't already pinned, most-used first.
+    fn rebuild_freq(&mut self) {
+        let mut v: Vec<(&String, &(u32, String))> = self
+            .counts
+            .iter()
+            .filter(|(p, _)| !self.pins.iter().any(|pin| &pin.parsing == *p))
+            .collect();
+        v.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.1.1.cmp(&b.1.1)));
+        self.freq = v
+            .into_iter()
+            .take(6)
+            .map(|(p, (_, n))| Entry::new(n.clone(), p.clone()))
+            .collect();
+        self.rebuild_rows();
+    }
+
+    fn update_results(&mut self) {
+        self.results.clear();
+        self.selected = 0;
+        self.scroll_list = 0.0;
+        if self.query.is_empty() {
+            return;
+        }
+        let q = self.query.to_lowercase();
+        let jamo_mode = q.chars().all(|c| ('ㄱ'..='ㅎ').contains(&c));
+        let mut scored: Vec<(usize, u32, usize)> = Vec::new();
+        for (i, a) in self.apps.iter().enumerate() {
+            let hay = if jamo_mode { name_cho(&a.name) } else { a.name.to_lowercase() };
+            if let Some(pos) = hay.find(&q) {
+                let count = self.counts.get(&a.parsing).map(|c| c.0).unwrap_or(0);
+                scored.push((pos, u32::MAX - count, i));
+            }
+        }
+        scored.sort();
+        self.results = scored.into_iter().map(|(_, _, i)| i).collect();
+    }
+
+    /// Keep the keyboard selection inside the search viewport.
+    fn ensure_selected_visible(&mut self) {
+        let view_h = self.list_bottom() - self.list_top();
+        let top = self.selected as f32 * ROW_H;
+        if top < self.scroll_list {
+            self.scroll_list = top;
+        } else if top + ROW_H > self.scroll_list + view_h {
+            self.scroll_list = top + ROW_H - view_h;
+        }
+    }
+
+    // ---- layout ------------------------------------------------------------
+
+    fn list_top(&self) -> f32 {
+        HEADER_H
+    }
+
+    fn list_bottom(&self) -> f32 {
+        self.h - FOOTER_H
+    }
+
+    /// First-fit tile packing: (col, row, span) per pin. Wide tiles take two
+    /// adjacent cells; squares backfill earlier holes so the grid stays tight.
+    fn tile_slots(&self) -> Vec<(usize, usize, usize)> {
+        let mut used: Vec<[bool; TILE_COLS]> = Vec::new();
+        let mut out = Vec::with_capacity(self.pins.len());
+        for pin in &self.pins {
+            let span = if pin.wide { 2 } else { 1 };
+            let mut row = 0usize;
+            let (row, col) = loop {
+                if row == used.len() {
+                    used.push([false; TILE_COLS]);
+                }
+                if let Some(c) =
+                    (0..=(TILE_COLS - span)).find(|&c| used[row][c..c + span].iter().all(|u| !u))
+                {
+                    break (row, c);
+                }
+                row += 1;
+            };
+            for u in &mut used[row][col..col + span] {
+                *u = true;
+            }
+            out.push((col, row, span));
+        }
+        out
+    }
+
+    fn tile_rect(&self, col: usize, row: usize, span: usize) -> D2D_RECT_F {
+        let x = TILES_X0 + col as f32 * (TILE + TILE_GUT);
+        let y = self.list_top() + row as f32 * (TILE + TILE_GUT) - self.scroll_tiles;
+        rect(x, y, x + span as f32 * TILE + (span - 1) as f32 * TILE_GUT, y + TILE)
+    }
+
+    fn pins_h(&self) -> f32 {
+        let rows = self
+            .tile_slots()
+            .iter()
+            .map(|&(_, r, _)| r + 1)
+            .max()
+            .unwrap_or(0);
+        rows as f32 * (TILE + TILE_GUT)
+    }
+
+    fn list_content_h(&self) -> f32 {
+        if !self.query.is_empty() {
+            return self.results.len() as f32 * ROW_H;
+        }
+        self.row_pos
+            .last()
+            .map(|p| {
+                p + match self.rows.last() {
+                    Some(Row::Section(_)) => SECTION_H,
+                    _ => ROW_H,
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
+    fn max_scroll_list(&self) -> f32 {
+        (self.list_content_h() - (self.list_bottom() - self.list_top())).max(0.0)
+    }
+
+    fn max_scroll_tiles(&self) -> f32 {
+        (self.pins_h() - (self.list_bottom() - self.list_top())).max(0.0)
+    }
+
+    /// Wheel scrolls the pane under the cursor.
+    fn wheel(&mut self, x: f32, notches: f32) {
+        let d = notches * ROW_H * 3.0;
+        let changed = if x >= SPLIT_X {
+            let max = self.max_scroll_tiles();
+            let before = self.scroll_tiles;
+            self.scroll_tiles = (self.scroll_tiles - d).clamp(0.0, max);
+            self.scroll_tiles != before
+        } else {
+            let max = self.max_scroll_list();
+            let before = self.scroll_list;
+            self.scroll_list = (self.scroll_list - d).clamp(0.0, max);
+            self.scroll_list != before
+        };
+        if changed {
+            self.paint();
+        }
+    }
+
+    /// Footer control rects, right-aligned: lock, sleep, restart, shutdown.
+    fn power_rects(&self) -> [(D2D_RECT_F, Act); 4] {
+        let acts = [Act::Lock, Act::Sleep, Act::Restart, Act::Shutdown];
+        let size = 34.0;
+        let gap = 6.0;
+        let cy = self.h - FOOTER_H / 2.0;
+        let mut right = self.w - 14.0;
+        let mut out = [(rect(0.0, 0.0, 0.0, 0.0), Act::Lock); 4];
+        for (slot, act) in out.iter_mut().zip(acts).rev() {
+            *slot = (
+                rect(right - size, cy - size / 2.0, right, cy + size / 2.0),
+                act,
+            );
+            right -= size + gap;
+        }
+        out
+    }
+
+    /// Footer folder shortcuts (Win7-style): documents, downloads.
+    fn folder_rects(&self) -> [(D2D_RECT_F, Act); 2] {
+        let size = 34.0;
+        let cy = self.h - FOOTER_H / 2.0;
+        let x0 = 10.0 + USER_W + 8.0;
+        [
+            (rect(x0, cy - size / 2.0, x0 + size, cy + size / 2.0), Act::Docs),
+            (
+                rect(x0 + size + 6.0, cy - size / 2.0, x0 + size * 2.0 + 6.0, cy + size / 2.0),
+                Act::Downloads,
+            ),
+        ]
+    }
+
+    fn hit(&self, x: f32, y: f32) -> Option<Act> {
+        if y >= self.list_bottom() {
+            for (rc, act) in self.power_rects().into_iter().chain(self.folder_rects()) {
+                if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                    return Some(act);
+                }
+            }
+            if x >= 10.0 && x < 10.0 + USER_W {
+                return Some(Act::User);
+            }
+            return None;
+        }
+        if y < self.list_top() {
+            return None;
+        }
+        if x >= SPLIT_X {
+            for (i, &(c, r, s)) in self.tile_slots().iter().enumerate() {
+                let rc = self.tile_rect(c, r, s);
+                if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                    return Some(Act::Pin(i));
+                }
+            }
+            return None;
+        }
+        if !self.query.is_empty() {
+            let idx = ((y - self.list_top() + self.scroll_list) / ROW_H) as usize;
+            return (idx < self.results.len()).then_some(Act::Result(idx));
+        }
+        let cy = y - self.list_top() + self.scroll_list;
+        for (i, row) in self.rows.iter().enumerate() {
+            let act = match row {
+                Row::App(a) => Act::App(*a),
+                Row::Freq(f) => Act::Freq(*f),
+                Row::Section(_) => continue,
+            };
+            let top = self.row_pos[i];
+            if cy >= top && cy < top + ROW_H {
+                return Some(act);
+            }
+        }
+        None
+    }
+
+    /// Launch an entry, feed the 자주 사용 counter, close.
+    fn launch_entry(&mut self, parsing: String, name: String, cmd: Vec<u16>) {
+        launch(&cmd);
+        self.bump_count(&parsing, &name);
+        self.hide();
+    }
+
+    fn act(&mut self, a: Act) {
+        match a {
+            Act::App(i) => {
+                if let Some(app) = self.apps.get(i) {
+                    let (p, n, c) = (app.parsing.clone(), app.name.clone(), app.launch.clone());
+                    self.launch_entry(p, n, c);
+                }
+            }
+            Act::Pin(i) => {
+                if let Some(pin) = self.pins.get(i) {
+                    let (p, n, c) = (pin.parsing.clone(), pin.name.clone(), pin.launch.clone());
+                    self.launch_entry(p, n, c);
+                }
+            }
+            Act::Freq(i) => {
+                if let Some(f) = self.freq.get(i) {
+                    let (p, n, c) = (f.parsing.clone(), f.name.clone(), f.launch.clone());
+                    self.launch_entry(p, n, c);
+                }
+            }
+            Act::Result(i) => {
+                if let Some(app) = self.results.get(i).and_then(|&a| self.apps.get(a)) {
+                    let (p, n, c) = (app.parsing.clone(), app.name.clone(), app.launch.clone());
+                    self.launch_entry(p, n, c);
+                }
+            }
+            Act::Docs => {
+                open_profile_dir("Documents");
+                self.hide();
+            }
+            Act::Downloads => {
+                open_profile_dir("Downloads");
+                self.hide();
+            }
+            Act::User => {
+                open_home();
+                self.hide();
+            }
+            Act::Lock => {
+                self.hide();
+                unsafe {
+                    let _ = LockWorkStation();
+                }
+            }
+            Act::Sleep => {
+                self.hide();
+                unsafe {
+                    let _ = SetSuspendState(false, false, false);
+                }
+            }
+            Act::Restart => {
+                self.hide();
+                run_shutdown(w!("/r /t 0"));
+            }
+            Act::Shutdown => {
+                self.hide();
+                run_shutdown(w!("/s /t 0"));
+            }
+        }
+    }
+
+    fn refresh(&mut self) {
+        unsafe {
+            // SetForegroundWindow can be denied; if we never became foreground
+            // and the user moved on, WA_INACTIVE never comes — close here.
+            let fg = GetForegroundWindow();
+            if fg != self.hwnd && fg != self.fg_at_open {
+                self.hide();
+            }
+        }
+    }
+
+    // ---- paint -------------------------------------------------------------
+
+    fn paint(&mut self) {
+        // Queue icon fetches for what is (or will be) visible; the worker
+        // streams results back via WM_APP_REPLY.
+        let (top, bottom) = (self.list_top(), self.list_bottom());
+        let mut want = Vec::new();
+        if !self.query.is_empty() {
+            for (i, &a) in self.results.iter().enumerate() {
+                let y = top + i as f32 * ROW_H - self.scroll_list;
+                if y + ROW_H >= top && y <= bottom {
+                    want.push(self.apps[a].parsing.clone());
+                }
+            }
+        } else {
+            for (i, row) in self.rows.iter().enumerate() {
+                let y = top + self.row_pos[i] - self.scroll_list;
+                if y + ROW_H < top || y > bottom {
+                    continue;
+                }
+                match row {
+                    Row::App(a) => want.push(self.apps[*a].parsing.clone()),
+                    Row::Freq(f) => {
+                        if let Some(e) = self.freq.get(*f) {
+                            want.push(e.parsing.clone());
+                        }
+                    }
+                    Row::Section(_) => {}
+                }
+            }
+        }
+        let slots = self.tile_slots();
+        for (p, &(c, r, s)) in self.pins.iter().zip(&slots) {
+            let rc = self.tile_rect(c, r, s);
+            if rc.bottom >= top && rc.top <= bottom {
+                want.push(p.parsing.clone());
+            }
+        }
+        for p in want {
+            self.request_icon(&p);
+        }
+
+        unsafe {
+            let r = &self.renderer;
+            r.dc.BeginDraw();
+            r.dc.Clear(Some(&theme::rgba(26, 27, 32, 0.92)));
+
+            // Header: search echo while typing, else title + hint.
+            if !self.query.is_empty() {
+                self.text(&[0xE721], &self.fmt_glyph, rect(16.0, 0.0, 40.0, HEADER_H), theme::ACCENT);
+                let q: Vec<u16> = self.query.encode_utf16().collect();
+                self.text(&q, &self.fmt_head, rect(44.0, 0.0, self.w - 60.0, HEADER_H), theme::TEXT);
+                let n: Vec<u16> = format!("{}", self.results.len()).encode_utf16().collect();
+                self.text(&n, &self.fmt_section, rect(self.w - 56.0, 0.0, self.w - 18.0, HEADER_H), theme::TEXT_DIM);
+            } else {
+                let title: Vec<u16> = "시작".encode_utf16().collect();
+                self.text(&title, &self.fmt_head, rect(20.0, 0.0, 200.0, HEADER_H), theme::TEXT);
+                let hint: Vec<u16> = "입력하면 검색".encode_utf16().collect();
+                self.text(
+                    &hint,
+                    &self.fmt_grid,
+                    rect(self.w - 130.0, 0.0, self.w - 18.0, HEADER_H),
+                    theme::TEXT_DIM,
+                );
+            }
+
+            // Left pane: search results or the freq + app list.
+            r.dc.PushAxisAlignedClip(
+                &rect(0.0, top, SPLIT_X - 3.0, bottom),
+                D2D1_ANTIALIAS_MODE_ALIASED,
+            );
+            if !self.query.is_empty() {
+                self.paint_search(top, bottom);
+            } else {
+                self.paint_apps(top, bottom);
+            }
+            r.dc.PopAxisAlignedClip();
+
+            // Pane divider
+            if let Ok(b) = r.brush(theme::with_alpha(theme::TEXT_DIM, 0.18)) {
+                r.dc.FillRectangle(&rect(SPLIT_X - 1.0, top + 4.0, SPLIT_X, bottom - 4.0), &b);
+            }
+
+            // Right pane: pinned tile grid.
+            r.dc.PushAxisAlignedClip(
+                &rect(SPLIT_X, top, self.w, bottom),
+                D2D1_ANTIALIAS_MODE_ALIASED,
+            );
+            self.paint_tiles(top, bottom);
+            r.dc.PopAxisAlignedClip();
+
+            // Per-pane scrollbar thumbs (only when the content overflows)
+            let view_h = bottom - top;
+            let list_h = self.list_content_h();
+            if list_h > view_h {
+                let th = (view_h * view_h / list_h).max(24.0);
+                let ty = top + (view_h - th) * (self.scroll_list / self.max_scroll_list());
+                self.fill_round(
+                    rect(SPLIT_X - 9.0, ty, SPLIT_X - 6.0, ty + th),
+                    1.5,
+                    theme::with_alpha(theme::TEXT_DIM, 0.5),
+                );
+            }
+            let tiles_h = self.pins_h();
+            if tiles_h > view_h {
+                let th = (view_h * view_h / tiles_h).max(24.0);
+                let ty = top + (view_h - th) * (self.scroll_tiles / self.max_scroll_tiles());
+                self.fill_round(
+                    rect(self.w - 6.0, ty, self.w - 3.0, ty + th),
+                    1.5,
+                    theme::with_alpha(theme::TEXT_DIM, 0.5),
+                );
+            }
+
+            // Footer
+            if let Ok(b) = r.brush(theme::with_alpha(theme::TEXT_DIM, 0.25)) {
+                r.dc.FillRectangle(&rect(12.0, bottom, self.w - 12.0, bottom + 1.0), &b);
+            }
+            if self.hover == Some(Act::User) {
+                self.fill_round(
+                    rect(
+                        10.0,
+                        bottom + (FOOTER_H - 34.0) / 2.0,
+                        10.0 + USER_W,
+                        bottom + (FOOTER_H + 34.0) / 2.0,
+                    ),
+                    6.0,
+                    theme::HOVER_FILL,
+                );
+            }
+            self.text(&[0xE77B], &self.fmt_glyph, rect(16.0, bottom, 44.0, self.h), theme::TEXT_DIM);
+            self.text(
+                &self.user,
+                &self.fmt_item,
+                rect(46.0, bottom, 10.0 + USER_W, self.h),
+                theme::TEXT,
+            );
+            for (rc, act) in self.folder_rects() {
+                if self.hover == Some(act) {
+                    self.fill_round(rc, 6.0, theme::HOVER_FILL);
+                }
+                let glyph: u16 = match act {
+                    Act::Docs => 0xE8A5,  // Document
+                    _ => 0xE896,          // Download
+                };
+                self.text(&[glyph], &self.fmt_glyph, rc, theme::TEXT_DIM);
+            }
+            for (rc, act) in self.power_rects() {
+                if self.hover == Some(act) {
+                    self.fill_round(rc, 6.0, theme::HOVER_FILL);
+                }
+                let glyph: u16 = match act {
+                    Act::Lock => 0xE72E,    // Lock
+                    Act::Sleep => 0xE708,   // QuietHours (moon)
+                    Act::Restart => 0xE72C, // Refresh
+                    _ => 0xE7E8,            // PowerButton
+                };
+                self.text(&[glyph], &self.fmt_glyph, rc, theme::TEXT);
+            }
+
+            let _ = r.dc.EndDraw(None, None);
+            let _ = self.renderer.present();
+        }
+    }
+
+    /// Right pane: the pinned Metro tile grid.
+    fn paint_tiles(&self, top: f32, bottom: f32) {
+        if self.pins.is_empty() {
+            let hint: Vec<u16> = "고정된 앱이 없습니다.\r왼쪽 목록에서 우클릭 → 고정"
+                .encode_utf16()
+                .collect();
+            self.text(
+                &hint,
+                &self.fmt_center,
+                rect(SPLIT_X, top, self.w, bottom),
+                theme::TEXT_DIM,
+            );
+            return;
+        }
+        let slots = self.tile_slots();
+        for (i, (pin, &(c, r, s))) in self.pins.iter().zip(&slots).enumerate() {
+            self.paint_tile(self.tile_rect(c, r, s), pin, self.hover == Some(Act::Pin(i)));
+        }
+    }
+
+    /// Metro tile: dominant-color background, centered icon, label inside
+    /// bottom-left. Hover = light wash + hairline border (the Win10 look).
+    fn paint_tile(&self, rc: D2D_RECT_F, e: &Entry, hovered: bool) {
+        if rc.bottom < self.list_top() || rc.top > self.list_bottom() {
+            return;
+        }
+        let bg = self
+            .tints
+            .get(&e.parsing)
+            .copied()
+            .unwrap_or(theme::rgba(255, 255, 255, 0.07));
+        self.fill_round(rc, 3.0, bg);
+        if hovered {
+            self.fill_round(rc, 3.0, theme::HOVER_FILL);
+            unsafe {
+                if let Ok(b) = self.renderer.brush(theme::rgba(255, 255, 255, 0.45)) {
+                    self.renderer.dc.DrawRoundedRectangle(
+                        &D2D1_ROUNDED_RECT { rect: rc, radiusX: 3.0, radiusY: 3.0 },
+                        &b,
+                        1.5,
+                        None,
+                    );
+                }
+            }
+        }
+        let icx = (rc.left + rc.right) / 2.0;
+        let icy = rc.top + (TILE - TILE_ICON) / 2.0 - 8.0;
+        self.draw_icon(
+            &e.parsing,
+            rect(icx - TILE_ICON / 2.0, icy, icx + TILE_ICON / 2.0, icy + TILE_ICON),
+        );
+        self.text(
+            &e.wname,
+            &self.fmt_tile,
+            rect(rc.left + 9.0, rc.top, rc.right - 9.0, rc.bottom - 7.0),
+            theme::TEXT,
+        );
+    }
+
+    /// Type-to-search result rows (left pane); `selected` gets the accent.
+    fn paint_search(&self, top: f32, bottom: f32) {
+        if self.results.is_empty() {
+            let msg: Vec<u16> = "일치하는 앱 없음".encode_utf16().collect();
+            self.text(&msg, &self.fmt_center, rect(0.0, top, SPLIT_X, bottom), theme::TEXT_DIM);
+            return;
+        }
+        for (i, &a) in self.results.iter().enumerate() {
+            let y = top + i as f32 * ROW_H - self.scroll_list;
+            if y + ROW_H < top || y > bottom {
+                continue;
+            }
+            let app = &self.apps[a];
+            if i == self.selected {
+                self.fill_round(
+                    rect(8.0, y + 1.0, SPLIT_X - 12.0, y + ROW_H - 1.0),
+                    6.0,
+                    theme::with_alpha(theme::ACCENT, 0.22),
+                );
+            } else if self.hover == Some(Act::Result(i)) {
+                self.fill_round(
+                    rect(8.0, y + 1.0, SPLIT_X - 12.0, y + ROW_H - 1.0),
+                    6.0,
+                    theme::HOVER_FILL,
+                );
+            }
+            self.paint_row_entry(app, y);
+        }
+    }
+
+    /// Icon + name for one list row, shared by search/apps/freq painters.
+    fn paint_row_entry(&self, e: &Entry, y: f32) {
+        let islot = rect(
+            16.0,
+            y + (ROW_H - LIST_ICON) / 2.0,
+            16.0 + LIST_ICON,
+            y + (ROW_H + LIST_ICON) / 2.0,
+        );
+        self.draw_icon(&e.parsing, islot);
+        self.text(
+            &e.wname,
+            &self.fmt_item,
+            rect(16.0 + LIST_ICON + 10.0, y, SPLIT_X - 14.0, y + ROW_H),
+            theme::TEXT,
+        );
+    }
+
+    /// Left pane: 자주 사용 rows on top, then the sectioned app list.
+    fn paint_apps(&self, top: f32, bottom: f32) {
+        if self.loading && self.apps.is_empty() {
+            let msg: Vec<u16> = "앱 목록 불러오는 중…".encode_utf16().collect();
+            self.text(&msg, &self.fmt_center, rect(0.0, top, SPLIT_X, bottom), theme::TEXT_DIM);
+            return;
+        }
+        for (i, row) in self.rows.iter().enumerate() {
+            let y = top + self.row_pos[i] - self.scroll_list;
+            match row {
+                Row::Section(label) => {
+                    if y + SECTION_H < top || y > bottom {
+                        continue;
+                    }
+                    self.text(
+                        label,
+                        &self.fmt_section,
+                        rect(18.0, y, SPLIT_X - 12.0, y + SECTION_H),
+                        theme::ACCENT,
+                    );
+                }
+                Row::App(_) | Row::Freq(_) => {
+                    if y + ROW_H < top || y > bottom {
+                        continue;
+                    }
+                    let (entry, act) = match row {
+                        Row::App(a) => (self.apps.get(*a), Act::App(*a)),
+                        Row::Freq(f) => (self.freq.get(*f), Act::Freq(*f)),
+                        Row::Section(_) => unreachable!(),
+                    };
+                    let Some(entry) = entry else { continue };
+                    if self.hover == Some(act) {
+                        self.fill_round(
+                            rect(8.0, y + 1.0, SPLIT_X - 12.0, y + ROW_H - 1.0),
+                            6.0,
+                            theme::HOVER_FILL,
+                        );
+                    }
+                    self.paint_row_entry(entry, y);
+                }
+            }
+        }
+    }
+
+    /// Aspect-fit the cached icon into `slot`; dim placeholder until (or if)
+    /// the worker delivers.
+    fn draw_icon(&self, parsing: &str, slot: D2D_RECT_F) {
+        match self.icons.get(parsing) {
+            Some(Some(bmp)) => unsafe {
+                let sz = bmp.GetSize();
+                if sz.width <= 0.0 || sz.height <= 0.0 {
+                    return;
+                }
+                let sw = slot.right - slot.left;
+                let sh = slot.bottom - slot.top;
+                let s = (sw / sz.width).min(sh / sz.height);
+                let (dw, dh) = (sz.width * s, sz.height * s);
+                let dst = rect(
+                    slot.left + (sw - dw) / 2.0,
+                    slot.top + (sh - dh) / 2.0,
+                    slot.left + (sw - dw) / 2.0 + dw,
+                    slot.top + (sh - dh) / 2.0 + dh,
+                );
+                self.renderer.dc.DrawBitmap(
+                    bmp,
+                    Some(&dst),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    None,
+                    None,
+                );
+            },
+            _ => {
+                self.fill_round(slot, 5.0, theme::with_alpha(theme::TEXT_DIM, 0.3));
+            }
+        }
+    }
+
+    fn text(&self, s: &[u16], fmt: &IDWriteTextFormat, rc: D2D_RECT_F, color: D2D1_COLOR_F) {
+        unsafe {
+            if let Ok(b) = self.renderer.brush(color) {
+                self.renderer.dc.DrawText(
+                    s,
+                    fmt,
+                    &rc,
+                    &b,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        }
+    }
+
+    fn fill_round(&self, rc: D2D_RECT_F, radius: f32, color: D2D1_COLOR_F) {
+        unsafe {
+            if let Ok(b) = self.renderer.brush(color) {
+                self.renderer.dc.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rc, radiusX: radius, radiusY: radius },
+                    &b,
+                );
+            }
+        }
+    }
+}
+
+fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
+    D2D_RECT_F { left, top, right, bottom }
+}
+
+fn launch(cmd: &[u16]) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), PCWSTR(cmd.as_ptr()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+// ---- pins persistence ------------------------------------------------------
+
+fn start_pins_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("glide-shell").join("start_pins.txt")
+}
+
+/// One pin per line: `{parsing}\t{display name}\t{wide 0|1}` (third field
+/// optional for files written before tiles).
+fn load_start_pins() -> Vec<Entry> {
+    std::fs::read_to_string(start_pins_path())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let mut it = l.splitn(3, '\t');
+                    let parsing = it.next()?;
+                    let name = it.next()?;
+                    if parsing.is_empty() {
+                        return None;
+                    }
+                    let mut e = Entry::new(name.to_string(), parsing.to_string());
+                    e.wide = it.next() == Some("1");
+                    Some(e)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_start_pins(pins: &[Entry]) {
+    let p = start_pins_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body: String = pins
+        .iter()
+        .map(|e| format!("{}\t{}\t{}\n", e.parsing, e.name, e.wide as u8))
+        .collect();
+    let _ = std::fs::write(p, body);
+}
+
+// ---- launch counts (자주 사용) ----------------------------------------------
+
+fn counts_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("glide-shell").join("start_counts.txt")
+}
+
+/// One app per line: `{count}\t{parsing}\t{display name}`.
+fn load_counts() -> HashMap<String, (u32, String)> {
+    std::fs::read_to_string(counts_path())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let mut it = l.splitn(3, '\t');
+                    let count: u32 = it.next()?.parse().ok()?;
+                    let parsing = it.next()?.to_string();
+                    let name = it.next()?.to_string();
+                    Some((parsing, (count, name)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_counts(counts: &HashMap<String, (u32, String)>) {
+    let p = counts_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body: String = counts
+        .iter()
+        .map(|(parsing, (count, name))| format!("{count}\t{parsing}\t{name}\n"))
+        .collect();
+    let _ = std::fs::write(p, body);
+}
+
+// ---- sorting ----------------------------------------------------------------
+
+/// Sort/section class: 0 = digits & symbols ("#"), 1 = 한글 초성, 2 = A–Z.
+fn section_of(name: &str) -> (u8, char) {
+    const CHO: [char; 19] = [
+        'ㄱ', 'ㄱ', 'ㄴ', 'ㄷ', 'ㄷ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅂ', 'ㅅ', 'ㅅ', 'ㅇ', 'ㅈ', 'ㅈ',
+        'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+    ];
+    let c = name.chars().next().unwrap_or('#');
+    if ('가'..='힣').contains(&c) {
+        (1, CHO[(c as usize - 0xAC00) / 588])
+    } else if c.is_ascii_alphabetic() {
+        (2, c.to_ascii_uppercase())
+    } else {
+        (0, '#')
+    }
+}
+
+/// Search haystack for 초성 queries: 한글 syllables collapse to their initial
+/// consonant (full 19-jamo table — ㄲㄸㅃㅆㅉ stay distinct), everything else
+/// lowercases, so "ㅋㄹ" finds 크롬 and "ㄱㅁ" finds 게임.
+fn name_cho(name: &str) -> String {
+    const CHO_FULL: [char; 19] = [
+        'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ',
+        'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+    ];
+    name.chars()
+        .flat_map(|c| {
+            if ('가'..='힣').contains(&c) {
+                CHO_FULL[(c as usize - 0xAC00) / 588].to_lowercase()
+            } else {
+                c.to_lowercase()
+            }
+        })
+        .collect()
+}
+
+// ---- worker thread -----------------------------------------------------------
+
+/// MTA COM worker: AppsFolder enumeration and icon extraction. Sends replies
+/// and pokes the UI window with WM_APP_REPLY; exits when the channel closes.
+fn worker(jobs: Receiver<Job>, replies: Sender<Reply>, hwnd_raw: isize) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let hwnd = HWND(hwnd_raw as *mut _);
+    while let Ok(job) = jobs.recv() {
+        let rep = match job {
+            Job::Apps { epoch } => Reply::Apps { epoch, list: enum_apps() },
+            Job::Icon { parsing } => {
+                let (w, h, pixels) = extract_icon(&parsing).unwrap_or((0, 0, Vec::new()));
+                Reply::Icon { parsing, w, h, pixels }
+            }
+        };
+        if replies.send(rep).is_err() {
+            break;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_REPLY, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// (display name, parsing name) for everything the stock Start shows,
+/// pre-sorted #→한글→ABC.
+fn enum_apps() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    unsafe {
+        let folder: IShellItem =
+            match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
+                Ok(f) => f,
+                Err(_) => return out,
+            };
+        let en: IEnumShellItems = match folder.BindToHandler(None, &BHID_EnumItems) {
+            Ok(e) => e,
+            Err(_) => return out,
+        };
+        loop {
+            let mut batch: [Option<IShellItem>; 1] = [None];
+            let mut got = 0u32;
+            if en.Next(&mut batch, Some(&mut got)).is_err() || got == 0 {
+                break;
+            }
+            let Some(item) = batch[0].take() else { break };
+            let Some(name) = take_pwstr(item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()) else {
+                continue;
+            };
+            let Some(rel) = take_pwstr(item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING).ok())
+            else {
+                continue;
+            };
+            out.push((name, rel));
+        }
+    }
+    out.sort_by_cached_key(|(name, _)| {
+        let (class, ch) = section_of(name);
+        (class, ch, name.to_lowercase())
+    });
+    out
+}
+
+/// Premultiplied BGRA pixels at the bitmap's REAL size (GetObjectW) — the
+/// shell does not always honor the requested size, and reading a mismatched
+/// buffer is what mangled the first cut of these icons.
+fn extract_icon(parsing: &str) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let path: Vec<u16> = format!(r"shell:AppsFolder\{parsing}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None).ok()?;
+        let factory: IShellItemImageFactory = item.cast().ok()?;
+        let hbmp = factory
+            .GetImage(
+                windows::Win32::Foundation::SIZE { cx: ICON_PX, cy: ICON_PX },
+                SIIGBF_RESIZETOFIT,
+            )
+            .ok()?;
+        let result = (|| {
+            let mut bm = BITMAP::default();
+            if GetObjectW(
+                hbmp.into(),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bm as *mut _ as *mut _),
+            ) == 0
+                || bm.bmWidth <= 0
+                || bm.bmHeight <= 0
+            {
+                return None;
+            }
+            let (w, h) = (bm.bmWidth, bm.bmHeight);
+            let hdc = CreateCompatibleDC(None);
+            let mut bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            let got = GetDIBits(
+                hdc,
+                hbmp,
+                0,
+                h as u32,
+                Some(pixels.as_mut_ptr() as *mut _),
+                &mut bi,
+                DIB_RGB_COLORS,
+            );
+            let _ = DeleteDC(hdc);
+            if got == 0 {
+                return None;
+            }
+            // Dead alpha channel (24bpp sources) — force opaque. Live alpha
+            // is straight; premultiply for the swapchain format.
+            if pixels.chunks_exact(4).all(|p| p[3] == 0) {
+                for p in pixels.chunks_exact_mut(4) {
+                    p[3] = 255;
+                }
+            }
+            for p in pixels.chunks_exact_mut(4) {
+                let a = p[3] as u32;
+                p[0] = ((p[0] as u32 * a) / 255) as u8;
+                p[1] = ((p[1] as u32 * a) / 255) as u8;
+                p[2] = ((p[2] as u32 * a) / 255) as u8;
+            }
+            Some((w, h, pixels))
+        })();
+        let _ = DeleteObject(hbmp.into());
+        result
+    }
+}
+
+/// Dominant color of an icon (premultiplied BGRA), normalized to a dark-theme
+/// tile background. Colored pixels vote; near-grayscale ones don't, so white
+/// glyph icons fall back to the neutral tile instead of washing out gray.
+fn tint_of(pixels: &[u8]) -> Option<(f32, f32, f32)> {
+    let (mut rs, mut gs, mut bs, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for p in pixels.chunks_exact(4) {
+        let a = p[3] as u32;
+        if a < 200 {
+            continue;
+        }
+        let b = (p[0] as u32 * 255 / a).min(255);
+        let g = (p[1] as u32 * 255 / a).min(255);
+        let r = (p[2] as u32 * 255 / a).min(255);
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        if mx - mn < 24 {
+            continue;
+        }
+        rs += r as u64;
+        gs += g as u64;
+        bs += b as u64;
+        n += 1;
+    }
+    if n < 32 {
+        return None;
+    }
+    let (r, g, b) = ((rs / n) as f32, (gs / n) as f32, (bs / n) as f32);
+    let mx = r.max(g).max(b).max(1.0);
+    // Darken to tile depth (max channel ≈ 0.46) with a touch of gray so
+    // saturated brand colors don't go neon against the dark panel.
+    let k = 118.0 / mx;
+    let mix = |c: f32| (c * k * 0.88 + 14.0) / 255.0;
+    Some((mix(r), mix(g), mix(b)))
+}
+
+/// Read and free a shell-allocated display-name string.
+fn take_pwstr(p: Option<windows::core::PWSTR>) -> Option<String> {
+    let p = p?;
+    unsafe {
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s
+    }
+}
+
+fn open_home() {
+    open_dir(std::env::var_os("USERPROFILE").map(PathBuf::from));
+}
+
+fn open_profile_dir(sub: &str) {
+    open_dir(
+        std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(sub)),
+    );
+}
+
+fn open_dir(dir: Option<PathBuf>) {
+    let Some(dir) = dir else { return };
+    unsafe {
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+fn run_shutdown(args: PCWSTR) {
+    unsafe {
+        ShellExecuteW(None, None, w!("shutdown.exe"), args, None, SW_HIDE);
+    }
+}
+
+extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu;
+        if ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let sm = &mut *ptr;
+        let lx = |s: &StartMenu| (lparam.0 & 0xFFFF) as i16 as f32 / s.scale;
+        let ly = |s: &StartMenu| ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / s.scale;
+        match msg {
+            WM_PAINT => {
+                let _ = ValidateRect(Some(hwnd), None);
+                sm.paint();
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_APP_REPLY => {
+                sm.on_replies();
+                LRESULT(0)
+            }
+            WM_ACTIVATE => {
+                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                    sm.hide();
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = (lx(sm), ly(sm));
+                let h = sm.hit(x, y);
+                if h != sm.hover {
+                    sm.hover = h;
+                    sm.paint();
+                }
+                if !sm.tracking {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    if TrackMouseEvent(&mut tme).is_ok() {
+                        sm.tracking = true;
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                sm.tracking = false;
+                if sm.hover.take().is_some() {
+                    sm.paint();
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = (lx(sm), ly(sm));
+                if let Some(a) = sm.hit(x, y) {
+                    sm.act(a);
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = (lx(sm), ly(sm));
+                // Pin/unpin mini-menu. TrackPopupMenu pumps this wndproc
+                // reentrantly (same lesson as desktop.rs) — collect what we
+                // need, let the borrow lapse across the modal call, then
+                // re-deref GWLP_USERDATA.
+                // (parsing, name, pinned, wide-state for pin tiles)
+                let target: Option<(String, String, bool, Option<bool>)> = match sm.hit(x, y) {
+                    Some(Act::App(i)) => sm.apps.get(i).map(|a| {
+                        let pinned = sm.pins.iter().any(|p| p.parsing == a.parsing);
+                        (a.parsing.clone(), a.name.clone(), pinned, None)
+                    }),
+                    Some(Act::Result(i)) => {
+                        sm.results.get(i).and_then(|&a| sm.apps.get(a)).map(|a| {
+                            let pinned = sm.pins.iter().any(|p| p.parsing == a.parsing);
+                            (a.parsing.clone(), a.name.clone(), pinned, None)
+                        })
+                    }
+                    Some(Act::Pin(i)) => sm
+                        .pins
+                        .get(i)
+                        .map(|p| (p.parsing.clone(), p.name.clone(), true, Some(p.wide))),
+                    Some(Act::Freq(i)) => sm
+                        .freq
+                        .get(i)
+                        .map(|f| (f.parsing.clone(), f.name.clone(), false, None)),
+                    _ => None,
+                };
+                if let Some((parsing, name, pinned, wide)) = target {
+                    let menu = match CreatePopupMenu() {
+                        Ok(m) => m,
+                        Err(_) => return LRESULT(0),
+                    };
+                    let label = if pinned {
+                        w!("시작 화면에서 제거")
+                    } else {
+                        w!("시작 화면에 고정")
+                    };
+                    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PIN, label);
+                    if let Some(wide) = wide {
+                        let size_label = if wide {
+                            w!("정사각 타일로")
+                        } else {
+                            w!("와이드 타일로")
+                        };
+                        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_WIDE, size_label);
+                    }
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let cmd = TrackPopupMenu(
+                        menu,
+                        TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                        pt.x,
+                        pt.y,
+                        Some(0),
+                        hwnd,
+                        None,
+                    );
+                    let _ = DestroyMenu(menu);
+                    let sm = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu);
+                    match cmd.0 as usize {
+                        MENU_TOGGLE_PIN => sm.toggle_pin(&parsing, &name),
+                        MENU_TOGGLE_WIDE => sm.toggle_wide(&parsing),
+                        _ => {}
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                // lparam is screen coords here; map to client to pick the pane.
+                let notches = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                let mut pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                sm.wheel(pt.x as f32 / sm.scale, notches);
+                LRESULT(0)
+            }
+            WM_CHAR => {
+                let c = wparam.0 as u32;
+                if c == 0x08 {
+                    // Backspace
+                    if sm.query.pop().is_some() {
+                        sm.update_results();
+                        sm.paint();
+                    }
+                } else if c >= 0x20 {
+                    if let Some(ch) = char::from_u32(c) {
+                        sm.query.push(ch);
+                        sm.update_results();
+                        sm.paint();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN => {
+                if wparam.0 == VK_ESCAPE.0 as usize {
+                    // Esc backs out of the search first, then closes.
+                    if sm.query.is_empty() {
+                        sm.hide();
+                    } else {
+                        sm.query.clear();
+                        sm.update_results();
+                        sm.paint();
+                    }
+                } else if !sm.query.is_empty() {
+                    match VIRTUAL_KEY(wparam.0 as u16) {
+                        VK_DOWN => {
+                            if sm.selected + 1 < sm.results.len() {
+                                sm.selected += 1;
+                                sm.ensure_selected_visible();
+                                sm.paint();
+                            }
+                        }
+                        VK_UP => {
+                            if sm.selected > 0 {
+                                sm.selected -= 1;
+                                sm.ensure_selected_visible();
+                                sm.paint();
+                            }
+                        }
+                        VK_RETURN => {
+                            let sel = sm.selected;
+                            if sel < sm.results.len() {
+                                sm.act(Act::Result(sel));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                if wparam.0 == TIMER_REFRESH {
+                    sm.refresh();
+                }
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}

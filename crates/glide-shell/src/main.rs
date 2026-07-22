@@ -12,6 +12,7 @@ mod preview;
 mod render;
 mod shellmenu;
 mod spike_toasts;
+mod startmenu;
 mod status;
 mod taskbar;
 mod theme;
