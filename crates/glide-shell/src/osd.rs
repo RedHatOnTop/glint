@@ -1,11 +1,15 @@
-//! Volume OSD (SHELL_DESIGN §6.7). An IAudioEndpointVolumeCallback fires on
-//! any master-volume change — hardware keys, the tray wheel, other apps — on
-//! an arbitrary COM thread; OnNotify only posts the new level to the OSD
-//! window, so idle cost is zero (the poll alternative would wake 10×/s
-//! forever on a battery machine). The pill renders bottom-center above the
-//! work area, never activates, hit-tests transparent, and fades out 1.5s
-//! after the last change. Owns its own enumerator/endpoint instead of
-//! borrowing status.rs's so neither module depends on the other's lifecycle.
+//! Volume + brightness OSD (SHELL_DESIGN §6.7). An
+//! IAudioEndpointVolumeCallback fires on any master-volume change — hardware
+//! keys, the tray wheel, other apps — on an arbitrary COM thread; OnNotify
+//! only posts the new level to the OSD window, so idle cost is zero (the
+//! poll alternative would wake 10×/s forever on a battery machine).
+//! Brightness rides the same pill: a worker thread blocks on a WMI
+//! `WmiMonitorBrightnessEvent` notification query (fires for hotkeys and
+//! ms-settings alike) and posts the new percent. The pill renders
+//! bottom-center above the work area, never activates, hit-tests
+//! transparent, and fades out 1.5s after the last change. Owns its own
+//! enumerator/endpoint instead of borrowing status.rs's so neither module
+//! depends on the other's lifecycle.
 
 use std::time::Instant;
 
@@ -23,16 +27,28 @@ use windows::Win32::Media::Audio::Endpoints::{
 use windows::Win32::Media::Audio::{
     AUDIO_VOLUME_NOTIFICATION_DATA, IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender,
 };
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CoSetProxyBlanket, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+};
+use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_UI1};
+use windows::Win32::System::Wmi::{
+    IWbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    WbemLocator,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, implement, w};
+use windows::core::{BSTR, PCWSTR, implement, w};
 
 use crate::render::Renderer;
 use crate::theme;
 
 const WM_APP_VOL: u32 = WM_APP + 12;
+const WM_APP_BRIGHT: u32 = WM_APP + 13;
 const TIMER_HIDE: usize = 1;
 const TIMER_ANIM: usize = 2;
+/// RPC_C_AUTHN_WINNT — the constant lives in Win32_System_Rpc; not worth the
+/// feature for one u32.
+const AUTHN_WINNT: u32 = 10;
 
 const OSD_W: f32 = 280.0;
 const OSD_H: f32 = 48.0;
@@ -65,14 +81,24 @@ impl IAudioEndpointVolumeCallback_Impl for VolWatch_Impl {
     }
 }
 
+/// Which reading the pill currently shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Vol,
+    Bright,
+}
+
 pub struct Osd {
     hwnd: HWND,
     renderer: Renderer,
     fmt_glyph: IDWriteTextFormat,
     fmt_pct: IDWriteTextFormat,
     scale: f32,
+    mode: Mode,
     vol: f32,
     muted: bool,
+    /// Brightness percent, 0..=100.
+    bright: u32,
     /// 0→1 fade-in; runs back 1→0 when `closing`.
     state: f32,
     closing: bool,
@@ -139,8 +165,10 @@ impl Osd {
                 fmt_glyph,
                 fmt_pct,
                 scale: dpi / 96.0,
+                mode: Mode::Vol,
                 vol: 0.0,
                 muted: false,
+                bright: 0,
                 state: 0.0,
                 closing: false,
                 shown: false,
@@ -178,6 +206,10 @@ impl Osd {
             }
             Err(e) => eprintln!("glide-shell: volume OSD subscription failed: {e:?}"),
         }
+        // Brightness watcher. The blocking Next() has no clean cancel; the
+        // thread dies with the process, which is when we'd want it gone.
+        let hwnd_raw = self.hwnd.0 as isize;
+        std::thread::spawn(move || bright_worker(hwnd_raw));
     }
 
     pub fn disarm(&mut self) {
@@ -193,8 +225,19 @@ impl Osd {
 
     /// A volume change arrived: update, (re)show, restart the hide clock.
     fn bump(&mut self, vol: f32, muted: bool) {
+        self.mode = Mode::Vol;
         self.vol = vol.clamp(0.0, 1.0);
         self.muted = muted;
+        self.reveal();
+    }
+
+    fn bump_bright(&mut self, pct: u32) {
+        self.mode = Mode::Bright;
+        self.bright = pct.min(100);
+        self.reveal();
+    }
+
+    fn reveal(&mut self) {
         self.closing = false;
         if !self.shown {
             self.shown = true;
@@ -282,7 +325,15 @@ impl Osd {
                 );
             }
 
-            let glyph = crate::status::volume_glyph(Some((self.vol, self.muted)));
+            // Sun for brightness; the volume glyph tracks level and mute.
+            let (glyph, frac, dim_fill) = match self.mode {
+                Mode::Vol => (
+                    crate::status::volume_glyph(Some((self.vol, self.muted))),
+                    self.vol,
+                    self.muted,
+                ),
+                Mode::Bright => (0xE706u16, self.bright as f32 / 100.0, false),
+            };
             self.text(&[glyph], &self.fmt_glyph, rect(10.0, 0.0, 46.0, OSD_H), fade(theme::TEXT));
 
             // Track + fill; mute dims the fill instead of hiding it.
@@ -293,17 +344,17 @@ impl Osd {
                 2.0,
                 fade(theme::with_alpha(theme::TEXT_DIM, 0.3)),
             );
-            let fill = if self.muted {
+            let fill = if dim_fill {
                 fade(theme::with_alpha(theme::TEXT_DIM, 0.6))
             } else {
                 fade(theme::ACCENT)
             };
-            let fx = tx0 + (tx1 - tx0) * self.vol;
+            let fx = tx0 + (tx1 - tx0) * frac;
             if fx > tx0 {
                 self.fill_round(rect(tx0, cy - 2.0, fx, cy + 2.0), 2.0, fill);
             }
 
-            let pct: Vec<u16> = format!("{}", (self.vol * 100.0).round() as u32)
+            let pct: Vec<u16> = format!("{}", (frac * 100.0).round() as u32)
                 .encode_utf16()
                 .collect();
             self.text(
@@ -349,6 +400,74 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     D2D_RECT_F { left, top, right, bottom }
 }
 
+/// Blocks forever on a WMI notification query; every brightness change on
+/// any monitor posts its percent to the OSD window.
+fn bright_worker(hwnd_raw: isize) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let r = (|| -> windows::core::Result<()> {
+            let locator: IWbemLocator =
+                CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)?;
+            let services = locator.ConnectServer(
+                &BSTR::from(r"root\wmi"),
+                &BSTR::new(),
+                &BSTR::new(),
+                &BSTR::new(),
+                0,
+                &BSTR::new(),
+                None,
+            )?;
+            CoSetProxyBlanket(
+                &services,
+                AUTHN_WINNT,
+                0,
+                None,
+                RPC_C_AUTHN_LEVEL_CALL,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOAC_NONE,
+            )?;
+            let rows = services.ExecNotificationQuery(
+                &BSTR::from("WQL"),
+                &BSTR::from("SELECT * FROM WmiMonitorBrightnessEvent"),
+                WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY,
+                None,
+            )?;
+            loop {
+                let mut obj = [None; 1];
+                let mut got = 0u32;
+                let _ = rows.Next(WBEM_INFINITE, &mut obj, &mut got);
+                let Some(obj) = obj[0].take() else { continue };
+                if got == 0 {
+                    continue;
+                }
+                let mut v = VARIANT::default();
+                if obj.Get(w!("Brightness"), 0, &mut v, None, None).is_ok() {
+                    let vt = v.Anonymous.Anonymous.vt;
+                    let pct = if vt == VT_UI1 {
+                        Some(v.Anonymous.Anonymous.Anonymous.bVal as u32)
+                    } else if vt == VT_I4 {
+                        Some(v.Anonymous.Anonymous.Anonymous.lVal as u32)
+                    } else {
+                        None
+                    };
+                    if let Some(pct) = pct {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_raw as *mut _)),
+                            WM_APP_BRIGHT,
+                            WPARAM(0),
+                            LPARAM(pct as isize),
+                        );
+                    }
+                }
+            }
+        })();
+        if let Err(e) = r {
+            eprintln!("glide-shell: brightness OSD subscription failed: {e:?}");
+        }
+    }
+}
+
 extern "system" fn osd_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Osd;
@@ -369,6 +488,10 @@ extern "system" fn osd_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 let muted = wparam.0 != 0;
                 let vol = lparam.0 as f32 / 1000.0;
                 o.bump(vol, muted);
+                LRESULT(0)
+            }
+            WM_APP_BRIGHT => {
+                o.bump_bright(lparam.0 as u32);
                 LRESULT(0)
             }
             WM_TIMER => {
