@@ -84,6 +84,13 @@ const ICON_PX: i32 = 64;
 const STALE_SECS: u64 = 300;
 const MENU_TOGGLE_PIN: usize = 1;
 const MENU_TOGGLE_WIDE: usize = 2;
+const MENU_DISSOLVE: usize = 3;
+const MENU_UNGROUP: usize = 4;
+const MENU_NEW_GROUP: usize = 90;
+/// + group index for the "그룹에 추가" submenu entries.
+const MENU_GROUP_BASE: usize = 100;
+/// Folder-view header row (back chip + group name) height.
+const FOLDER_HEAD: f32 = 44.0;
 /// Footer user chip width; folder shortcuts sit to its right.
 const USER_W: f32 = 108.0;
 
@@ -96,6 +103,9 @@ struct Entry {
     launch: Vec<u16>,
     /// 2×1 Metro tile instead of 1×1; only pins persist this.
     wide: bool,
+    /// Tile group (Win10 tile folder); pins sharing a name collapse into one
+    /// folder tile. Only pins persist this.
+    folder: Option<String>,
 }
 
 impl Entry {
@@ -105,8 +115,14 @@ impl Entry {
             .chain(std::iter::once(0))
             .collect();
         let wname = name.encode_utf16().collect();
-        Entry { name, wname, parsing, launch, wide: false }
+        Entry { name, wname, parsing, launch, wide: false, folder: None }
     }
+}
+
+/// One right-pane tile: a lone pin or a folder of them (indices into `pins`).
+enum TileItem {
+    Single(usize),
+    Folder(String, Vec<usize>),
 }
 
 enum Row {
@@ -119,7 +135,12 @@ enum Row {
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
     App(usize),
-    Pin(usize),
+    /// Index into `tile_items()` — a pin tile or a folder tile.
+    Tile(usize),
+    /// Index into the open folder's member list (pins indices via members()).
+    FolderItem(usize),
+    /// "‹ 뒤로" header row while a folder is open.
+    FolderBack,
     /// Index into the "자주 사용" list (Win10-style frequent apps).
     Freq(usize),
     /// Index into the type-to-search results.
@@ -169,6 +190,8 @@ pub struct StartMenu {
     /// Type-to-search: any printable key while the menu is open filters the
     /// app list (Launchpad/GNOME behavior), with 초성 matching (ㅋㄹ → 크롬).
     query: String,
+    /// Tile folder currently expanded in the right pane.
+    open_folder: Option<String>,
     /// apps indices matching `query`.
     results: Vec<usize>,
     selected: usize,
@@ -315,6 +338,7 @@ impl StartMenu {
                 epoch: 0,
                 loaded_at: None,
                 query: String::new(),
+                open_folder: None,
                 results: Vec::new(),
                 selected: 0,
                 counts: load_counts(),
@@ -350,6 +374,7 @@ impl StartMenu {
         self.scroll_list = 0.0;
         self.scroll_tiles = 0.0;
         self.query.clear();
+        self.open_folder = None;
         self.results.clear();
         self.rebuild_freq();
 
@@ -517,6 +542,46 @@ impl StartMenu {
         }
     }
 
+    /// Move a pin into a group (or out with `None`).
+    fn set_folder(&mut self, parsing: &str, folder: Option<String>) {
+        if let Some(p) = self.pins.iter_mut().find(|p| p.parsing == parsing) {
+            p.folder = folder;
+            save_start_pins(&self.pins);
+            // Open folder may have just emptied.
+            if let Some(f) = &self.open_folder {
+                if self.members(f).is_empty() {
+                    self.open_folder = None;
+                    self.scroll_tiles = 0.0;
+                }
+            }
+            self.paint();
+        }
+    }
+
+    /// Ungroup every member; the folder tile dissolves back into singles.
+    fn dissolve(&mut self, folder: &str) {
+        for p in &mut self.pins {
+            if p.folder.as_deref() == Some(folder) {
+                p.folder = None;
+            }
+        }
+        save_start_pins(&self.pins);
+        if self.open_folder.as_deref() == Some(folder) {
+            self.open_folder = None;
+            self.scroll_tiles = 0.0;
+        }
+        self.paint();
+    }
+
+    /// "그룹 1", "그룹 2", … first unused.
+    fn next_group_name(&self) -> String {
+        let groups = self.groups();
+        (1..)
+            .map(|n| format!("그룹 {n}"))
+            .find(|c| !groups.contains(c))
+            .unwrap()
+    }
+
     fn bump_count(&mut self, parsing: &str, name: &str) {
         let e = self
             .counts
@@ -585,13 +650,58 @@ impl StartMenu {
         self.h - FOOTER_H
     }
 
-    /// First-fit tile packing: (col, row, span) per pin. Wide tiles take two
-    /// adjacent cells; squares backfill earlier holes so the grid stays tight.
-    fn tile_slots(&self) -> Vec<(usize, usize, usize)> {
+    /// Right-pane tile items: pins fold into folder tiles at the position of
+    /// their first member; loose pins stay singles, in pin order.
+    fn tile_items(&self) -> Vec<TileItem> {
+        let mut out: Vec<TileItem> = Vec::new();
+        for (i, pin) in self.pins.iter().enumerate() {
+            match &pin.folder {
+                Some(f) => {
+                    if let Some(TileItem::Folder(_, members)) = out
+                        .iter_mut()
+                        .find(|it| matches!(it, TileItem::Folder(n, _) if n == f))
+                    {
+                        members.push(i);
+                    } else {
+                        out.push(TileItem::Folder(f.clone(), vec![i]));
+                    }
+                }
+                None => out.push(TileItem::Single(i)),
+            }
+        }
+        out
+    }
+
+    /// Pin indices inside a folder, in pin order.
+    fn members(&self, folder: &str) -> Vec<usize> {
+        self.pins
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.folder.as_deref() == Some(folder))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Existing group names, in first-appearance order.
+    fn groups(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in &self.pins {
+            if let Some(f) = &p.folder {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// First-fit tile packing: (col, row, span) per input span. Wide tiles
+    /// take two adjacent cells; squares backfill earlier holes so the grid
+    /// stays tight.
+    fn pack(spans: &[usize]) -> Vec<(usize, usize, usize)> {
         let mut used: Vec<[bool; TILE_COLS]> = Vec::new();
-        let mut out = Vec::with_capacity(self.pins.len());
-        for pin in &self.pins {
-            let span = if pin.wide { 2 } else { 1 };
+        let mut out = Vec::with_capacity(spans.len());
+        for &span in spans {
             let mut row = 0usize;
             let (row, col) = loop {
                 if row == used.len() {
@@ -612,20 +722,43 @@ impl StartMenu {
         out
     }
 
-    fn tile_rect(&self, col: usize, row: usize, span: usize) -> D2D_RECT_F {
+    /// Packed slots for the main grid (folders collapse to 1×1).
+    fn item_slots(&self, items: &[TileItem]) -> Vec<(usize, usize, usize)> {
+        let spans: Vec<usize> = items
+            .iter()
+            .map(|it| match it {
+                TileItem::Single(i) if self.pins[*i].wide => 2,
+                _ => 1,
+            })
+            .collect();
+        Self::pack(&spans)
+    }
+
+    /// Packed slots for the open folder's members.
+    fn member_slots(&self, members: &[usize]) -> Vec<(usize, usize, usize)> {
+        let spans: Vec<usize> = members
+            .iter()
+            .map(|&i| if self.pins[i].wide { 2 } else { 1 })
+            .collect();
+        Self::pack(&spans)
+    }
+
+    fn tile_rect(&self, col: usize, row: usize, span: usize, y_off: f32) -> D2D_RECT_F {
         let x = TILES_X0 + col as f32 * (TILE + TILE_GUT);
-        let y = self.list_top() + row as f32 * (TILE + TILE_GUT) - self.scroll_tiles;
+        let y = self.list_top() + y_off + row as f32 * (TILE + TILE_GUT) - self.scroll_tiles;
         rect(x, y, x + span as f32 * TILE + (span - 1) as f32 * TILE_GUT, y + TILE)
     }
 
-    fn pins_h(&self) -> f32 {
-        let rows = self
-            .tile_slots()
-            .iter()
-            .map(|&(_, r, _)| r + 1)
-            .max()
-            .unwrap_or(0);
+    fn grid_h(slots: &[(usize, usize, usize)]) -> f32 {
+        let rows = slots.iter().map(|&(_, r, _)| r + 1).max().unwrap_or(0);
         rows as f32 * (TILE + TILE_GUT)
+    }
+
+    fn tiles_content_h(&self) -> f32 {
+        match &self.open_folder {
+            Some(f) => FOLDER_HEAD + Self::grid_h(&self.member_slots(&self.members(f))),
+            None => Self::grid_h(&self.item_slots(&self.tile_items())),
+        }
     }
 
     fn list_content_h(&self) -> f32 {
@@ -648,7 +781,7 @@ impl StartMenu {
     }
 
     fn max_scroll_tiles(&self) -> f32 {
-        (self.pins_h() - (self.list_bottom() - self.list_top())).max(0.0)
+        (self.tiles_content_h() - (self.list_bottom() - self.list_top())).max(0.0)
     }
 
     /// Wheel scrolls the pane under the cursor.
@@ -718,10 +851,28 @@ impl StartMenu {
             return None;
         }
         if x >= SPLIT_X {
-            for (i, &(c, r, s)) in self.tile_slots().iter().enumerate() {
-                let rc = self.tile_rect(c, r, s);
-                if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
-                    return Some(Act::Pin(i));
+            match &self.open_folder {
+                Some(f) => {
+                    let br = self.back_rect();
+                    if x >= br.left && x < br.right && y >= br.top && y < br.bottom {
+                        return Some(Act::FolderBack);
+                    }
+                    let members = self.members(f);
+                    for (j, &(c, r, s)) in self.member_slots(&members).iter().enumerate() {
+                        let rc = self.tile_rect(c, r, s, FOLDER_HEAD);
+                        if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                            return Some(Act::FolderItem(j));
+                        }
+                    }
+                }
+                None => {
+                    let items = self.tile_items();
+                    for (i, &(c, r, s)) in self.item_slots(&items).iter().enumerate() {
+                        let rc = self.tile_rect(c, r, s, 0.0);
+                        if x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom {
+                            return Some(Act::Tile(i));
+                        }
+                    }
                 }
             }
             return None;
@@ -760,11 +911,36 @@ impl StartMenu {
                     self.launch_entry(p, n, c);
                 }
             }
-            Act::Pin(i) => {
-                if let Some(pin) = self.pins.get(i) {
-                    let (p, n, c) = (pin.parsing.clone(), pin.name.clone(), pin.launch.clone());
-                    self.launch_entry(p, n, c);
+            Act::Tile(i) => match self.tile_items().get(i) {
+                Some(TileItem::Single(pi)) => {
+                    if let Some(pin) = self.pins.get(*pi) {
+                        let (p, n, c) =
+                            (pin.parsing.clone(), pin.name.clone(), pin.launch.clone());
+                        self.launch_entry(p, n, c);
+                    }
                 }
+                Some(TileItem::Folder(name, _)) => {
+                    self.open_folder = Some(name.clone());
+                    self.scroll_tiles = 0.0;
+                    self.hover = None;
+                    self.paint();
+                }
+                None => {}
+            },
+            Act::FolderItem(j) => {
+                if let Some(f) = self.open_folder.clone() {
+                    if let Some(pin) = self.members(&f).get(j).and_then(|&pi| self.pins.get(pi)) {
+                        let (p, n, c) =
+                            (pin.parsing.clone(), pin.name.clone(), pin.launch.clone());
+                        self.launch_entry(p, n, c);
+                    }
+                }
+            }
+            Act::FolderBack => {
+                self.open_folder = None;
+                self.scroll_tiles = 0.0;
+                self.hover = None;
+                self.paint();
             }
             Act::Freq(i) => {
                 if let Some(f) = self.freq.get(i) {
@@ -855,11 +1031,33 @@ impl StartMenu {
                 }
             }
         }
-        let slots = self.tile_slots();
-        for (p, &(c, r, s)) in self.pins.iter().zip(&slots) {
-            let rc = self.tile_rect(c, r, s);
-            if rc.bottom >= top && rc.top <= bottom {
-                want.push(p.parsing.clone());
+        match &self.open_folder {
+            Some(f) => {
+                let members = self.members(f);
+                for (&pi, &(c, r, s)) in members.iter().zip(&self.member_slots(&members)) {
+                    let rc = self.tile_rect(c, r, s, FOLDER_HEAD);
+                    if rc.bottom >= top && rc.top <= bottom {
+                        want.push(self.pins[pi].parsing.clone());
+                    }
+                }
+            }
+            None => {
+                let items = self.tile_items();
+                for (item, &(c, r, s)) in items.iter().zip(&self.item_slots(&items)) {
+                    let rc = self.tile_rect(c, r, s, 0.0);
+                    if rc.bottom < top || rc.top > bottom {
+                        continue;
+                    }
+                    match item {
+                        TileItem::Single(pi) => want.push(self.pins[*pi].parsing.clone()),
+                        // Folder tiles preview their first four members.
+                        TileItem::Folder(_, ms) => {
+                            for &pi in ms.iter().take(4) {
+                                want.push(self.pins[pi].parsing.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
         for p in want {
@@ -927,7 +1125,7 @@ impl StartMenu {
                     theme::with_alpha(theme::TEXT_DIM, 0.5),
                 );
             }
-            let tiles_h = self.pins_h();
+            let tiles_h = self.tiles_content_h();
             if tiles_h > view_h {
                 let th = (view_h * view_h / tiles_h).max(24.0);
                 let ty = top + (view_h - th) * (self.scroll_tiles / self.max_scroll_tiles());
@@ -989,8 +1187,43 @@ impl StartMenu {
         }
     }
 
-    /// Right pane: the pinned Metro tile grid.
+    /// Right pane: the pinned tile grid, or the open folder's contents under
+    /// a fixed back-chip header.
     fn paint_tiles(&self, top: f32, bottom: f32) {
+        if let Some(f) = &self.open_folder {
+            let members = self.members(f);
+            for (j, (&pi, &(c, r, s))) in
+                members.iter().zip(&self.member_slots(&members)).enumerate()
+            {
+                self.paint_tile(
+                    self.tile_rect(c, r, s, FOLDER_HEAD),
+                    &self.pins[pi],
+                    self.hover == Some(Act::FolderItem(j)),
+                );
+            }
+            // Header painted after the grid so tiles scroll under it.
+            unsafe {
+                if let Ok(b) = self.renderer.brush(theme::rgba(26, 27, 32, 0.92)) {
+                    self.renderer
+                        .dc
+                        .FillRectangle(&rect(SPLIT_X, top, self.w, top + FOLDER_HEAD), &b);
+                }
+            }
+            let br = self.back_rect();
+            if self.hover == Some(Act::FolderBack) {
+                self.fill_round(br, 5.0, theme::HOVER_FILL);
+            }
+            let back: Vec<u16> = "‹ 뒤로".encode_utf16().collect();
+            self.text(&back, &self.fmt_center, br, theme::TEXT);
+            let name: Vec<u16> = f.encode_utf16().collect();
+            self.text(
+                &name,
+                &self.fmt_head,
+                rect(br.right + 10.0, top, self.w - 12.0, top + FOLDER_HEAD),
+                theme::TEXT,
+            );
+            return;
+        }
         if self.pins.is_empty() {
             let hint: Vec<u16> = "고정된 앱이 없습니다.\r왼쪽 목록에서 우클릭 → 고정"
                 .encode_utf16()
@@ -1003,10 +1236,21 @@ impl StartMenu {
             );
             return;
         }
-        let slots = self.tile_slots();
-        for (i, (pin, &(c, r, s))) in self.pins.iter().zip(&slots).enumerate() {
-            self.paint_tile(self.tile_rect(c, r, s), pin, self.hover == Some(Act::Pin(i)));
+        let items = self.tile_items();
+        for (i, (item, &(c, r, s))) in items.iter().zip(&self.item_slots(&items)).enumerate() {
+            let rc = self.tile_rect(c, r, s, 0.0);
+            let hovered = self.hover == Some(Act::Tile(i));
+            match item {
+                TileItem::Single(pi) => self.paint_tile(rc, &self.pins[*pi], hovered),
+                TileItem::Folder(name, ms) => self.paint_folder_tile(rc, name, ms, hovered),
+            }
         }
+    }
+
+    /// "‹ 뒤로" chip in the folder-view header.
+    fn back_rect(&self) -> D2D_RECT_F {
+        let y = self.list_top();
+        rect(TILES_X0, y + 6.0, TILES_X0 + 88.0, y + FOLDER_HEAD - 6.0)
     }
 
     /// Metro tile: dominant-color background, centered icon, label inside
@@ -1022,17 +1266,7 @@ impl StartMenu {
             .unwrap_or(theme::rgba(255, 255, 255, 0.07));
         self.fill_round(rc, 3.0, bg);
         if hovered {
-            self.fill_round(rc, 3.0, theme::HOVER_FILL);
-            unsafe {
-                if let Ok(b) = self.renderer.brush(theme::rgba(255, 255, 255, 0.45)) {
-                    self.renderer.dc.DrawRoundedRectangle(
-                        &D2D1_ROUNDED_RECT { rect: rc, radiusX: 3.0, radiusY: 3.0 },
-                        &b,
-                        1.5,
-                        None,
-                    );
-                }
-            }
+            self.hover_deco(rc);
         }
         let icx = (rc.left + rc.right) / 2.0;
         let icy = rc.top + (TILE - TILE_ICON) / 2.0 - 8.0;
@@ -1042,6 +1276,45 @@ impl StartMenu {
         );
         self.text(
             &e.wname,
+            &self.fmt_tile,
+            rect(rc.left + 9.0, rc.top, rc.right - 9.0, rc.bottom - 7.0),
+            theme::TEXT,
+        );
+    }
+
+    /// Hover wash + white hairline shared by tile kinds.
+    fn hover_deco(&self, rc: D2D_RECT_F) {
+        self.fill_round(rc, 3.0, theme::HOVER_FILL);
+        unsafe {
+            if let Ok(b) = self.renderer.brush(theme::rgba(255, 255, 255, 0.45)) {
+                self.renderer.dc.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rc, radiusX: 3.0, radiusY: 3.0 },
+                    &b,
+                    1.5,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Folder tile: neutral slab, up to four member icons in a 2×2 preview,
+    /// group name bottom-left like a normal tile.
+    fn paint_folder_tile(&self, rc: D2D_RECT_F, name: &str, members: &[usize], hovered: bool) {
+        if rc.bottom < self.list_top() || rc.top > self.list_bottom() {
+            return;
+        }
+        self.fill_round(rc, 3.0, theme::rgba(255, 255, 255, 0.07));
+        if hovered {
+            self.hover_deco(rc);
+        }
+        for (k, &pi) in members.iter().take(4).enumerate() {
+            let x = rc.left + 14.0 + (k % 2) as f32 * 40.0;
+            let y = rc.top + 10.0 + (k / 2) as f32 * 34.0;
+            self.draw_icon(&self.pins[pi].parsing, rect(x, y, x + 30.0, y + 30.0));
+        }
+        let label: Vec<u16> = name.encode_utf16().collect();
+        self.text(
+            &label,
             &self.fmt_tile,
             rect(rc.left + 9.0, rc.top, rc.right - 9.0, rc.bottom - 7.0),
             theme::TEXT,
@@ -1217,14 +1490,14 @@ fn start_pins_path() -> PathBuf {
     PathBuf::from(base).join("glide-shell").join("start_pins.txt")
 }
 
-/// One pin per line: `{parsing}\t{display name}\t{wide 0|1}` (third field
-/// optional for files written before tiles).
+/// One pin per line: `{parsing}\t{display name}\t{wide 0|1}\t{folder}`
+/// (trailing fields optional for files written by older builds).
 fn load_start_pins() -> Vec<Entry> {
     std::fs::read_to_string(start_pins_path())
         .map(|s| {
             s.lines()
                 .filter_map(|l| {
-                    let mut it = l.splitn(3, '\t');
+                    let mut it = l.splitn(4, '\t');
                     let parsing = it.next()?;
                     let name = it.next()?;
                     if parsing.is_empty() {
@@ -1232,6 +1505,7 @@ fn load_start_pins() -> Vec<Entry> {
                     }
                     let mut e = Entry::new(name.to_string(), parsing.to_string());
                     e.wide = it.next() == Some("1");
+                    e.folder = it.next().filter(|f| !f.is_empty()).map(String::from);
                     Some(e)
                 })
                 .collect()
@@ -1246,7 +1520,15 @@ fn save_start_pins(pins: &[Entry]) {
     }
     let body: String = pins
         .iter()
-        .map(|e| format!("{}\t{}\t{}\n", e.parsing, e.name, e.wide as u8))
+        .map(|e| {
+            format!(
+                "{}\t{}\t{}\t{}\n",
+                e.parsing,
+                e.name,
+                e.wide as u8,
+                e.folder.as_deref().unwrap_or("")
+            )
+        })
         .collect();
     let _ = std::fs::write(p, body);
 }
@@ -1539,6 +1821,18 @@ fn run_shutdown(args: PCWSTR) {
     }
 }
 
+/// Owned right-click target — survives TrackPopupMenu's reentrant pump.
+enum RTarget {
+    /// App list / search / 자주 사용 rows: pin/unpin only.
+    AppLike { parsing: String, name: String, pinned: bool },
+    /// Loose pin tile: unpin, resize, add to a group.
+    Tile { parsing: String, name: String, wide: bool },
+    /// Folder tile: dissolve.
+    FolderTile { name: String },
+    /// Tile inside the open folder: pull out, unpin, resize.
+    Member { parsing: String, name: String, wide: bool },
+}
+
 extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu;
@@ -1601,50 +1895,112 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_RBUTTONUP => {
                 let (x, y) = (lx(sm), ly(sm));
-                // Pin/unpin mini-menu. TrackPopupMenu pumps this wndproc
-                // reentrantly (same lesson as desktop.rs) — collect what we
-                // need, let the borrow lapse across the modal call, then
-                // re-deref GWLP_USERDATA.
-                // (parsing, name, pinned, wide-state for pin tiles)
-                let target: Option<(String, String, bool, Option<bool>)> = match sm.hit(x, y) {
-                    Some(Act::App(i)) => sm.apps.get(i).map(|a| {
-                        let pinned = sm.pins.iter().any(|p| p.parsing == a.parsing);
-                        (a.parsing.clone(), a.name.clone(), pinned, None)
+                // Context menu. TrackPopupMenu pumps this wndproc reentrantly
+                // (same lesson as desktop.rs) — collect owned data, let the
+                // borrow lapse across the modal call, then re-deref
+                // GWLP_USERDATA.
+                let target: Option<RTarget> = match sm.hit(x, y) {
+                    Some(Act::App(i)) => sm.apps.get(i).map(|a| RTarget::AppLike {
+                        parsing: a.parsing.clone(),
+                        name: a.name.clone(),
+                        pinned: sm.pins.iter().any(|p| p.parsing == a.parsing),
                     }),
                     Some(Act::Result(i)) => {
                         sm.results.get(i).and_then(|&a| sm.apps.get(a)).map(|a| {
-                            let pinned = sm.pins.iter().any(|p| p.parsing == a.parsing);
-                            (a.parsing.clone(), a.name.clone(), pinned, None)
+                            RTarget::AppLike {
+                                parsing: a.parsing.clone(),
+                                name: a.name.clone(),
+                                pinned: sm.pins.iter().any(|p| p.parsing == a.parsing),
+                            }
                         })
                     }
-                    Some(Act::Pin(i)) => sm
-                        .pins
-                        .get(i)
-                        .map(|p| (p.parsing.clone(), p.name.clone(), true, Some(p.wide))),
-                    Some(Act::Freq(i)) => sm
-                        .freq
-                        .get(i)
-                        .map(|f| (f.parsing.clone(), f.name.clone(), false, None)),
+                    Some(Act::Freq(i)) => sm.freq.get(i).map(|f| RTarget::AppLike {
+                        parsing: f.parsing.clone(),
+                        name: f.name.clone(),
+                        pinned: false,
+                    }),
+                    Some(Act::Tile(i)) => match sm.tile_items().get(i) {
+                        Some(TileItem::Single(pi)) => sm.pins.get(*pi).map(|p| RTarget::Tile {
+                            parsing: p.parsing.clone(),
+                            name: p.name.clone(),
+                            wide: p.wide,
+                        }),
+                        Some(TileItem::Folder(n, _)) => {
+                            Some(RTarget::FolderTile { name: n.clone() })
+                        }
+                        None => None,
+                    },
+                    Some(Act::FolderItem(j)) => sm.open_folder.clone().and_then(|f| {
+                        sm.members(&f).get(j).and_then(|&pi| sm.pins.get(pi)).map(|p| {
+                            RTarget::Member {
+                                parsing: p.parsing.clone(),
+                                name: p.name.clone(),
+                                wide: p.wide,
+                            }
+                        })
+                    }),
                     _ => None,
                 };
-                if let Some((parsing, name, pinned, wide)) = target {
+                if let Some(target) = target {
+                    let groups = sm.groups();
                     let menu = match CreatePopupMenu() {
                         Ok(m) => m,
                         Err(_) => return LRESULT(0),
                     };
-                    let label = if pinned {
-                        w!("시작 화면에서 제거")
-                    } else {
-                        w!("시작 화면에 고정")
+                    let wide_label = |wide: bool| {
+                        if wide { w!("정사각 타일로") } else { w!("와이드 타일로") }
                     };
-                    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PIN, label);
-                    if let Some(wide) = wide {
-                        let size_label = if wide {
-                            w!("정사각 타일로")
-                        } else {
-                            w!("와이드 타일로")
-                        };
-                        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_WIDE, size_label);
+                    match &target {
+                        RTarget::AppLike { pinned, .. } => {
+                            let label = if *pinned {
+                                w!("시작 화면에서 제거")
+                            } else {
+                                w!("시작 화면에 고정")
+                            };
+                            let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PIN, label);
+                        }
+                        RTarget::Tile { wide, .. } => {
+                            let _ = AppendMenuW(
+                                menu,
+                                MF_STRING,
+                                MENU_TOGGLE_PIN,
+                                w!("시작 화면에서 제거"),
+                            );
+                            let _ =
+                                AppendMenuW(menu, MF_STRING, MENU_TOGGLE_WIDE, wide_label(*wide));
+                            // AppendMenuW copies MF_STRING text, so the wide
+                            // group names may drop before TrackPopupMenu.
+                            if let Ok(sub) = CreatePopupMenu() {
+                                let _ = AppendMenuW(sub, MF_STRING, MENU_NEW_GROUP, w!("새 그룹"));
+                                for (gi, g) in groups.iter().enumerate() {
+                                    let wg: Vec<u16> =
+                                        g.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let _ = AppendMenuW(
+                                        sub,
+                                        MF_STRING,
+                                        MENU_GROUP_BASE + gi,
+                                        PCWSTR(wg.as_ptr()),
+                                    );
+                                }
+                                let _ =
+                                    AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("그룹에 추가"));
+                            }
+                        }
+                        RTarget::FolderTile { .. } => {
+                            let _ = AppendMenuW(menu, MF_STRING, MENU_DISSOLVE, w!("그룹 해제"));
+                        }
+                        RTarget::Member { wide, .. } => {
+                            let _ =
+                                AppendMenuW(menu, MF_STRING, MENU_UNGROUP, w!("그룹에서 빼기"));
+                            let _ = AppendMenuW(
+                                menu,
+                                MF_STRING,
+                                MENU_TOGGLE_PIN,
+                                w!("시작 화면에서 제거"),
+                            );
+                            let _ =
+                                AppendMenuW(menu, MF_STRING, MENU_TOGGLE_WIDE, wide_label(*wide));
+                        }
                     }
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
@@ -1659,9 +2015,28 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     );
                     let _ = DestroyMenu(menu);
                     let sm = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu);
+                    let (parsing, name) = match &target {
+                        RTarget::AppLike { parsing, name, .. }
+                        | RTarget::Tile { parsing, name, .. }
+                        | RTarget::Member { parsing, name, .. } => {
+                            (parsing.clone(), name.clone())
+                        }
+                        RTarget::FolderTile { name } => (String::new(), name.clone()),
+                    };
                     match cmd.0 as usize {
                         MENU_TOGGLE_PIN => sm.toggle_pin(&parsing, &name),
                         MENU_TOGGLE_WIDE => sm.toggle_wide(&parsing),
+                        MENU_DISSOLVE => sm.dissolve(&name),
+                        MENU_UNGROUP => sm.set_folder(&parsing, None),
+                        MENU_NEW_GROUP => {
+                            let g = sm.next_group_name();
+                            sm.set_folder(&parsing, Some(g));
+                        }
+                        c if c >= MENU_GROUP_BASE => {
+                            if let Some(g) = groups.get(c - MENU_GROUP_BASE) {
+                                sm.set_folder(&parsing, Some(g.clone()));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1697,13 +2072,18 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             WM_KEYDOWN => {
                 if wparam.0 == VK_ESCAPE.0 as usize {
-                    // Esc backs out of the search first, then closes.
-                    if sm.query.is_empty() {
-                        sm.hide();
-                    } else {
+                    // Esc backs out of search, then an open folder, then closes.
+                    if !sm.query.is_empty() {
                         sm.query.clear();
                         sm.update_results();
                         sm.paint();
+                    } else if sm.open_folder.is_some() {
+                        sm.open_folder = None;
+                        sm.scroll_tiles = 0.0;
+                        sm.hover = None;
+                        sm.paint();
+                    } else {
+                        sm.hide();
                     }
                 } else if !sm.query.is_empty() {
                     match VIRTUAL_KEY(wparam.0 as u16) {
