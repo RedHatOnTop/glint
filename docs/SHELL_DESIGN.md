@@ -353,7 +353,28 @@ M7 스왑의 예행연습이 된다.
 - v1 미포함: glint 감시/재스폰 (죽으면 다음 bare-Win이 다시 스폰하므로 사실상
   커버), Win 길게 눌러 다른 동작 등.
 
-### 6.5 autostart 실행기 (M3, 잊으면 큰일 나는 것)
+**진짜 시작 메뉴 구현됨 (0722, startmenu.rs + taskbar.rs start 버튼).**
+
+- 팝업 기계 4번째 사용자 (flyout 입력 계보: activatable, WA_INACTIVE/Esc/재클릭/
+  1s foreground-check 폴백으로 닫힘). 바 좌단 Win11 4-사각 로고 버튼이 토글.
+- **Win10 2-패널 레이아웃 (유저 확정)**: 폭 604 — 좌측 240 앱 목록(맨 위
+  "자주 사용" 6행, 아래 초성/A–Z 섹션 전체 앱), 우측 3열 Metro 타일 그리드
+  (고정 앱 전용). 패널별 독립 스크롤, 휠은 커서 아래 패널로 라우팅
+  (WM_MOUSEWHEEL은 스크린 좌표 → ScreenToClient).
+- 앱 열거 = `shell:AppsFolder` 한 번 (win32 .lnk + UWP 동일 취급), 실행 =
+  `ShellExecuteW("shell:AppsFolder\{parsing}")`. 열거·아이콘 추출 전부 **MTA COM
+  워커 스레드** (IShellItemImageFactory 호출당 5–50ms — UI 스레드에서 하면 호버
+  리페인트가 얼어붙는다, v1에서 실증). UI는 완성된 픽셀 버퍼 → D2D 비트맵만.
+- 아이콘: 셸이 요청 크기와 다른 HBITMAP을 줄 수 있음 → GetObjectW로 실측 후
+  실크기 DIB 추출, aspect-fit 그리기 (v1 아이콘 깨짐 원인).
+- 타일: 아이콘 지배색 틴트 배경, 라벨 좌하단, 우클릭 = 고정 해제 / 1×1↔2×1
+  토글, first-fit 패킹(와이드 2칸, 정사각이 구멍 메움). 핀은
+  `%APPDATA%\glide-shell\start_pins.txt`.
+- 타이핑 즉시 검색 (WM_CHAR): 초성 매칭(ㅋㄹ→크롬), ↑↓/Enter, Esc는 검색부터
+  해제. 실행 횟수는 start_counts.txt에 영속 → 자주 사용 목록.
+- 푸터: 사용자 칩(프로필 폴더) + 문서/다운로드 + 잠금/절전/재시작/종료.
+- 검증: 컴파일 0 경고 + 유저 실물 확인 ("오 괜찮네"). 아이콘 수정도 유저 확인
+  ("오 아이콘 고쳤네").
 
 explorer가 셸 기동 시 하던 일. 우리가 안 하면 **아무도 안 한다**:
 
