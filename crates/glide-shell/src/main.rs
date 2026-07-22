@@ -8,6 +8,7 @@ mod autostart;
 mod desktop;
 mod flyout;
 mod icons;
+mod osd;
 mod preview;
 mod render;
 mod shellmenu;

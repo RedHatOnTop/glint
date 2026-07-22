@@ -262,10 +262,12 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         }
         crate::winkey::install(hwnd);
 
-        // Toast cards live on this thread but own their window and worker;
-        // the bar never needs to know about them.
+        // Toast cards and the volume OSD live on this thread but own their
+        // windows; the bar never needs to know about them.
         let mut toasts = crate::toasts::Toasts::new(dpi)?;
         toasts.arm();
+        let mut osd = crate::osd::Osd::new(dpi)?;
+        osd.arm();
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         bar.paint();
@@ -275,6 +277,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        osd.disarm();
         toasts.disarm();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let mut abd = APPBARDATA {

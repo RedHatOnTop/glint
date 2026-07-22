@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 windows.workspace = true
+windows-core.workspace = true
 windows-numerics.workspace = true
 anyhow.workspace = true
 chrono = "0.4"
