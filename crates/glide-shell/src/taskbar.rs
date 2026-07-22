@@ -66,6 +66,9 @@ const MENU_CLOSE: usize = 3;
 const MENU_TASKMGR: usize = 4;
 const MENU_RESTART: usize = 5;
 const MENU_QUIT: usize = 6;
+const MENU_NEWWIN: usize = 7;
+/// Win10 show-desktop sliver at the far right edge.
+const DESK_W: f32 = 8.0;
 /// Start button: glyph square at the far left, entries begin after it.
 const START_X: f32 = 8.0;
 const START_BTN_W: f32 = 40.0;
@@ -152,6 +155,9 @@ pub struct Bar {
     secondaries: Vec<Box<crate::secondary::Secondary>>,
     start: crate::startmenu::StartMenu,
     start_hover: bool,
+    desk_hover: bool,
+    /// Windows minimized by the show-desktop sliver, restored on re-click.
+    desk_stash: Vec<isize>,
 }
 
 /// Cells in the status cluster, left→right; presence varies (no battery on
@@ -251,6 +257,8 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             secondaries: Vec::new(),
             start: crate::startmenu::StartMenu::new(dpi)?,
             start_hover: false,
+            desk_hover: false,
+            desk_stash: Vec::new(),
         };
         bar.refresh();
         bar.rebuild_secondaries();
@@ -380,6 +388,15 @@ fn window_exe(hwnd: HWND) -> Option<String> {
     }
 }
 
+/// ShellExecute "open" on an exe path — pin launches, middle-click new
+/// instance, context-menu app row all funnel here.
+fn launch_exe(exe: &str) {
+    let wide: Vec<u16> = exe.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL);
+    }
+}
+
 fn primary_monitor_rect() -> RECT {
     unsafe {
         let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -482,13 +499,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let th = bar.tray_hit(x);
                     let sh = bar.status_hit(x);
                     let sth = th.is_none() && sh.is_none() && bar.start_hit(x);
+                    let dh = bar.desk_hit(x);
                     let eh = if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None };
                     let changed =
                         th != bar.tray_hover || sh != bar.status_hover || eh != bar.hover;
-                    if th != bar.tray_hover || sh != bar.status_hover || sth != bar.start_hover {
+                    if th != bar.tray_hover
+                        || sh != bar.status_hover
+                        || sth != bar.start_hover
+                        || dh != bar.desk_hover
+                    {
                         bar.tray_hover = th;
                         bar.status_hover = sh;
                         bar.start_hover = sth;
+                        bar.desk_hover = dh;
                         bar.paint();
                     }
                     bar.set_hover(eh);
@@ -516,6 +539,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if bar.tray_hover.take().is_some()
                     | bar.status_hover.take().is_some()
                     | std::mem::take(&mut bar.start_hover)
+                    | std::mem::take(&mut bar.desk_hover)
                 {
                     bar.paint();
                 }
@@ -598,6 +622,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             bar.flyout_toggle(hwnd, crate::flyout::Kind::Battery)
                         }
                         None => {}
+                    }
+                } else if bar.desk_hit(x) {
+                    bar.toggle_desktop();
+                } else if bar.clock_hit(x) {
+                    bar.flyout_toggle(hwnd, crate::flyout::Kind::Calendar);
+                }
+                LRESULT(0)
+            }
+            WM_MBUTTONUP => {
+                // Win10: middle-click a button = launch another instance.
+                bar.preview.hide();
+                let x = (lparam.0 & 0xFFFF) as i16 as f32 / bar.scale();
+                if let Some(i) = bar.hit_test(x) {
+                    if let Some(exe) = bar.entries[i].exe.clone() {
+                        launch_exe(&exe);
                     }
                 }
                 LRESULT(0)
@@ -808,7 +847,38 @@ impl Bar {
 
     /// Logical x of the status cluster's left edge (right of it: clock).
     fn status_left(&self) -> f32 {
-        self.width - CLOCK_W - (self.status_cells().len() as f32 * STATUS_CELL_W) - 2.0
+        self.width - DESK_W - CLOCK_W - (self.status_cells().len() as f32 * STATUS_CELL_W) - 2.0
+    }
+
+    fn desk_hit(&self, x: f32) -> bool {
+        x >= self.width - DESK_W
+    }
+
+    fn clock_hit(&self, x: f32) -> bool {
+        x >= self.width - DESK_W - CLOCK_W && x < self.width - DESK_W
+    }
+
+    /// Show-desktop toggle: first click minimizes everything visible, second
+    /// restores that same set (explorer's ToggleDesktop, self-hosted).
+    fn toggle_desktop(&mut self) {
+        unsafe {
+            if self.desk_stash.is_empty() {
+                for h in enumerate_taskbar_windows(self.hwnd) {
+                    if !IsIconic(h).as_bool() {
+                        let _ = ShowWindow(h, SW_SHOWMINNOACTIVE);
+                        self.desk_stash.push(h.0 as isize);
+                    }
+                }
+            } else {
+                for &raw in self.desk_stash.iter().rev() {
+                    let h = HWND(raw as *mut _);
+                    if IsWindow(Some(h)).as_bool() && IsIconic(h).as_bool() {
+                        let _ = ShowWindow(h, SW_RESTORE);
+                    }
+                }
+                self.desk_stash.clear();
+            }
+        }
     }
 
     /// x → index into status_cells().
@@ -1293,16 +1363,7 @@ impl Bar {
                 None => {
                     // Launcher slot: start the pinned exe.
                     if let Some(exe) = &e.exe {
-                        let wide: Vec<u16> =
-                            exe.encode_utf16().chain(std::iter::once(0)).collect();
-                        ShellExecuteW(
-                            None,
-                            w!("open"),
-                            PCWSTR(wide.as_ptr()),
-                            None,
-                            None,
-                            SW_SHOWNORMAL,
-                        );
+                        launch_exe(exe);
                     }
                 }
             }
@@ -1320,6 +1381,15 @@ impl Bar {
                 let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(wide.as_ptr()));
             };
+            if let Some(x) = &exe {
+                // Win10 jumplist's app row: click = another instance.
+                let name = std::path::Path::new(x)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("새 창");
+                add(MENU_NEWWIN, name);
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
             if exe.is_some() {
                 if pinned {
                     add(MENU_UNPIN, "고정 해제");
@@ -1365,6 +1435,11 @@ impl Bar {
                 MENU_CLOSE => {
                     if let Some(h) = hwnd_opt {
                         let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                MENU_NEWWIN => {
+                    if let Some(x) = exe {
+                        launch_exe(&x);
                     }
                 }
                 _ => {}
@@ -1885,12 +1960,13 @@ impl Bar {
             )
             .encode_utf16()
             .collect();
-            let clock_left = self.width - CLOCK_W;
+            let clock_left = self.width - DESK_W - CLOCK_W;
+            let clock_right = self.width - DESK_W - 8.0;
             if let Ok(b) = r.brush(theme::TEXT) {
                 r.dc.DrawText(
                     &hhmm,
                     &r.fmt_clock,
-                    &D2D_RECT_F { left: clock_left, top: 4.0, right: self.width - 8.0, bottom: 22.0 },
+                    &D2D_RECT_F { left: clock_left, top: 4.0, right: clock_right, bottom: 22.0 },
                     &b,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
@@ -1900,18 +1976,35 @@ impl Bar {
                 r.dc.DrawText(
                     &date,
                     &r.fmt_date,
-                    &D2D_RECT_F { left: clock_left, top: 22.0, right: self.width - 8.0, bottom: 37.0 },
+                    &D2D_RECT_F { left: clock_left, top: 22.0, right: clock_right, bottom: 37.0 },
                     &b,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
 
+            // Show-desktop sliver: hairline divider, fills on hover (Win10).
+            let sx = self.width - DESK_W;
+            if self.desk_hover {
+                if let Ok(b) = r.brush(theme::rgba(255, 255, 255, theme::HOVER_FILL.a)) {
+                    r.dc.FillRectangle(
+                        &D2D_RECT_F { left: sx, top: 0.0, right: self.width, bottom: theme::BAR_HEIGHT },
+                        &b,
+                    );
+                }
+            }
+            if let Ok(b) = r.brush(theme::rgba(255, 255, 255, 0.10)) {
+                r.dc.FillRectangle(
+                    &D2D_RECT_F { left: sx, top: 8.0, right: sx + 1.0, bottom: theme::BAR_HEIGHT - 8.0 },
+                    &b,
+                );
+            }
+
             // Dragged button floats on top, following the cursor.
             if let Some((di, float_left)) = dragging {
                 let w = self.entries[di].width;
-                let left =
-                    float_left.clamp(ENTRY_X0, (self.width - CLOCK_W - w - 4.0).max(ENTRY_X0));
+                let left = float_left
+                    .clamp(ENTRY_X0, (self.width - DESK_W - CLOCK_W - w - 4.0).max(ENTRY_X0));
                 self.draw_entry(di, left, true);
             }
 

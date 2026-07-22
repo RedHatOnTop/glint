@@ -50,6 +50,7 @@ pub enum Kind {
     Volume,
     Network,
     Battery,
+    Calendar,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,6 +61,9 @@ enum Act {
     Row(usize),
     NetSettings,
     PowerSettings,
+    CalPrev,
+    CalNext,
+    CalToday,
 }
 
 pub struct Flyout {
@@ -94,6 +98,9 @@ pub struct Flyout {
     // battery
     battery: Option<(u8, bool)>,
     charging: bool,
+    // calendar (viewed month, not necessarily today's)
+    cal_year: i32,
+    cal_month: u32,
 }
 
 impl Flyout {
@@ -210,6 +217,8 @@ impl Flyout {
                 connecting: None,
                 battery: None,
                 charging: false,
+                cal_year: 2000,
+                cal_month: 1,
             })
         }
     }
@@ -249,6 +258,11 @@ impl Flyout {
                 }
             }
             Kind::Battery => self.poll_battery(),
+            Kind::Calendar => {
+                let now = chrono::Local::now();
+                self.cal_year = chrono::Datelike::year(&now);
+                self.cal_month = chrono::Datelike::month(&now);
+            }
         }
         self.anchor_right = bar_rect.right - (12.0 * self.scale) as i32;
         self.anchor_bottom = bar_rect.top - (10.0 * self.scale) as i32;
@@ -283,6 +297,7 @@ impl Flyout {
                 (W, 56.0 + rows as f32 * ROW_H + 17.0 + 40.0 + 8.0)
             }
             Some(Kind::Battery) => (W, 151.0),
+            Some(Kind::Calendar) => (W, 366.0),
             None => (64.0, 64.0),
         }
     }
@@ -395,6 +410,8 @@ impl Flyout {
                     self.paint();
                 }
             }
+            // Seconds tick on the big clock.
+            Some(Kind::Calendar) => self.paint(),
             None => {}
         }
     }
@@ -482,21 +499,57 @@ impl Flyout {
                 open_settings("ms-settings:powersleep");
                 self.hide();
             }
+            Act::CalPrev => {
+                self.cal_shift(-1);
+                self.paint();
+            }
+            Act::CalNext => {
+                self.cal_shift(1);
+                self.paint();
+            }
+            Act::CalToday => {
+                let now = chrono::Local::now();
+                self.cal_year = chrono::Datelike::year(&now);
+                self.cal_month = chrono::Datelike::month(&now);
+                self.paint();
+            }
         }
     }
 
+    fn cal_shift(&mut self, delta: i32) {
+        let mut y = self.cal_year;
+        let mut m = self.cal_month as i32 + delta;
+        while m < 1 {
+            m += 12;
+            y -= 1;
+        }
+        while m > 12 {
+            m -= 12;
+            y += 1;
+        }
+        self.cal_year = y;
+        self.cal_month = m as u32;
+    }
+
     fn wheel(&mut self, notches: f32) {
-        if self.kind != Some(Kind::Volume) {
-            return;
-        }
-        unsafe {
-            if let (Some(ep), Some((v, _))) = (&self.endpoint, self.vol) {
-                let nv = (v + notches * 0.02).clamp(0.0, 1.0);
-                let _ = ep.SetMasterVolumeLevelScalar(nv, std::ptr::null());
+        match self.kind {
+            Some(Kind::Volume) => {
+                unsafe {
+                    if let (Some(ep), Some((v, _))) = (&self.endpoint, self.vol) {
+                        let nv = (v + notches * 0.02).clamp(0.0, 1.0);
+                        let _ = ep.SetMasterVolumeLevelScalar(nv, std::ptr::null());
+                    }
+                }
+                self.poll_volume();
+                self.paint();
             }
+            // Win10 scrolls the month grid.
+            Some(Kind::Calendar) if notches != 0.0 => {
+                self.cal_shift(if notches > 0.0 { -1 } else { 1 });
+                self.paint();
+            }
+            _ => {}
         }
-        self.poll_volume();
-        self.paint();
     }
 
     // ---- painting ---------------------------------------------------------
@@ -521,6 +574,7 @@ impl Flyout {
             Some(Kind::Volume) => self.paint_volume(),
             Some(Kind::Network) => self.paint_network(),
             Some(Kind::Battery) => self.paint_battery(),
+            Some(Kind::Calendar) => self.paint_calendar(),
             None => {}
         }
         unsafe {
@@ -682,6 +736,69 @@ impl Flyout {
             if hot { theme::TEXT } else { theme::TEXT_DIM },
         );
         self.hits.push((footer, Act::PowerSettings));
+    }
+
+    /// Win10 clock flyout: live seconds clock + full date on top, month grid
+    /// below, chevrons/wheel page months, title click jumps back to today.
+    fn paint_calendar(&mut self) {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
+        let time = now.format("%H:%M:%S").to_string();
+        self.text(&time, &self.fmt_big.clone(), rect(16.0, 8.0, 240.0, 52.0), theme::TEXT);
+        let wd = ["월", "화", "수", "목", "금", "토", "일"]
+            [now.weekday().num_days_from_monday() as usize];
+        let date = format!("{}년 {}월 {}일 {}요일", now.year(), now.month(), now.day(), wd);
+        self.text(&date, &self.renderer.fmt_title.clone(), rect(16.0, 52.0, 328.0, 76.0), theme::ACCENT);
+
+        self.fill_round(rect(14.0, 84.0, 330.0, 85.0), 0.0, theme::rgba(255, 255, 255, 0.08));
+
+        let title = format!("{}년 {}월", self.cal_year, self.cal_month);
+        self.text(&title, &self.fmt_head.clone(), rect(16.0, 92.0, 220.0, 124.0), theme::TEXT);
+        self.hits.push((rect(8.0, 92.0, 220.0, 124.0), Act::CalToday));
+        for (cp, act, x) in [(0xE70Eu16, Act::CalPrev, 252.0f32), (0xE70D, Act::CalNext, 294.0)] {
+            let rr = rect(x, 92.0, x + 36.0, 124.0);
+            if self.hover == Some(act) {
+                self.fill_round(rr, 6.0, theme::HOVER_FILL);
+            }
+            self.glyph(cp, &self.fmt_g16.clone(), rr, theme::TEXT_DIM);
+            self.hits.push((rr, act));
+        }
+
+        let x0 = 16.0;
+        let cw = 312.0 / 7.0;
+        for (i, d) in ["일", "월", "화", "수", "목", "금", "토"].iter().enumerate() {
+            let x = x0 + i as f32 * cw;
+            self.text(d, &self.fmt_pct.clone(), rect(x, 128.0, x + cw, 150.0), theme::TEXT_DIM);
+        }
+
+        let today = now.date_naive();
+        let first = chrono::NaiveDate::from_ymd_opt(self.cal_year, self.cal_month, 1)
+            .unwrap_or(today);
+        let lead = first.weekday().num_days_from_sunday() as i64;
+        let start = first - chrono::Duration::days(lead);
+        for i in 0..42i64 {
+            let d = start + chrono::Duration::days(i);
+            let (row, col) = (i / 7, i % 7);
+            let y = 154.0 + row as f32 * 34.0;
+            let cell = rect(x0 + col as f32 * cw, y, x0 + (col + 1) as f32 * cw, y + 34.0);
+            let in_month = d.month() == self.cal_month && d.year() == self.cal_year;
+            if d == today {
+                let px = (cw - 30.0) / 2.0;
+                self.fill_round(
+                    rect(cell.left + px, cell.top + 2.0, cell.right - px, cell.bottom - 2.0),
+                    4.0,
+                    theme::ACCENT,
+                );
+            }
+            let c = if d == today {
+                theme::rgba(23, 24, 28, 1.0)
+            } else if in_month {
+                theme::TEXT
+            } else {
+                theme::with_alpha(theme::TEXT_DIM, 0.45)
+            };
+            self.text(&d.day().to_string(), &self.fmt_pct.clone(), cell, c);
+        }
     }
 
     // ---- draw helpers -----------------------------------------------------
