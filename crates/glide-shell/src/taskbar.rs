@@ -268,6 +268,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         toasts.arm();
         let mut osd = crate::osd::Osd::new(dpi)?;
         osd.arm();
+        osd.set_quiet_peer(bar.flyout.hwnd());
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         bar.paint();

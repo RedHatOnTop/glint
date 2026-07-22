@@ -214,6 +214,11 @@ impl Flyout {
         }
     }
 
+    /// For siblings that want to stay quiet while a panel is up (the OSD).
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn open(&mut self, kind: Kind, bar_rect: RECT) {
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut Flyout as isize);

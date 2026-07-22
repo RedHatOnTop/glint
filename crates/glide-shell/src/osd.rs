@@ -105,6 +105,9 @@ pub struct Osd {
     shown: bool,
     last_anim: Instant,
     anim_timer: bool,
+    /// While this window (the volume flyout) is visible, volume bumps stay
+    /// silent — the slider is already on screen showing the same number.
+    quiet_peer: isize,
     /// Keep the COM pair alive for the process lifetime.
     _endpoint: Option<IAudioEndpointVolume>,
     _callback: Option<IAudioEndpointVolumeCallback>,
@@ -174,6 +177,7 @@ impl Osd {
                 shown: false,
                 last_anim: Instant::now(),
                 anim_timer: false,
+                quiet_peer: 0,
                 _endpoint: None,
                 _callback: None,
             })
@@ -223,8 +227,17 @@ impl Osd {
         }
     }
 
+    pub fn set_quiet_peer(&mut self, hwnd: HWND) {
+        self.quiet_peer = hwnd.0 as isize;
+    }
+
     /// A volume change arrived: update, (re)show, restart the hide clock.
     fn bump(&mut self, vol: f32, muted: bool) {
+        if self.quiet_peer != 0
+            && unsafe { IsWindowVisible(HWND(self.quiet_peer as *mut _)) }.as_bool()
+        {
+            return;
+        }
         self.mode = Mode::Vol;
         self.vol = vol.clamp(0.0, 1.0);
         self.muted = muted;
