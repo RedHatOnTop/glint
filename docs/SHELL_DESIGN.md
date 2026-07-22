@@ -712,6 +712,23 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   클래스를 등록하면 FindWindowW가 바의 *숨은* 창을 잡음 — WM_CLOSE가
   USERDATA-null 창에서 DefWindowProc→DestroyWindow로 추락해 바 재시작 유발.
   FindWindowExW + IsWindowVisible 순회로 해결.
+- **click-away 해제 + Win+Shift+S 통과 SHIPPED 0722 (c815616)** *(유저 "버튼 한번 더
+  누르면 사라지게 + 다른데 눌러도 사라지게" + "캡처(Win+Shift+S) 안 켜짐")*:
+  ① `clickaway.rs` — WH_MOUSE_LL 훅(바 스레드). 팝업 열림 동안(START_OPEN/
+  FLYOUT_OPEN 아토믹, show/hide가 셋) 실물 버튼-다운마다 WM_CLICKAWAY(WM_APP+15,
+  스크린 좌표)를 바에 post. `Bar::click_away` = 팝업 자신/바 위 클릭은 무시(바
+  핸들러가 토글), 그 외 전부 해제. **WA_INACTIVE만으로는 부족한 이유: Win키로 연
+  메뉴는 입력 못 받은 프로세스라 SetForegroundWindow가 포그라운드 락에 거부 →
+  활성화 자체가 없어 비활성 통지도 영원히 없음** ② 바 자체 비-토글 타겟(창 버튼/
+  트레이/슬리버/빈 영역/우클릭/가운데클릭)도 close_popups — 스톡 태스크바 동일
+  ③ winkey.rs — 수식키(Shift/Ctrl/Alt) 동반 S는 통과 → Win+Shift+S 캡처 도구 복구.
+  검증(clickrig2.ps1 12/12): Win키 토글 개폐, 바깥 CLICKAWAY로 메뉴·달력 해제,
+  메뉴 안/바 안 좌표는 유지, 시계 클릭 달력 토글, 메뉴↔달력 스왑. 미검증(실입력
+  필요): LL 훅 다리 자체(리그는 WM_CLICKAWAY 직접 post — 훅은 posted 메시지 못 봄),
+  실물 Win+Shift+S. **리그 대함정 기록: DPI 비인지 리그 프로세스의 posted 마우스
+  lparam을 Windows가 1.25× 재스케일(120dpi) — x1870이 2338로 도착, 테스트 클릭이
+  바탕화면 슬리버에 꽂혀 toggle_desktop 연발(유저 창 전체 최소화 수 회). 모든
+  리그 첫 줄 = SetProcessDpiAwarenessContext(-4) 필수.**
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
