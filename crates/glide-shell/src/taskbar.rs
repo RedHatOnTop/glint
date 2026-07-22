@@ -42,13 +42,13 @@ use windows::core::{BOOL, PCWSTR, PWSTR, w};
 use crate::render::Renderer;
 use crate::{icons, theme};
 
-const WM_APPBAR: u32 = WM_APP + 1;
+pub(crate) const WM_APPBAR: u32 = WM_APP + 1;
 // In windows-rs metadata this lives in Win32_UI_Controls; not worth the
 // feature for one message id.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Shell_NotifyIcon v4 event codes (WM_USER-relative on the wire).
 const NIN_SELECT: u32 = 0x0400;
-const ABN_POSCHANGED_ID: usize = 1;
+pub(crate) const ABN_POSCHANGED_ID: usize = 1;
 const TIMER_CLOCK: usize = 1;
 const TIMER_ANIM: usize = 2;
 const TIMER_RESYNC: usize = 3;
@@ -147,6 +147,9 @@ pub struct Bar {
     status_hover: Option<usize>,
     preview: crate::preview::Preview,
     flyout: crate::flyout::Flyout,
+    /// One lightweight bar per non-primary monitor (M5); rebuilt wholesale
+    /// on WM_DISPLAYCHANGE.
+    secondaries: Vec<Box<crate::secondary::Secondary>>,
     start: crate::startmenu::StartMenu,
     start_hover: bool,
 }
@@ -245,10 +248,12 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             status_hover: None,
             preview: crate::preview::Preview::new(dpi)?,
             flyout: crate::flyout::Flyout::new(dpi)?,
+            secondaries: Vec::new(),
             start: crate::startmenu::StartMenu::new(dpi)?,
             start_hover: false,
         };
         bar.refresh();
+        bar.rebuild_secondaries();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
         if claim_tray {
             crate::tray::claim(&mut bar as *mut Bar)?;
@@ -323,7 +328,7 @@ fn save_pins(pins: &[String]) {
 /// Borrow the current foreground thread's input state via AttachThreadInput;
 /// as a last resort tap Alt, which resets the lock (the keybd_event
 /// workaround every shell replacement ends up shipping).
-fn force_foreground(hwnd: HWND) {
+pub(crate) fn force_foreground(hwnd: HWND) {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
@@ -390,30 +395,49 @@ fn primary_monitor_rect() -> RECT {
     }
 }
 
-/// ABM_NEW + QUERYPOS/SETPOS. The system pushes our rect above any existing
-/// bottom appbar (explorer's taskbar included), so coexistence is automatic.
-fn appbar_negotiate(hwnd: HWND, height_px: i32) -> RECT {
+/// ABM_NEW + QUERYPOS/SETPOS against `mon`. The system pushes our rect above
+/// any existing bottom appbar (explorer's taskbar included), so coexistence
+/// is automatic. Shared with the secondary-monitor bars.
+pub(crate) fn appbar_negotiate_on(hwnd: HWND, height_px: i32, mon: RECT) -> RECT {
     unsafe {
-        let mon = primary_monitor_rect();
-        let mut abd = APPBARDATA {
-            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-            hWnd: hwnd,
-            uCallbackMessage: WM_APPBAR,
-            uEdge: ABE_BOTTOM,
-            rc: RECT {
-                left: mon.left,
-                right: mon.right,
-                top: mon.bottom - height_px,
-                bottom: mon.bottom,
-            },
-            ..Default::default()
-        };
+        let mut abd = appbar_data(hwnd, height_px, mon);
         SHAppBarMessage(ABM_NEW, &mut abd);
         SHAppBarMessage(ABM_QUERYPOS, &mut abd);
         abd.rc.top = abd.rc.bottom - height_px;
         SHAppBarMessage(ABM_SETPOS, &mut abd);
         abd.rc
     }
+}
+
+/// QUERYPOS/SETPOS only — re-negotiate a slot that already did ABM_NEW.
+pub(crate) fn appbar_requery(hwnd: HWND, height_px: i32, mon: RECT) -> RECT {
+    unsafe {
+        let mut abd = appbar_data(hwnd, height_px, mon);
+        SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+        abd.rc.top = abd.rc.bottom - height_px;
+        SHAppBarMessage(ABM_SETPOS, &mut abd);
+        abd.rc
+    }
+}
+
+fn appbar_data(hwnd: HWND, height_px: i32, mon: RECT) -> APPBARDATA {
+    APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        hWnd: hwnd,
+        uCallbackMessage: WM_APPBAR,
+        uEdge: ABE_BOTTOM,
+        rc: RECT {
+            left: mon.left,
+            right: mon.right,
+            top: mon.bottom - height_px,
+            bottom: mon.bottom,
+        },
+        ..Default::default()
+    }
+}
+
+fn appbar_negotiate(hwnd: HWND, height_px: i32) -> RECT {
+    appbar_negotiate_on(hwnd, height_px, primary_monitor_rect())
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -632,6 +656,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE => {
                 bar.reposition();
+                bar.rebuild_secondaries();
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -655,6 +680,7 @@ impl Bar {
             4 => {
                 // HSHELL_WINDOWACTIVATED / RUDEAPPACTIVATED
                 self.active = unsafe { GetForegroundWindow() };
+                self.sync_secondaries();
                 for e in &mut self.entries {
                     if e.hwnd == Some(self.active) {
                         e.flash = false;
@@ -672,6 +698,7 @@ impl Bar {
                         }
                     }
                     self.paint();
+                    self.sync_secondaries();
                 } else {
                     self.refresh(); // HSHELL_REDRAW: titles changed
                 }
@@ -925,6 +952,48 @@ impl Bar {
         self.active = unsafe { GetForegroundWindow() };
         self.ensure_anim_timer();
         self.paint();
+        self.sync_secondaries();
+    }
+
+    /// Push the current window-button set to every secondary bar.
+    fn sync_secondaries(&mut self) {
+        if self.secondaries.is_empty() {
+            return;
+        }
+        let mirror = |bar: &Bar| -> Vec<crate::secondary::Mirror> {
+            bar.entries
+                .iter()
+                .filter_map(|e| {
+                    let h = e.hwnd?;
+                    Some(crate::secondary::Mirror {
+                        hwnd: h.0 as isize,
+                        active: h == bar.active,
+                        flash: e.flash,
+                    })
+                })
+                .collect()
+        };
+        for i in 0..self.secondaries.len() {
+            let m = mirror(self);
+            self.secondaries[i].sync(m);
+        }
+    }
+
+    /// Tear down and re-create the per-monitor bars from the current display
+    /// set. WM_DISPLAYCHANGE lands here — the Duo's bottom panel docking on
+    /// or off is just this list changing.
+    fn rebuild_secondaries(&mut self) {
+        self.secondaries.clear();
+        for (mon, primary) in crate::secondary::monitors() {
+            if primary {
+                continue;
+            }
+            match crate::secondary::Secondary::new(mon) {
+                Ok(sec) => self.secondaries.push(sec),
+                Err(e) => eprintln!("glide-shell: secondary bar failed: {e}"),
+            }
+        }
+        self.sync_secondaries();
     }
 
     fn make_window_entry(&mut self, h: HWND, exe: Option<String>, pinned: bool) -> Entry {

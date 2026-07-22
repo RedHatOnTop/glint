@@ -11,6 +11,7 @@ mod icons;
 mod osd;
 mod preview;
 mod render;
+mod secondary;
 mod shellmenu;
 mod spike_toasts;
 mod startmenu;
