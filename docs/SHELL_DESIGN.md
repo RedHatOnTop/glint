@@ -555,7 +555,25 @@ SSID 5개·연결됨 표시·신호별 글리프·토글 on), 배터리(51%·"�
   device rect 785,970–1135,1030 (정확히 280×48@1.25 하단 중앙), 스크린샷으로
   글리프/트랙/fill/숫자 렌더 확인, 2.5s 후 자동 숨김(vis=False), 미러 다운스윕으로
   볼륨 원복. **하드웨어 볼륨 키는 동일 OnNotify 경로지만 미타건 — 도그푸드 검증.**
-  잔여 M4: 밝기 OSD(WMI WmiMonitorBrightnessEvent) + 볼륨 글리프 클릭 슬라이더.
+
+**밝기 OSD 구현됨 (0722, `df5d27d`) + 플라이아웃 억제 (`061efae`) — M4 코드 완료.**
+
+- 같은 필의 두 번째 모드: 워커 스레드가 WMI 알림 쿼리(root\wmi,
+  `WmiMonitorBrightnessEvent`)에 블로킹 → WM_APP_BRIGHT(WM_APP+13)로 퍼센트
+  post. 해 글리프 + 트랙 + %. 핫키/ms-설정/WMI 쓰기 전부 같은 이벤트 소스.
+  블로킹 Next()는 취소 불가 — 스레드는 프로세스와 함께 죽는다(그때가 맞다).
+  RPC_C_AUTHN_WINNT는 로컬 const(Win32_System_Rpc feature 1개 u32에 안 태움).
+- **볼륨 슬라이더는 이미 있음** — flyout.rs `Kind::Volume`(§6.6 플라이아웃
+  라운드에서 출하: 트랙 드래그/뮤트 버튼/휠, 뮤트는 스피커 버튼으로 이동).
+  이번에 추가한 것은 억제 배선: OSD가 플라이아웃 hwnd를 quiet peer로 받아
+  **플라이아웃 visible 동안 볼륨 bump 무시**(슬라이더가 이미 같은 숫자를
+  보여주는 중) — 밝기 bump는 통과.
+- 검증: WmiSetBrightness 57→52 → OSD 필(해 글리프+52% fill+"52") 스크린샷,
+  만료 숨김, 57 원복 확인. 슬라이더 리그: Vol 셀 클릭 post → 플라이아웃,
+  트랙 30% 클릭 → 마스터 볼륨 48→30 정확(COM 리드백), **OSD 억제 확인**,
+  Esc 닫힘, 외부 SetMasterVolumeLevelScalar 48 원복 → OSD 정상 발동 후 숨김.
+  물리 밝기/볼륨 키는 도그푸드(동일 이벤트 경로). **M4 잔여 코드 없음** —
+  게이트(카톡/디코 실토스트 + 볼륨 키 OSD)는 도그푸드 판정.
 
 ## 7. 안전망 — 복구 사다리 (M6, 스왑 전 필수)
 
