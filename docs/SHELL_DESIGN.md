@@ -485,6 +485,25 @@ SSID 5개·연결됨 표시·신호별 글리프·토글 on), 배터리(51%·"�
 - 볼륨/밝기 OSD: 하드웨어 키 입력 시 자체 오버레이. 볼륨 = IAudioEndpointVolume
   변경 콜백, 밝기 = WMI `WmiMonitorBrightnessEvent`. tray 볼륨 글리프 클릭 = 슬라이더.
 
+**토스트 카드 구현됨 (0722, toasts.rs).**
+
+- 워커 스레드가 1s 폴링 + `UserNotification.Id` diff (스파이크 판정대로 이벤트
+  불가). 첫 폴 = 무음 베이스라인 — 셸 기동 시 백로그가 카드로 재생 안 됨.
+  커맨드 채널이 틱 시계 겸용 (recv_timeout = 폴 주기), RemoveNotification 왕복.
+- 카드: 작업 영역 우하단 스택(최신이 바 쪽), 최대 3+페이드아웃 1. teal 스트라이프
+  + dim 앱명 + semibold 제목 + 줄바꿈 본문 + X. 180ms cubic 페이드+슬라이드,
+  수명 8s, 호버 = 카운트다운 정지. **창은 절대 활성화 안 됨**
+  (WS_EX_NOACTIVATE + MA_NOACTIVATE) — 포커스 뺏는 토스트는 없느니만 못하다.
+  카드 사이 갭은 WM_NCHITTEST HTTRANSPARENT.
+- 본문 클릭 = `shell:AppsFolder\{AUMID}` 활성화 + RemoveNotification (리스너로
+  타 앱 액션 실행 불가 — 스파이크 발견 — 의 근사). X = 카드만 숨김(알림은
+  액션 센터 유지).
+- 검증 (실발사 토스트): 1s 내 픽업, 렌더+위치(창 rect = 스크린샷 카드 일치),
+  X/본문 클릭 각 400ms 내 해제, 2-카드 스택 렌더 + 8s 만료 후 창 숨김.
+  **AUMID 활성화·호버 정지는 도그푸드 검증** (테스트 AUMID 미등록이라 실 카톡/
+  디스코드 토스트 필요 — M4 게이트 그대로). 주의: 텍스트 없는 토스트로는 클릭
+  경로 검증이 헛돈다(발사 실패가 무음) — fire.ps1은 제목 필수.
+
 ## 7. 안전망 — 복구 사다리 (M6, 스왑 전 필수)
 
 겹겹이. 위에서부터 자동:
