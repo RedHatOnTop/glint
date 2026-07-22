@@ -729,6 +729,29 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   lparam을 Windows가 1.25× 재스케일(120dpi) — x1870이 2338로 도착, 테스트 클릭이
   바탕화면 슬리버에 꽂혀 toggle_desktop 연발(유저 창 전체 최소화 수 회). 모든
   리그 첫 줄 = SetProcessDpiAwarenessContext(-4) 필수.**
+- **실클릭 토글 가드 + 사운드 장치 전환 SHIPPED 0722 (af69147)** *(유저 "시작 한번
+  더 누르면 사라지게, 와이파이/사운드/배터리도. 사운드는 입출력 장치 변경도")*:
+  ① **실클릭 레이스 근인**: 클릭 #2의 마우스-DOWN이 WA_INACTIVE로 팝업을 먼저
+  해제 → UP의 토글이 "닫힘"을 보고 재오픈. posted 리그는 활성화를 안 움직여
+  재현 불가. 해법 = **해제 타임스탬프 가드**: dismiss()가 Instant(+플라이아웃은
+  Kind) 스탬프, 마우스 토글은 같은 타겟 해제 후 400ms 내 재오픈 스킵.
+  WM_WINKEY는 mouse=false로 가드 우회(선행 마우스-다운이 없으므로). 시작 존
+  WM_LBUTTONDBLCLK = 의도적 no-op(빠른 더블클릭이 "메뉴 유지"로 귀결되던 것).
+  ② **사운드 플라이아웃 입출력 장치 전환**: `audiopolicy.rs` — 비공개
+  IPolicyConfig COM(EarTrumpet 경로), 12-슬롯 vtable 전체 선언(오프셋 보전),
+  SetDefaultEndpoint만 호출(eConsole+eMultimedia+eCommunications).
+  flyout.rs poll_devices()가 eRender/eCapture 활성 엔드포인트 열거, 출력/입력
+  섹션 + 디폴트 체크 글리프. **전환 시 캐시 3종 무효화 필수**: 플라이아웃
+  슬라이더 endpoint, OSD 구독(WM_APP_REBIND=WM_APP+16 → resubscribe), 바 상태
+  셀(WM_AUDIO_REBIND=WM_APP+17 → rebind_volume). 구 endpoint는 구 장치로 계속
+  정상 응답하므로 에러-주도 자가복구가 영원히 안 걸림. 검증(clickrig3 13/13):
+  가드 사이클(열림→어웨이 해제→즉시클릭 삼킴→늦은클릭 열림→토글 닫힘) 달력+
+  시작 메뉴 양쪽, Win키 가드 우회, 해제 직후 딴 셀은 정상 오픈; 볼륨
+  플라이아웃 장치 섹션 스크린샷 + 디폴트 행 클릭 no-op. **리그 함정: 어웨이
+  좌표가 팝업 rect 밖이어야 함 — (500,500)은 시작 메뉴 안이라 정상 무시,
+  동일 재현 2회로 "제품 버그"처럼 보임. 셀 순서는 [Ime,Net,Vol,Bat]
+  (Vol ≈ 디바이스 x1753).** 미검증(도그푸드): 실클릭 WA_INACTIVE 다리,
+  실제 장치 전환(유저 라이브 오디오를 끊게 되어 리그 불가).
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
