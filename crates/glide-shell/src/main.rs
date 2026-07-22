@@ -16,6 +16,7 @@ mod startmenu;
 mod status;
 mod taskbar;
 mod theme;
+mod toasts;
 mod tray;
 mod wifi;
 mod winkey;
