@@ -11,6 +11,7 @@ mod icons;
 mod osd;
 mod preview;
 mod render;
+mod safety;
 mod secondary;
 mod shellmenu;
 mod spike_toasts;
@@ -38,6 +39,9 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some("--autostart-selftest") => autostart::selftest(),
+        Some("--register") => safety::register(),
+        Some("--unregister") => safety::unregister(),
+        Some("--selftest-crashloop") => safety::selftest_crashloop(),
         None | Some("--tray-claim") => {
             // --tray-claim: also register as Shell_TrayWnd. Racy while
             // explorer lives — meant for explorer-kill sessions (M2 gate).
@@ -50,10 +54,16 @@ fn main() -> anyhow::Result<()> {
             // Shell duty (SHELL_DESIGN §6.5): the Run keys and Startup folders
             // only fire from here once Winlogon Shell= points at us; while
             // explorer is the shell this is a no-op, never a double launch.
-            if autostart::is_system_shell() {
+            let system_shell = autostart::is_system_shell();
+            if system_shell {
                 std::thread::spawn(autostart::run_all);
             }
-            taskbar::run(claim)
+            safety::install_panic_log();
+            // Ladder rung 3; alongside-explorer runs bookkeep but never fire.
+            let _ = safety::crash_check_and_mark_running(system_shell);
+            let r = taskbar::run(claim);
+            safety::mark_clean_exit();
+            r
         }
         _ => {
             eprintln!(

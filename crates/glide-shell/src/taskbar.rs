@@ -30,7 +30,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA, SHAppBarMessage,
@@ -69,6 +70,9 @@ const MENU_QUIT: usize = 6;
 const MENU_NEWWIN: usize = 7;
 /// Win10 show-desktop sliver at the far right edge.
 const DESK_W: f32 = 8.0;
+/// Rescue hotkeys (§7 ladder 4): Ctrl+Alt+Shift+E / +R.
+const HOTKEY_RESCUE_E: i32 = 41;
+const HOTKEY_RESCUE_R: i32 = 42;
 /// Start button: glyph square at the far left, entries begin after it.
 const START_X: f32 = 8.0;
 const START_BTN_W: f32 = 40.0;
@@ -274,6 +278,12 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             eprintln!("glide-shell: desktop window failed: {e}");
         }
         crate::winkey::install(hwnd);
+        // Rescue ladder rung 4 (§7): E = spawn explorer now, R = drop the
+        // HKCU Shell= override for next logon. Registered always — they're
+        // no-ops of low cost while explorer is still the shell.
+        let mods = MOD_CONTROL | MOD_ALT | MOD_SHIFT;
+        let _ = RegisterHotKey(Some(hwnd), HOTKEY_RESCUE_E, mods, 'E' as u32);
+        let _ = RegisterHotKey(Some(hwnd), HOTKEY_RESCUE_R, mods, 'R' as u32);
 
         // Toast cards and the volume OSD live on this thread but own their
         // windows; the bar never needs to know about them.
@@ -691,6 +701,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             crate::winkey::WM_WINKEY => {
                 crate::winkey::toggle_glint();
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                match wparam.0 as i32 {
+                    HOTKEY_RESCUE_E => crate::safety::spawn_explorer(),
+                    HOTKEY_RESCUE_R => {
+                        crate::safety::restore_explorer_shell(false);
+                        MessageBoxW(
+                            None,
+                            w!("HKCU Shell= 해제됨 — 다음 로그온부터 stock explorer.\n지금 복귀하려면 Ctrl+Alt+Shift+E."),
+                            w!("glide-shell 안전망"),
+                            MB_OK | MB_SETFOREGROUND,
+                        );
+                    }
+                    _ => {}
+                }
                 LRESULT(0)
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE => {
