@@ -4,6 +4,7 @@
 //! above the stock bar). `--spike-toasts` is the M4 gating spike, kept for
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
+mod actioncenter;
 mod audiopolicy;
 mod autostart;
 mod clickaway;
@@ -13,6 +14,7 @@ mod flyout;
 mod icons;
 mod osd;
 mod preview;
+mod quicksettings;
 mod render;
 mod safety;
 mod secondary;

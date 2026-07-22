@@ -74,6 +74,8 @@ const MENU_NEWWIN: usize = 7;
 const MENU_SETTINGS: usize = 8;
 /// Win10 show-desktop sliver at the far right edge.
 const DESK_W: f32 = 8.0;
+/// Action-center bell, between the clock and the show-desktop sliver.
+const NOTIF_CELL_W: f32 = 30.0;
 /// Rescue hotkeys (§7 ladder 4): Ctrl+Alt+Shift+E / +R.
 const HOTKEY_RESCUE_E: i32 = 41;
 const HOTKEY_RESCUE_R: i32 = 42;
@@ -163,6 +165,8 @@ pub struct Bar {
     secondaries: Vec<Box<crate::secondary::Secondary>>,
     start: crate::startmenu::StartMenu,
     start_hover: bool,
+    actioncenter: crate::actioncenter::ActionCenter,
+    notif_hover: bool,
     desk_hover: bool,
     /// Windows minimized by the show-desktop sliver, restored on re-click.
     desk_stash: Vec<isize>,
@@ -267,6 +271,8 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             secondaries: Vec::new(),
             start: crate::startmenu::StartMenu::new(dpi)?,
             start_hover: false,
+            actioncenter: crate::actioncenter::ActionCenter::new(dpi)?,
+            notif_hover: false,
             desk_hover: false,
             desk_stash: Vec::new(),
             cfg: crate::config::load(),
@@ -519,6 +525,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let sh = bar.status_hit(x);
                     let sth = th.is_none() && sh.is_none() && bar.start_hit(x);
                     let dh = bar.desk_hit(x);
+                    let nh = bar.notif_hit(x);
                     let eh = if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None };
                     let changed =
                         th != bar.tray_hover || sh != bar.status_hover || eh != bar.hover;
@@ -526,11 +533,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         || sh != bar.status_hover
                         || sth != bar.start_hover
                         || dh != bar.desk_hover
+                        || nh != bar.notif_hover
                     {
                         bar.tray_hover = th;
                         bar.status_hover = sh;
                         bar.start_hover = sth;
                         bar.desk_hover = dh;
+                        bar.notif_hover = nh;
                         bar.paint();
                     }
                     bar.set_hover(eh);
@@ -559,6 +568,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     | bar.status_hover.take().is_some()
                     | std::mem::take(&mut bar.start_hover)
                     | std::mem::take(&mut bar.desk_hover)
+                    | std::mem::take(&mut bar.notif_hover)
                 {
                     bar.paint();
                 }
@@ -651,6 +661,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     bar.toggle_desktop();
                 } else if bar.clock_hit(x) {
                     bar.flyout_toggle(hwnd, crate::flyout::Kind::Calendar);
+                } else if bar.notif_hit(x) {
+                    bar.ac_toggle(hwnd);
                 } else {
                     // Empty bar area — same dismissal as clicking anywhere
                     // else on screen.
@@ -935,6 +947,7 @@ impl Bar {
     fn status_left(&self) -> f32 {
         self.width
             - self.desk_w()
+            - NOTIF_CELL_W
             - self.clock_w()
             - (self.status_cells().len() as f32 * STATUS_CELL_W)
             - 2.0
@@ -944,8 +957,19 @@ impl Bar {
         self.cfg.desk_sliver && x >= self.width - DESK_W
     }
 
+    /// Right edge of the clock block (the bell sits to its right).
+    fn clock_right_edge(&self) -> f32 {
+        self.width - self.desk_w() - NOTIF_CELL_W
+    }
+
     fn clock_hit(&self, x: f32) -> bool {
-        x >= self.width - self.desk_w() - self.clock_w() && x < self.width - self.desk_w()
+        x >= self.clock_right_edge() - self.clock_w() && x < self.clock_right_edge()
+    }
+
+    /// Bell cell between the clock and the sliver.
+    fn notif_hit(&self, x: f32) -> bool {
+        let right = self.width - self.desk_w();
+        x >= right - NOTIF_CELL_W && x < right
     }
 
     /// Show-desktop toggle: first click minimizes everything visible, second
@@ -1209,11 +1233,28 @@ impl Bar {
     /// Dismiss the start menu and any flyout (clicks on non-toggle targets;
     /// the toggle buttons manage their own popup instead).
     fn close_popups(&mut self) {
-        if self.start.open || self.flyout.kind.is_some() {
+        if self.start.open || self.flyout.kind.is_some() || self.actioncenter.open {
             self.start.hide();
             self.flyout.hide();
+            self.actioncenter.hide();
             self.paint();
         }
+    }
+
+    /// Toggle the action center from the bell; guard-aware like the others.
+    fn ac_toggle(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
+        }
+        self.preview.hide();
+        self.start.hide();
+        self.flyout.hide();
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        self.actioncenter.toggle(rect);
+        self.paint();
     }
 
     /// A mouse button went down somewhere on screen while a popup was open
@@ -1221,7 +1262,7 @@ impl Bar {
     /// nothing, clicks on this bar are left to its own handlers (which
     /// toggle), anything else dismisses.
     fn click_away(&mut self, pt: POINT) {
-        if !self.start.open && self.flyout.kind.is_none() {
+        if !self.start.open && self.flyout.kind.is_none() && !self.actioncenter.open {
             return;
         }
         let inside = |h: HWND| unsafe {
@@ -1235,11 +1276,13 @@ impl Bar {
         if inside(self.hwnd)
             || (self.start.open && inside(self.start.hwnd()))
             || (self.flyout.kind.is_some() && inside(self.flyout.hwnd()))
+            || (self.actioncenter.open && inside(self.actioncenter.hwnd()))
         {
             return;
         }
         self.start.dismiss();
         self.flyout.dismiss();
+        self.actioncenter.dismiss();
         self.paint();
     }
 
@@ -1253,6 +1296,7 @@ impl Bar {
         }
         self.preview.hide();
         self.flyout.hide();
+        self.actioncenter.hide();
         if self.start.open {
             self.start.hide();
         } else if !(mouse && self.start.just_dismissed()) {
@@ -1274,6 +1318,7 @@ impl Bar {
         }
         self.preview.hide();
         self.start.hide();
+        self.actioncenter.hide();
         if self.flyout.kind == Some(kind) {
             self.flyout.hide();
         } else if !self.flyout.just_dismissed(kind) {
@@ -2112,8 +2157,8 @@ impl Bar {
             )
             .encode_utf16()
             .collect();
-            let clock_left = self.width - self.desk_w() - self.clock_w();
-            let clock_right = self.width - self.desk_w() - 8.0;
+            let clock_left = self.clock_right_edge() - self.clock_w();
+            let clock_right = self.clock_right_edge() - 8.0;
             if let Ok(b) = r.brush(theme::TEXT) {
                 r.dc.DrawText(
                     &hhmm,
@@ -2133,6 +2178,41 @@ impl Bar {
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
+            }
+
+            // Action-center bell, right of the clock.
+            {
+                let nx = self.width - self.desk_w() - NOTIF_CELL_W;
+                let engaged = self.notif_hover || self.actioncenter.open;
+                if engaged {
+                    let fill = if self.notif_hover { theme::HOVER_FILL } else { theme::ACTIVE_FILL };
+                    if let Ok(b) = r.brush(fill) {
+                        r.dc.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: nx + 2.0,
+                                    top: 6.0,
+                                    right: nx + NOTIF_CELL_W - 2.0,
+                                    bottom: bar_h - 6.0,
+                                },
+                                radiusX: 4.0,
+                                radiusY: 4.0,
+                            },
+                            &b,
+                        );
+                    }
+                }
+                let color = if self.actioncenter.open { theme::ACCENT } else { theme::TEXT };
+                if let Ok(b) = r.brush(color) {
+                    r.dc.DrawText(
+                        &[0xE7E7u16], // Ringer
+                        &r.fmt_glyph,
+                        &D2D_RECT_F { left: nx, top: 0.0, right: nx + NOTIF_CELL_W, bottom: bar_h },
+                        &b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
             }
 
             // Show-desktop sliver: hairline divider, fills on hover (Win10).
@@ -2159,7 +2239,8 @@ impl Bar {
                 let w = self.entries[di].width;
                 let left = float_left.clamp(
                     ENTRY_X0,
-                    (self.width - self.desk_w() - self.clock_w() - w - 4.0).max(ENTRY_X0),
+                    (self.width - self.desk_w() - NOTIF_CELL_W - self.clock_w() - w - 4.0)
+                        .max(ENTRY_X0),
                 );
                 self.draw_entry(di, left, true);
             }
