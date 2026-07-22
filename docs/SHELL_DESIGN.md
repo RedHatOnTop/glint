@@ -660,10 +660,34 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   포그라운드 전환 따라감(스크린샷 2장). 클릭 활성화는 포커스 강탈이라 스크립트
   미실행(주 바와 동일 `force_foreground` 경로). **잔여 게이트**: 물리 도킹
   탈착 반복 도그푸드.
+- **Win10 머슬 메모리 팩 SHIPPED 0722 (67f8a6d)** *(마일스톤 외 유저 요청 "좀 더
+  Windows 10 태스크바처럼 — 머슬 메모리가 크더라")*: ① 시계 클릭 → 달력 플라이아웃
+  (초 단위 라이브 시계 + 풀 날짜 + 월 그리드, 오늘 = 악센트 사각, 이월 날짜 딤,
+  셰브런/휠 = 월 이동, 제목 클릭 = 오늘 복귀, 1s 타이머) ② 우측 끝 바탕화면 보기
+  슬리버 8px(주 바 전용, 1클릭 전체 최소화 SW_SHOWMINNOACTIVE → 재클릭 동일 세트
+  복원, 시계/상태 클러스터 DESK_W만큼 좌측 시프트) ③ 버튼 가운데 클릭 = 새 인스턴스
+  ④ 버튼 우클릭 메뉴에 Win10 점프리스트식 앱 행(exe stem, 클릭 = 새 창) + 구분선.
+  라이브 검증: 달력 열림/초 틱/7월 그리드 정확(22 수요일)/6월 네비/Esc 닫힘 —
+  전부 posted 메시지. 미발사(교란): 슬리버 토글·가운데 클릭 스폰 = 도그푸드.
 - **M6 — 안전망** (1세션)
   watchdog + 크래시 자폭 + 레스큐 핫키 + RESTORE-SHELL.ps1 + `--register` CLI +
   **레스큐 admin 계정 생성(유저 동의 확보됨 0721)**. 게이트: 셸 프로세스 kill →
   winlogon 재기동 확인, 3-크래시 자폭 시뮬레이션 통과.
+  **첫 컷 SHIPPED 0722 (ec13045)**: `safety.rs` = `--register`/`--unregister`
+  (YES 확인 + 에코백), 크래시 카운터(session.state 센티널로 비정상 종료 감지,
+  **크래시 기인 기동 && 10분 내 3회 → Shell= 삭제 + explorer 스폰 + 경고 + exit**;
+  clean exit 후 잔존 스탬프는 재발동 안 함), panic 훅 → crash.log,
+  `--selftest-crashloop`(임시 상태 디렉터리, 레지스트리 무접촉). 레스큐 핫키
+  Ctrl+Alt+Shift+E(explorer 즉시 스폰)/R(Shell= 삭제 + 안내) = bar WM_HOTKEY.
+  스크립트: RESTORE-SHELL.ps1(사다리 5, ~\system-optimize-backup\ 복사 완료; 바탕
+  화면 복사는 M7 리허설 때) + CREATE-RESCUE-ACCOUNT.ps1(사다리 6, 유저가 승격
+  실행 + 비밀번호 직접 입력, admin 그룹은 well-known SID). 사다리 1은 panic 로그 +
+  glint on-demand 재스폰(winkey 기존 경로)으로 한정 — 창 사망 = 프로세스 사망 →
+  사다리 2(AutoRestartShell=1 이 박스 실측). **검증**: 셀프테스트 5/5 PASS,
+  CLI 취소/no-op 경로 레지스트리 무변 확인, 레스큐 E 암 posted WM_HOTKEY로 라이브
+  발사(explorer 창 스폰 확인 후 닫음). **미검증**: 실제 핫키 타건(등록 반환값
+  미확인 — 도그푸드), armed 자폭(등록 셸 상태 필요 — M7 리허설), winlogon 재기동
+  게이트(동일), 레스큐 계정 생성(유저 실행 대기).
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
