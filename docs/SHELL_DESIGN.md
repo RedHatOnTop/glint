@@ -688,6 +688,30 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   발사(explorer 창 스폰 확인 후 닫음). **미검증**: 실제 핫키 타건(등록 반환값
   미확인 — 도그푸드), armed 자폭(등록 셸 상태 필요 — M7 리허설), winlogon 재기동
   게이트(동일), 레스큐 계정 생성(유저 실행 대기).
+- **설정 앱 + Win키 라우팅 SHIPPED 0722 (cbaa622)** *(마일스톤 외 유저 요청 "윈도우
+  키 누르면 시작이 떠야… Win+S가 검색… 설정 앱을 새로 만들던가" + "Windows 설정
+  앱처럼 잘 만들어줘")*: ① `config.rs` — `%APPDATA%\glide-shell\settings.txt`
+  (labels/clock_seconds/desk_sliver/secondary_bars/winkey_start, 파일이 단일
+  진실원, 누락 키 = 기본값) ② `settings.rs` — Win11 설정 앱 룩 실창
+  (WS_OVERLAPPEDWINDOW + Mica(backdrop=2) + 다크 타이틀바, 좌측 내비 3분류
+  작업 표시줄/단축키/정보 + 악센트 인디케이터, 토글 카드 + Win11식 스위치, 정보
+  행 = 버전/로그온 셸(query_shell 라이브)/CLI 힌트/crash.log 경로; WM_CLOSE·Esc =
+  숨김, 바 메뉴 "작업 표시줄 설정"으로 재소생; `--settings` 단독 실행 가능 —
+  **함정: 단독 프로세스는 CoInitializeEx 직접 호출 필수**, 없으면 Renderer가
+  0x800401F0) ③ 바 적용 — WM_SETTINGS_CHANGED(WM_APP+14) 수신 시 재로드:
+  라벨/아이콘-온리 버튼, HH:MM:SS 시계 폭, 슬리버 on/off, 보조 바 철거/재건
+  ④ **Win키 라우팅 재정의(§10-5 번복, 유저 지시)**: bare Win → 시작 메뉴
+  (winkey_start=0이면 구 glint 동작), Win+S → glint 검색. `winkey.rs`가 Win 다운
+  중 S를 전부 삼키고(오토리피트 + 대응 keyup 포함) 더미 VK 주입으로 bare-Win
+  해제 오인 차단. **라이브 검증(posted 리그 setrig2.ps1)**: 카드 클릭 →
+  settings.txt 원문 단언(labels=0/clock_seconds=1), 3페이지 전부 렌더 스크린샷,
+  WM_CLOSE = 숨김(파괴 아님), 바 라이브 적용(아이콘-온리 + 초 시계 스크린샷),
+  bar2 철거/재건, WM_WINKEY → 시작 메뉴 개폐. **미검증**: 실물 Win/Win+S 타건
+  (LL 훅 실경로 — 도그푸드), 바 TrackPopupMenu 경유 열기(메뉴 스크립트 불가,
+  직접 open() 경로로 갈음). **리그 함정 기록**: 두 프로세스가 같은 설정 창
+  클래스를 등록하면 FindWindowW가 바의 *숨은* 창을 잡음 — WM_CLOSE가
+  USERDATA-null 창에서 DefWindowProc→DestroyWindow로 추락해 바 재시작 유발.
+  FindWindowExW + IsWindowVisible 순회로 해결.
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
@@ -703,6 +727,8 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
 3. **레스큐 계정**: 생성 동의 (M6에서 생성, 비밀번호는 유저가 직접 설정).
 4. **Duo 모니터**: 양 패널 스왑 전 필수 (M5). M1은 주 패널로 시작하되 per-monitor 구조.
 5. **Win키**: bare-Win → glint 확정 (Win+E/D/화살표 조합키 유지).
+   **→ 0722 유저 지시로 번복**: bare-Win → 시작 메뉴, Win+S → glint 검색
+   (설정 winkey_start=0으로 구 동작 복원 가능). §9 설정 앱 블록 참조.
 6. **토스트**: 손실 수용 안 함 — `UserNotificationListener` 자체 토스트가 스왑 전 필수
    (M4). 스파이크 실패 시 스왑 보류하고 재논의.
 7. **UI/UX 철학**: "쉽고, 빠르고, 아름답게" + 웹뷰 전면 금지. 설계 반영: 렌더링 스택
