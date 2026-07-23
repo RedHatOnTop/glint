@@ -20,7 +20,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            labels: true,
+            // Icon-only by default: the floating panel reads as a designed
+            // dock, not a Win10 label strip. Toggle labels back in settings.
+            labels: false,
             clock_seconds: false,
             desk_sliver: true,
             secondary_bars: true,

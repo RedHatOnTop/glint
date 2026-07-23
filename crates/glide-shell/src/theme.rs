@@ -29,6 +29,11 @@ pub const BAR_HEIGHT: f32 = 40.0;
 pub const BUTTON_MAX_W: f32 = 176.0;
 pub const BUTTON_RADIUS: f32 = 6.0;
 pub const UNDERLINE_H: f32 = 3.0;
+/// Floating panel (Plasma-style): the slab is inset from the screen edges by
+/// these gaps, which the desktop shows through. The reserved appbar strut is
+/// BAR_HEIGHT + PANEL_MARGIN_BOTTOM tall; left/right gaps are cosmetic.
+pub const PANEL_MARGIN_X: f32 = 10.0;
+pub const PANEL_MARGIN_BOTTOM: f32 = 8.0;
 
 /// Motion vocabulary: single 120–180ms ease-out (SHELL_DESIGN §5).
 pub const ANIM_MS: f32 = 140.0;

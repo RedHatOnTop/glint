@@ -18,8 +18,8 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL;
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute,
-    DwmSetWindowAttribute,
+    DWMWA_CLOAKED, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ScreenToClient,
@@ -241,11 +241,16 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         let backdrop: i32 = 3; // DWMSBT_TRANSIENTWINDOW (acrylic) — glint's recipe
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
+        // Rounded corners make the inset slab read as a floating panel.
+        let corner = DWMWCP_ROUND.0;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
 
         let dpi = GetDpiForWindow(hwnd) as f32;
         let scale = dpi / 96.0;
-        let bar_h = (theme::BAR_HEIGHT * scale).round() as i32;
-        let rect = appbar_negotiate(hwnd, bar_h);
+        // Reserve a strut of panel + bottom gap, then float the slab inside it.
+        let strut = ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
+        let band = appbar_negotiate(hwnd, strut);
+        let rect = panel_rect(band, scale);
         let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
         MoveWindow(hwnd, rect.left, rect.top, w_px, h_px, true)?;
 
@@ -471,6 +476,20 @@ pub(crate) fn appbar_requery(hwnd: HWND, height_px: i32, mon: RECT) -> RECT {
         abd.rc.top = abd.rc.bottom - height_px;
         SHAppBarMessage(ABM_SETPOS, &mut abd);
         abd.rc
+    }
+}
+
+/// Inset the negotiated full-width strut into the floating slab: gaps on the
+/// left and right that the desktop shows through, and the panel pinned to the
+/// strut's top so PANEL_MARGIN_BOTTOM of gap sits beneath it.
+fn panel_rect(band: RECT, scale: f32) -> RECT {
+    let mx = (theme::PANEL_MARGIN_X * scale).round() as i32;
+    let ph = (theme::BAR_HEIGHT * scale).round() as i32;
+    RECT {
+        left: band.left + mx,
+        top: band.top,
+        right: band.right - mx,
+        bottom: band.top + ph,
     }
 }
 
@@ -1780,8 +1799,9 @@ impl Bar {
     fn reposition(&mut self) {
         unsafe {
             let dpi = GetDpiForWindow(self.hwnd) as f32;
-            let bar_h = (theme::BAR_HEIGHT * dpi / 96.0).round() as i32;
-            let rect = {
+            let scale = dpi / 96.0;
+            let strut = ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
+            let band = {
                 let mon = primary_monitor_rect();
                 let mut abd = APPBARDATA {
                     cbSize: std::mem::size_of::<APPBARDATA>() as u32,
@@ -1791,20 +1811,21 @@ impl Bar {
                     rc: RECT {
                         left: mon.left,
                         right: mon.right,
-                        top: mon.bottom - bar_h,
+                        top: mon.bottom - strut,
                         bottom: mon.bottom,
                     },
                     ..Default::default()
                 };
                 SHAppBarMessage(ABM_QUERYPOS, &mut abd);
-                abd.rc.top = abd.rc.bottom - bar_h;
+                abd.rc.top = abd.rc.bottom - strut;
                 SHAppBarMessage(ABM_SETPOS, &mut abd);
                 abd.rc
             };
+            let rect = panel_rect(band, scale);
             let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
             let _ = MoveWindow(self.hwnd, rect.left, rect.top, w_px, h_px, true);
             let _ = self.renderer.resize(w_px as u32, h_px as u32, dpi);
-            self.width = w_px as f32 / (dpi / 96.0);
+            self.width = w_px as f32 / scale;
             self.apply_overflow();
             self.paint();
         }
@@ -1948,22 +1969,26 @@ impl Bar {
                 }
             }
 
-            // Active underline: grows from the center (glide accent-pill
-            // gesture), amber when flashing. Window buttons only.
-            let grow = a.active;
-            if e.hwnd.is_some() && (grow > 0.01 || e.flash) {
-                let full = e.width - 28.0;
-                let w = if e.flash { full } else { 8.0 + (full - 8.0) * grow };
-                let mid = cx + e.width / 2.0;
-                let color = if e.flash { theme::FLASH } else { theme::ACCENT };
-                if let Ok(b) = r.brush(color) {
+            // Running dot under the icon: every open window shows a dim accent
+            // dot, the foreground one grows into a bright pill (amber when the
+            // window flashed for attention). Centered on the icon, not the
+            // button, so it reads the same in icon-only and labeled modes.
+            if e.hwnd.is_some() {
+                let mid = icon_left + 10.0;
+                let hw = 3.0 + 8.0 * a.active;
+                let (color, alpha) = if e.flash {
+                    (theme::FLASH, 1.0)
+                } else {
+                    (theme::ACCENT, 0.5 + 0.5 * a.active)
+                };
+                if let Ok(b) = r.brush(theme::with_alpha(color, alpha)) {
                     r.dc.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
-                                left: mid - w / 2.0,
-                                top: bar_h - theme::UNDERLINE_H - 2.0,
-                                right: mid + w / 2.0,
-                                bottom: bar_h - 2.0,
+                                left: mid - hw,
+                                top: bar_h - theme::UNDERLINE_H - 1.0,
+                                right: mid + hw,
+                                bottom: bar_h - 1.0,
                             },
                             radiusX: theme::UNDERLINE_H / 2.0,
                             radiusY: theme::UNDERLINE_H / 2.0,
