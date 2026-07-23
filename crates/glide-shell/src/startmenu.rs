@@ -365,6 +365,19 @@ impl StartMenu {
             let hwnd_raw = hwnd.0 as isize;
             std::thread::spawn(move || worker(job_rx, reply_tx, hwnd_raw));
 
+            // Pre-warm during startup idle: the cold shell:AppsFolder
+            // enumeration costs several seconds, and it sits at the head of the
+            // single worker queue, so a first open with no warm-up shows a
+            // multi-second "loading" state with blank tiles. Kick the app enum
+            // and the pinned-tile icons now; the replies land via WM_APP_REPLY
+            // on the (hidden) menu window that the bar's loop already pumps, so
+            // the first Win-key open is already populated.
+            let pins = load_start_pins();
+            let _ = jobs.send(Job::Apps { epoch: 1 });
+            for p in &pins {
+                let _ = jobs.send(Job::Icon { parsing: p.parsing.clone() });
+            }
+
             Ok(StartMenu {
                 hwnd,
                 renderer,
@@ -382,11 +395,11 @@ impl StartMenu {
                 h: 0.0,
                 fg_at_open: HWND::default(),
                 apps: Vec::new(),
-                pins: load_start_pins(),
+                pins,
                 rows: Vec::new(),
                 row_pos: Vec::new(),
-                loading: false,
-                epoch: 0,
+                loading: true,
+                epoch: 1,
                 loaded_at: None,
                 query: String::new(),
                 open_folder: None,
@@ -418,9 +431,10 @@ impl StartMenu {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut StartMenu as isize);
         }
         crate::clickaway::set_start_open(true);
-        if self
-            .loaded_at
-            .is_none_or(|t| t.elapsed().as_secs() > STALE_SECS)
+        if !self.loading
+            && self
+                .loaded_at
+                .is_none_or(|t| t.elapsed().as_secs() > STALE_SECS)
         {
             self.epoch += 1;
             self.loading = true;
