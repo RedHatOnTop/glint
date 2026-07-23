@@ -8,7 +8,9 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
-use windows::Win32::Graphics::Direct2D::{D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_ROUNDED_RECT};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
+};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
@@ -37,21 +39,64 @@ const NAV_ITEM_H: f32 = 40.0;
 const CARD_H: f32 = 68.0;
 const CARD_GAP: f32 = 4.0;
 
-const CATS: [(&str, u16); 3] = [
+const CATS: [(&str, u16); 6] = [
+    ("개인화", 0xE771),
     ("작업 표시줄", 0xE7F4),
+    ("시작 프로그램", 0xE7B5),
+    ("Windows 설정", 0xE713),
     ("단축키", 0xE765),
-    ("정보", 0xE946),
+    ("시스템 정보", 0xE946),
 ];
+const CAT_PERSONALIZE: usize = 0;
+const CAT_TASKBAR: usize = 1;
+const CAT_STARTUP: usize = 2;
+const CAT_LINKS: usize = 3;
+const CAT_SHORTCUTS: usize = 4;
+const CAT_ABOUT: usize = 5;
+
+/// (label, subtitle, deep-link URI). The stock panels glide doesn't own yet —
+/// surfaced here so the settings app is one door to the whole system, and the
+/// fragmented Control Panel / ms-settings maze collapses into this list. Each
+/// opens via ShellExecute; ms-settings: URIs and control.exe applets both work.
+const LINKS: [(&str, &str, &str); 10] = [
+    ("네트워크 · 인터넷", "Wi-Fi, 이더넷, VPN, 프록시", "ms-settings:network"),
+    ("Bluetooth · 장치", "장치 추가, 프린터, 마우스", "ms-settings:bluetooth"),
+    ("소리", "출력·입력 장치, 앱별 볼륨 믹서", "ms-settings:sound"),
+    ("디스플레이", "해상도, 배율, 야간 모드, 다중 모니터", "ms-settings:display"),
+    ("전원 · 배터리", "전원 모드, 절전, 화면 끄기 시간", "ms-settings:powersleep"),
+    ("앱 · 기능", "설치된 앱 제거, 기본 앱", "ms-settings:appsfeatures"),
+    ("Windows 업데이트", "업데이트 확인, 기록, 일시 중지", "ms-settings:windowsupdate"),
+    ("시간 · 언어", "시간대, 지역, 키보드 레이아웃", "ms-settings:dateandtime"),
+    ("계정 · 로그인", "사용자, PIN, 로그인 옵션", "ms-settings:signinoptions"),
+    ("저장소", "디스크 사용량, 저장소 센스 정리", "ms-settings:storagesense"),
+];
+
+/// A Windows-side toggle (registry-backed), distinct from glide's own config.
+#[derive(Clone, Copy, PartialEq)]
+enum WinTgl {
+    Dark,
+    Transparency,
+    TitleAccent,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
     Nav(usize),
     Toggle(usize),
+    Win(WinTgl),
+    Startup(usize),
+    Link(usize),
 }
 
 enum RowKind {
-    /// Index into the toggle table below.
+    /// Index into glide's own toggle table below.
     Toggle(usize),
+    /// A Windows setting glide reads/writes directly.
+    Win(WinTgl),
+    /// Index into the cached startup-item list.
+    Startup(usize),
+    /// Index into LINKS — a deep-link to a stock panel; opens on click.
+    Link(usize),
     Info,
 }
 
@@ -87,6 +132,8 @@ pub struct SettingsApp {
     tracking: bool,
     hits: Vec<(D2D_RECT_F, Act)>,
     cfg: crate::config::Settings,
+    startup: Vec<crate::winsettings::StartupItem>,
+    scroll: f32,
     bar: isize,
 }
 
@@ -171,6 +218,8 @@ impl SettingsApp {
                 tracking: false,
                 hits: Vec::new(),
                 cfg: crate::config::load(),
+                startup: Vec::new(),
+                scroll: 0.0,
                 bar: 0,
             })
         }
@@ -179,6 +228,8 @@ impl SettingsApp {
     pub fn open(&mut self, bar: HWND) {
         self.bar = bar.0 as isize;
         self.cfg = crate::config::load();
+        self.startup = crate::winsettings::list_startup();
+        self.scroll = 0.0;
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut SettingsApp as isize);
             if !IsWindowVisible(self.hwnd).as_bool() {
@@ -228,25 +279,94 @@ impl SettingsApp {
             sub: TOGGLES[t].1.to_string(),
             kind: RowKind::Toggle(t),
         };
+        let win = |w: WinTgl, title: &str, sub: &str| Row {
+            title: title.to_string(),
+            sub: sub.to_string(),
+            kind: RowKind::Win(w),
+        };
         let info = |title: &str, sub: String| Row { title: title.to_string(), sub, kind: RowKind::Info };
         match self.cat {
-            0 => vec![row(0), row(1), row(2), row(3)],
-            1 => vec![
+            CAT_PERSONALIZE => vec![
+                win(WinTgl::Dark, "어두운 모드", "앱·시스템을 어두운 테마로 — Windows 설정과 동기화"),
+                win(WinTgl::Transparency, "투명 효과", "창·패널 배경의 아크릴/미카 투명"),
+                win(WinTgl::TitleAccent, "제목 표시줄 강조색", "제목 표시줄과 창 테두리에 강조색 적용"),
+            ],
+            CAT_TASKBAR => vec![row(0), row(1), row(2), row(3)],
+            CAT_STARTUP => {
+                if self.startup.is_empty() {
+                    vec![info(
+                        "등록된 시작 프로그램 없음",
+                        "로그온 시 자동 실행되는 앱이 없습니다".to_string(),
+                    )]
+                } else {
+                    self.startup
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| Row {
+                            title: s.name.clone(),
+                            sub: trunc(&s.detail, 78),
+                            kind: RowKind::Startup(i),
+                        })
+                        .collect()
+                }
+            }
+            CAT_LINKS => LINKS
+                .iter()
+                .enumerate()
+                .map(|(i, (title, sub, _))| Row {
+                    title: title.to_string(),
+                    sub: sub.to_string(),
+                    kind: RowKind::Link(i),
+                })
+                .collect(),
+            CAT_SHORTCUTS => vec![
                 row(4),
                 info("Win+S", "glint 검색".to_string()),
                 info("Ctrl+Alt+Shift+E", "레스큐 — explorer 즉시 복귀".to_string()),
                 info("Ctrl+Alt+Shift+R", "레스큐 — 셸 등록 해제 (다음 로그온부터 stock)".to_string()),
             ],
-            _ => vec![
-                info("버전", format!("glide-shell {}", env!("CARGO_PKG_VERSION"))),
-                info(
+            CAT_ABOUT => {
+                let mut v: Vec<Row> = crate::winsettings::system_info()
+                    .into_iter()
+                    .map(|(k, val)| info(&k, val))
+                    .collect();
+                v.push(info("glide-shell", format!("버전 {}", env!("CARGO_PKG_VERSION"))));
+                v.push(info(
                     "로그온 셸",
                     crate::safety::query_shell().unwrap_or_else(|| "stock explorer (Shell= 없음)".to_string()),
-                ),
-                info("셸 등록/해제", "glide-shell --register / --unregister (CLI, YES 확인)".to_string()),
-                info("크래시 로그", "%APPDATA%\\glide-shell\\crash.log".to_string()),
-            ],
+                ));
+                v.push(info("크래시 로그", "%APPDATA%\\glide-shell\\crash.log".to_string()));
+                v
+            }
+            _ => Vec::new(),
         }
+    }
+
+    fn win_value(&self, w: WinTgl) -> bool {
+        match w {
+            WinTgl::Dark => crate::winsettings::dark_mode(),
+            WinTgl::Transparency => crate::winsettings::transparency(),
+            WinTgl::TitleAccent => crate::winsettings::title_accent(),
+        }
+    }
+
+    fn win_flip(&mut self, w: WinTgl) {
+        let now = self.win_value(w);
+        match w {
+            WinTgl::Dark => crate::winsettings::set_dark_mode(!now),
+            WinTgl::Transparency => crate::winsettings::set_transparency(!now),
+            WinTgl::TitleAccent => crate::winsettings::set_title_accent(!now),
+        }
+        self.paint();
+    }
+
+    fn startup_flip(&mut self, i: usize) {
+        if let Some(item) = self.startup.get(i) {
+            crate::winsettings::set_startup_enabled(item, !item.enabled);
+        }
+        // Re-read so the switch reflects the truth (writes can be no-ops).
+        self.startup = crate::winsettings::list_startup();
+        self.paint();
     }
 
     fn toggle_value(&self, t: usize) -> bool {
@@ -388,15 +508,34 @@ impl SettingsApp {
         let cx1 = (self.w - 32.0).max(cx0 + 120.0);
         self.text(CATS[self.cat].0, &self.fmt_cat.clone(), rect(cx0, 18.0, cx1, 62.0), theme::TEXT);
 
+        // Content scrolls under the fixed title; clip so scrolled rows never
+        // paint over the title or the nav pane.
+        let content_top = 72.0;
+        let clip = rect(cx0 - 4.0, content_top, self.w, self.h);
+        unsafe {
+            r.dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
         let rows = self.rows();
         for (i, row) in rows.iter().enumerate() {
-            let y = 80.0 + i as f32 * (CARD_H + CARD_GAP);
+            let y = 80.0 - self.scroll + i as f32 * (CARD_H + CARD_GAP);
+            if y + CARD_H < content_top || y > self.h {
+                continue; // offscreen — skip paint and hit-test
+            }
             let card = rect(cx0, y, cx1, y + CARD_H);
-            let toggle = matches!(row.kind, RowKind::Toggle(_));
-            let hot = toggle && self.hover == Some(Act::Toggle(match row.kind {
-                RowKind::Toggle(t) => t,
-                RowKind::Info => 0,
-            }));
+            // act = clickable target; sw = switch state (toggle rows); link =
+            // draw a chevron and open on click instead of a switch.
+            let (act, sw, link): (Option<Act>, Option<bool>, bool) = match row.kind {
+                RowKind::Toggle(t) => (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false),
+                RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false),
+                RowKind::Startup(s) => (
+                    Some(Act::Startup(s)),
+                    Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
+                    false,
+                ),
+                RowKind::Link(l) => (Some(Act::Link(l)), None, true),
+                RowKind::Info => (None, None, false),
+            };
+            let hot = act.map(|a| self.hover == Some(a)).unwrap_or(false);
             self.fill_round(card, 6.0, theme::rgba(255, 255, 255, if hot { 0.075 } else { 0.045 }));
             self.text(
                 &row.title,
@@ -410,13 +549,19 @@ impl SettingsApp {
                 rect(cx0 + 18.0, y + 36.0, cx1 - 80.0, y + 58.0),
                 theme::TEXT_DIM,
             );
-            if let RowKind::Toggle(t) = row.kind {
-                self.switch(cx1 - 18.0, y + CARD_H / 2.0, self.toggle_value(t));
-                self.hits.push((card, Act::Toggle(t)));
+            if let Some(on) = sw {
+                self.switch(cx1 - 18.0, y + CARD_H / 2.0, on);
+            }
+            if link {
+                // ChevronRight — the Win11 "opens elsewhere" affordance.
+                self.glyph(0xE76C, rect(cx1 - 44.0, y, cx1 - 12.0, y + CARD_H), theme::TEXT_DIM);
+            }
+            if let Some(a) = act {
+                self.hits.push((card, a));
             }
         }
-
         unsafe {
+            r.dc.PopAxisAlignedClip();
             let _ = r.dc.EndDraw(None, None);
             let _ = r.present();
         }
@@ -425,6 +570,16 @@ impl SettingsApp {
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     D2D_RECT_F { left, top, right, bottom }
+}
+
+/// Clip a subtitle to `max` chars (counting by char, not byte, so multibyte
+/// paths never split mid-codepoint) with an ellipsis.
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -502,11 +657,39 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                     Some(Act::Nav(i)) => {
                         if app.cat != i {
                             app.cat = i;
+                            app.scroll = 0.0;
+                            // Startup can change out from under us (installers,
+                            // Task Manager); re-read on entry so it's current.
+                            if i == CAT_STARTUP {
+                                app.startup = crate::winsettings::list_startup();
+                            }
+                            app.hover = None;
                             app.paint();
                         }
                     }
                     Some(Act::Toggle(t)) => app.flip(t),
+                    Some(Act::Win(w)) => app.win_flip(w),
+                    Some(Act::Startup(s)) => app.startup_flip(s),
+                    Some(Act::Link(l)) => {
+                        if let Some(e) = LINKS.get(l) {
+                            crate::winsettings::launch(e.2);
+                        }
+                    }
                     None => {}
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0 * 52.0;
+                let n = app.rows().len();
+                let content_h = n as f32 * (CARD_H + CARD_GAP);
+                let vis = (app.h - 92.0).max(0.0);
+                let max = (content_h - vis).max(0.0);
+                let ns = (app.scroll - delta).clamp(0.0, max);
+                if ns != app.scroll {
+                    app.scroll = ns;
+                    app.hover = None;
+                    app.paint();
                 }
                 LRESULT(0)
             }
