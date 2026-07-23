@@ -238,12 +238,145 @@ fn ram_string() -> String {
     }
 }
 
-/// Deep-link the still-stock panels glide doesn't own yet, so the settings app
-/// stays the single entry point. ms-settings: URIs and control.exe applets.
+// ---- Windows tweaks (the registry substance behind Settings/Control Panel) --
+//
+// Settings and Control Panel are, at bottom, GUIs that poke files and the
+// registry. These are the tweaks people actually open regedit / dig through
+// Settings for — exposed as direct HKCU reads/writes (no elevation), each
+// reversible, applied live where Explorer honours a change notification.
+
+/// How a tweak's on/off state maps to the registry.
+pub enum TweakKind {
+    /// A DWORD flag: `on` when enabled, `off` when disabled. `default_on` is
+    /// the effective state when the value is absent.
+    Flag { on: u32, off: u32, default_on: bool },
+    /// The Win11→Win10 context-menu tweak: enabled = the CLSID key exists with
+    /// an empty default value; disabled = key absent. Explorer reads it only at
+    /// startup, so we write it and leave the relaunch to the user (killing
+    /// explorer under an active session is not ours to do).
+    ClassicMenu,
+}
+
+pub struct Tweak {
+    pub title: &'static str,
+    pub sub: &'static str,
+    path: &'static str,
+    name: &'static str,
+    pub kind: TweakKind,
+}
+
+const ADV: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced";
+const CABINET: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState";
+const SEARCH: &str = r"Software\Microsoft\Windows\CurrentVersion\Search";
+/// The shell extension the Win11 short context menu hangs off; an empty
+/// InprocServer32 default disables it and restores the full Win10 menu.
+const CLASSIC_MENU_CLSID: &str = r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}";
+const CLASSIC_MENU_KEY: &str =
+    r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32";
+
+pub const TWEAKS: &[Tweak] = &[
+    Tweak {
+        title: "파일 확장명 표시",
+        sub: "모든 파일의 .exe · .txt 확장명 표시",
+        path: ADV,
+        name: "HideFileExt",
+        kind: TweakKind::Flag { on: 0, off: 1, default_on: false },
+    },
+    Tweak {
+        title: "숨김 파일 표시",
+        sub: "숨김 속성 파일 · 폴더 표시",
+        path: ADV,
+        name: "Hidden",
+        kind: TweakKind::Flag { on: 1, off: 2, default_on: false },
+    },
+    Tweak {
+        title: "보호된 운영체제 파일 표시",
+        sub: "시스템 파일까지 표시 — 주의",
+        path: ADV,
+        name: "ShowSuperHidden",
+        kind: TweakKind::Flag { on: 1, off: 0, default_on: false },
+    },
+    Tweak {
+        title: "탐색기 시작 위치 = 내 PC",
+        sub: "새 탐색기 창을 '내 PC'로 (기본: 즐겨찾기)",
+        path: ADV,
+        name: "LaunchTo",
+        kind: TweakKind::Flag { on: 1, off: 2, default_on: false },
+    },
+    Tweak {
+        title: "제목 표시줄에 전체 경로",
+        sub: "탐색기 제목에 전체 폴더 경로 표시",
+        path: CABINET,
+        name: "FullPath",
+        kind: TweakKind::Flag { on: 1, off: 0, default_on: false },
+    },
+    Tweak {
+        title: "검색 웹 결과(Bing) 끄기",
+        sub: "시작 · 검색에서 Bing 웹 결과 제거",
+        path: SEARCH,
+        name: "BingSearchEnabled",
+        kind: TweakKind::Flag { on: 0, off: 1, default_on: false },
+    },
+    Tweak {
+        title: "마우스 우클릭 = Win10 전체 메뉴",
+        sub: "Win11 축약 메뉴 대신 전체 메뉴 — 탐색기 재시작 후 적용",
+        path: CLASSIC_MENU_KEY,
+        name: "",
+        kind: TweakKind::ClassicMenu,
+    },
+];
+
+pub fn tweak_enabled(t: &Tweak) -> bool {
+    match &t.kind {
+        TweakKind::Flag { on, default_on, .. } => match read_dword(t.path, t.name) {
+            Some(v) => v == *on,
+            None => *default_on,
+        },
+        TweakKind::ClassicMenu => RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(t.path, KEY_READ)
+            .is_ok(),
+    }
+}
+
+pub fn set_tweak(t: &Tweak, enabled: bool) {
+    match &t.kind {
+        TweakKind::Flag { on, off, .. } => {
+            write_dword(t.path, t.name, if enabled { *on } else { *off });
+            notify_explorer();
+        }
+        TweakKind::ClassicMenu => {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            if enabled {
+                if let Ok((k, _)) = hkcu.create_subkey(t.path) {
+                    let _ = k.set_value("", &"");
+                }
+            } else {
+                // Restore the Win11 menu = drop the whole CLSID override.
+                let _ = hkcu.delete_subkey_all(CLASSIC_MENU_CLSID);
+            }
+        }
+    }
+}
+
+/// Tell Explorer its file-view settings changed so open windows refresh without
+/// a logoff (what the Folder Options dialog does under the hood).
+fn notify_explorer() {
+    use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+}
+
+// ---- launch (deep-links + classic tools) -----------------------------------
+
+/// Open a still-stock panel or tool so the settings app stays the single entry
+/// point: ms-settings: URIs, control.exe applets, .msc consoles, or a folder
+/// path (env vars expanded, so `%APPDATA%\glide-shell` opens the config dir).
 pub fn launch(target: &str) {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    let expanded = expand_env(target);
+    let wide: Vec<u16> = expanded.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         ShellExecuteW(
             None,
@@ -253,5 +386,25 @@ pub fn launch(target: &str) {
             None,
             SW_SHOWNORMAL,
         );
+    }
+}
+
+fn expand_env(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let src: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let n = ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), None);
+        if n == 0 {
+            return s.to_string();
+        }
+        let mut buf = vec![0u16; n as usize];
+        let n2 = ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut buf));
+        if n2 == 0 {
+            return s.to_string();
+        }
+        String::from_utf16_lossy(&buf[..(n2 as usize).saturating_sub(1)])
     }
 }

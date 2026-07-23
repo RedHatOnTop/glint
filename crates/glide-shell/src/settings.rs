@@ -39,26 +39,28 @@ const NAV_ITEM_H: f32 = 40.0;
 const CARD_H: f32 = 68.0;
 const CARD_GAP: f32 = 4.0;
 
-const CATS: [(&str, u16); 6] = [
+const CATS: [(&str, u16); 7] = [
     ("개인화", 0xE771),
     ("작업 표시줄", 0xE7F4),
     ("시작 프로그램", 0xE7B5),
-    ("Windows 설정", 0xE713),
+    ("Windows 조정", 0xE90F),
+    ("설정 · 도구", 0xE713),
     ("단축키", 0xE765),
     ("시스템 정보", 0xE946),
 ];
 const CAT_PERSONALIZE: usize = 0;
 const CAT_TASKBAR: usize = 1;
 const CAT_STARTUP: usize = 2;
-const CAT_LINKS: usize = 3;
-const CAT_SHORTCUTS: usize = 4;
-const CAT_ABOUT: usize = 5;
+const CAT_TWEAKS: usize = 3;
+const CAT_LINKS: usize = 4;
+const CAT_SHORTCUTS: usize = 5;
+const CAT_ABOUT: usize = 6;
 
 /// (label, subtitle, deep-link URI). The stock panels glide doesn't own yet —
 /// surfaced here so the settings app is one door to the whole system, and the
 /// fragmented Control Panel / ms-settings maze collapses into this list. Each
 /// opens via ShellExecute; ms-settings: URIs and control.exe applets both work.
-const LINKS: [(&str, &str, &str); 10] = [
+const LINKS: [(&str, &str, &str); 16] = [
     ("네트워크 · 인터넷", "Wi-Fi, 이더넷, VPN, 프록시", "ms-settings:network"),
     ("Bluetooth · 장치", "장치 추가, 프린터, 마우스", "ms-settings:bluetooth"),
     ("소리", "출력·입력 장치, 앱별 볼륨 믹서", "ms-settings:sound"),
@@ -69,6 +71,13 @@ const LINKS: [(&str, &str, &str); 10] = [
     ("시간 · 언어", "시간대, 지역, 키보드 레이아웃", "ms-settings:dateandtime"),
     ("계정 · 로그인", "사용자, PIN, 로그인 옵션", "ms-settings:signinoptions"),
     ("저장소", "디스크 사용량, 저장소 센스 정리", "ms-settings:storagesense"),
+    // Classic tools — the Control Panel bits ms-settings never absorbed.
+    ("장치 관리자", "하드웨어 · 드라이버", "devmgmt.msc"),
+    ("서비스", "백그라운드 서비스 시작 · 중지", "services.msc"),
+    ("디스크 관리", "파티션 · 볼륨 · 드라이브 문자", "diskmgmt.msc"),
+    ("제어판 (클래식 전체)", "ms-settings로 안 옮겨진 나머지", "control.exe"),
+    ("레지스트리 편집기", "고급 — regedit로 직접 편집", "regedit.exe"),
+    ("glide 설정 폴더", "%APPDATA%\\glide-shell — 설정 파일 직접", "%APPDATA%\\glide-shell"),
 ];
 
 /// A Windows-side toggle (registry-backed), distinct from glide's own config.
@@ -85,6 +94,7 @@ enum Act {
     Toggle(usize),
     Win(WinTgl),
     Startup(usize),
+    Tweak(usize),
     Link(usize),
 }
 
@@ -95,6 +105,8 @@ enum RowKind {
     Win(WinTgl),
     /// Index into the cached startup-item list.
     Startup(usize),
+    /// Index into winsettings::TWEAKS — a registry-backed toggle.
+    Tweak(usize),
     /// Index into LINKS — a deep-link to a stock panel; opens on click.
     Link(usize),
     Info,
@@ -310,6 +322,15 @@ impl SettingsApp {
                         .collect()
                 }
             }
+            CAT_TWEAKS => crate::winsettings::TWEAKS
+                .iter()
+                .enumerate()
+                .map(|(i, t)| Row {
+                    title: t.title.to_string(),
+                    sub: t.sub.to_string(),
+                    kind: RowKind::Tweak(i),
+                })
+                .collect(),
             CAT_LINKS => LINKS
                 .iter()
                 .enumerate()
@@ -366,6 +387,20 @@ impl SettingsApp {
         }
         // Re-read so the switch reflects the truth (writes can be no-ops).
         self.startup = crate::winsettings::list_startup();
+        self.paint();
+    }
+
+    fn tweak_value(&self, i: usize) -> bool {
+        crate::winsettings::TWEAKS
+            .get(i)
+            .map(crate::winsettings::tweak_enabled)
+            .unwrap_or(false)
+    }
+
+    fn tweak_flip(&mut self, i: usize) {
+        if let Some(t) = crate::winsettings::TWEAKS.get(i) {
+            crate::winsettings::set_tweak(t, !crate::winsettings::tweak_enabled(t));
+        }
         self.paint();
     }
 
@@ -532,6 +567,7 @@ impl SettingsApp {
                     Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
                     false,
                 ),
+                RowKind::Tweak(t) => (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false),
                 RowKind::Link(l) => (Some(Act::Link(l)), None, true),
                 RowKind::Info => (None, None, false),
             };
@@ -670,6 +706,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                     Some(Act::Toggle(t)) => app.flip(t),
                     Some(Act::Win(w)) => app.win_flip(w),
                     Some(Act::Startup(s)) => app.startup_flip(s),
+                    Some(Act::Tweak(t)) => app.tweak_flip(t),
                     Some(Act::Link(l)) => {
                         if let Some(e) = LINKS.get(l) {
                             crate::winsettings::launch(e.2);
