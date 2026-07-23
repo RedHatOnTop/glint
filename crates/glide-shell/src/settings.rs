@@ -44,38 +44,36 @@ const CATS: [(&str, u16); 7] = [
     ("작업 표시줄", 0xE7F4),
     ("시작 프로그램", 0xE7B5),
     ("Windows 조정", 0xE90F),
-    ("설정 · 도구", 0xE713),
     ("단축키", 0xE765),
+    ("고급 · 도구", 0xEC7A),
     ("시스템 정보", 0xE946),
 ];
 const CAT_PERSONALIZE: usize = 0;
 const CAT_TASKBAR: usize = 1;
 const CAT_STARTUP: usize = 2;
 const CAT_TWEAKS: usize = 3;
-const CAT_LINKS: usize = 4;
-const CAT_SHORTCUTS: usize = 5;
+const CAT_SHORTCUTS: usize = 4;
+const CAT_ADVANCED: usize = 5;
 const CAT_ABOUT: usize = 6;
 
 /// (label, subtitle, deep-link URI). The stock panels glide doesn't own yet —
 /// surfaced here so the settings app is one door to the whole system, and the
 /// fragmented Control Panel / ms-settings maze collapses into this list. Each
 /// opens via ShellExecute; ms-settings: URIs and control.exe applets both work.
-const LINKS: [(&str, &str, &str); 16] = [
-    ("네트워크 · 인터넷", "Wi-Fi, 이더넷, VPN, 프록시", "ms-settings:network"),
-    ("Bluetooth · 장치", "장치 추가, 프린터, 마우스", "ms-settings:bluetooth"),
-    ("소리", "출력·입력 장치, 앱별 볼륨 믹서", "ms-settings:sound"),
-    ("디스플레이", "해상도, 배율, 야간 모드, 다중 모니터", "ms-settings:display"),
-    ("전원 · 배터리", "전원 모드, 절전, 화면 끄기 시간", "ms-settings:powersleep"),
-    ("앱 · 기능", "설치된 앱 제거, 기본 앱", "ms-settings:appsfeatures"),
-    ("Windows 업데이트", "업데이트 확인, 기록, 일시 중지", "ms-settings:windowsupdate"),
-    ("시간 · 언어", "시간대, 지역, 키보드 레이아웃", "ms-settings:dateandtime"),
-    ("계정 · 로그인", "사용자, PIN, 로그인 옵션", "ms-settings:signinoptions"),
-    ("저장소", "디스크 사용량, 저장소 센스 정리", "ms-settings:storagesense"),
-    // Classic tools — the Control Panel bits ms-settings never absorbed.
+/// The classic Control Panel applets + power tools — the *utilitarian* Windows
+/// surface, routed through control.exe/.cpl/.msc, never ms-settings (that page
+/// is the ad billboard we're replacing, not linking back into). This is the
+/// fragmented Control Panel, reachable, ad-free.
+const LINKS: [(&str, &str, &str); 11] = [
+    ("네트워크 연결", "어댑터 · IP · 프록시 (ncpa.cpl)", "ncpa.cpl"),
+    ("소리 장치", "재생 · 녹음 · 기본 장치 (mmsys.cpl)", "mmsys.cpl"),
+    ("전원 옵션", "전원 계획 · 절전 동작 (powercfg.cpl)", "powercfg.cpl"),
+    ("프로그램 제거", "설치된 앱 제거 (appwiz.cpl)", "appwiz.cpl"),
+    ("날짜 · 시간", "시간대 · 인터넷 동기화 (timedate.cpl)", "timedate.cpl"),
+    ("제어판 (클래식 홈)", "모든 클래식 항목", "control.exe"),
     ("장치 관리자", "하드웨어 · 드라이버", "devmgmt.msc"),
     ("서비스", "백그라운드 서비스 시작 · 중지", "services.msc"),
     ("디스크 관리", "파티션 · 볼륨 · 드라이브 문자", "diskmgmt.msc"),
-    ("제어판 (클래식 전체)", "ms-settings로 안 옮겨진 나머지", "control.exe"),
     ("레지스트리 편집기", "고급 — regedit로 직접 편집", "regedit.exe"),
     ("glide 설정 폴더", "%APPDATA%\\glide-shell — 설정 파일 직접", "%APPDATA%\\glide-shell"),
 ];
@@ -331,7 +329,7 @@ impl SettingsApp {
                     kind: RowKind::Tweak(i),
                 })
                 .collect(),
-            CAT_LINKS => LINKS
+            CAT_ADVANCED => LINKS
                 .iter()
                 .enumerate()
                 .map(|(i, (title, sub, _))| Row {
