@@ -774,6 +774,28 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   BT/비행기/자동회전 토글(연결 끊김·화면 회전), 야간/설정 딥링크, 실클릭 WA_INACTIVE
   가드 다리. **함정: 새 PS 프로세스가 포그라운드를 뺏어 AC를 해제시킴 → 열기+스샷은
   반드시 한 프로세스에서(같은 프로세스가 sleep만 하면 포커스 유지).**
+- **tray overflow `^` chevron SHIPPED 0723 (65cb269)** *(유저 "당장 트레이 아이콘도
+  구현 안돼있잖아" → 트레이 프로토콜은 이미 구현+증명(199b55b 세션 트레이 rig)이었고,
+  진짜 갭 = 아이콘 많으면 바 넘침 → chevron 오버플로가 명확한 buildable 갭. 유저가
+  우선순위로 chevron 선택)*: 스트립은 `TRAY_MAX_VISIBLE`(6)까지만, 나머지는 `^`
+  chevron이 여는 그리드 플라이아웃(Win10/11 숨긴 아이콘 오버플로, 자체 호스팅).
+  ① `trayoverflow.rs` — flyout.rs 형제 팝업(자체 창/DWM 라운드·아크릴/해제 가드/
+  click-away/WA_INACTIVE). **아이콘 비트맵은 래스터화한 dc에 종속 → dc 간 못 넘김**,
+  그래서 바가 각 아이콘 HICON을 보관(`TrayIcon.hicon`)하고 플라이아웃이 demoted
+  아이콘을 **자기 dc에서 재래스터화**. refresh 타이머의 죽은-owner 스윕이 사라진
+  아이콘 제거+비면 자동 닫힘. ② `tray.rs` — 버전인지 Shell_NotifyIcon 콜백을
+  **`tray::forward` 자유함수로 추출**(demoted 아이콘 클릭이 스트립 아이콘과 동일 경로),
+  NIN_SELECT도 이관. ③ `taskbar.rs` — `tray_promoted`/`tray_overflow_ids`가 visible을
+  cap에서 분할, chevron 셀은 승격 아이콘 왼쪽에 위치하고 호버셋/상호배제/close_popups/
+  click_away 합류; **버튼 shrink(apply_overflow)는 이제 chevron까지(tray_cluster_left)**.
+  ④ clickaway: OVERFLOW_OPEN이 훅 조건 합류. **검증(posted 리그+스크린샷): 9개 주입 →
+  스트립 6 + `^` chevron 렌더, chevron 클릭 → 위에 앵커된 플라이아웃이 정확히 demoted 3개
+  + "숨긴 아이콘" 헤더 렌더(9−6=3), 아이콘 클릭 → forward 경로 실행+플라이아웃 hide
+  (visible True→False).** 미검증(도그푸드): 실입력 WA_INACTIVE 해제·실앱 클릭 왕복
+  (posted 입력은 activation 안 바꿈, 합성 아이콘은 실 owner 없음), ESC/우클릭 경로.
+  **함정: `WM_MOUSELEAVE`(=0x2A3)는 WindowsAndMessaging이 아니라 UI::Controls 소속 →
+  glob 임포트로 안 잡혀 match arm이 catch-all 바인딩이 되어 뒤 arm 전부 unreachable;
+  바/flyout처럼 로컬 const 정의로 우회. chevron device x는 formula 말고 스샷 실측(1434).**
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
