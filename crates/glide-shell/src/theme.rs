@@ -58,7 +58,18 @@ pub const ACTIVE_FILL: D2D1_COLOR_F = rgba(255, 255, 255, 0.05);
 pub const FLASH: D2D1_COLOR_F = rgba(224, 164, 80, 1.0);
 
 /// Logical (96-dpi) metrics. Scale by dpi/96 at use sites.
-pub const BAR_HEIGHT: f32 = 40.0;
+///
+/// Bar height is a density preset chosen in settings; baked at launch (the
+/// appbar strut and every offset derive from it). 0 compact, 1 normal, 2 large.
+static BAR_H: AtomicU32 = AtomicU32::new(40);
+
+pub fn set_bar_density(d: u8) {
+    BAR_H.store(match d { 0 => 34, 2 => 48, _ => 40 }, Ordering::Relaxed);
+}
+
+pub fn bar_height() -> f32 {
+    BAR_H.load(Ordering::Relaxed) as f32
+}
 pub const BUTTON_MAX_W: f32 = 176.0;
 pub const BUTTON_RADIUS: f32 = 6.0;
 pub const UNDERLINE_H: f32 = 3.0;

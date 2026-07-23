@@ -200,8 +200,13 @@ enum StatusCell {
 }
 
 pub fn run(claim_tray: bool) -> anyhow::Result<()> {
-    // Point the accent atom at the saved swatch before the first paint.
-    theme::set_accent(crate::config::load().accent);
+    // Point the accent + density atoms at the saved config before the first
+    // paint (density is baked here; changing it takes a relaunch).
+    {
+        let c = crate::config::load();
+        theme::set_accent(c.accent);
+        theme::set_bar_density(c.bar_density);
+    }
     unsafe {
         // Status cluster (volume/network) talks COM on this thread.
         let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -255,7 +260,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         let dpi = GetDpiForWindow(hwnd) as f32;
         let scale = dpi / 96.0;
         // Reserve a strut of panel + bottom gap, then float the slab inside it.
-        let strut = ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
+        let strut = ((theme::bar_height() + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
         let band = appbar_negotiate(hwnd, strut);
         let rect = panel_rect(band, scale);
         let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -599,7 +604,7 @@ pub(crate) fn appbar_requery(hwnd: HWND, height_px: i32, mon: RECT) -> RECT {
 /// strut's top so PANEL_MARGIN_BOTTOM of gap sits beneath it.
 pub(crate) fn panel_rect(band: RECT, scale: f32) -> RECT {
     let mx = (theme::PANEL_MARGIN_X * scale).round() as i32;
-    let ph = (theme::BAR_HEIGHT * scale).round() as i32;
+    let ph = (theme::bar_height() * scale).round() as i32;
     RECT {
         left: band.left + mx,
         top: band.top,
@@ -1922,7 +1927,7 @@ impl Bar {
         unsafe {
             let dpi = GetDpiForWindow(self.hwnd) as f32;
             let scale = dpi / 96.0;
-            let strut = ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
+            let strut = ((theme::bar_height() + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
             let band = {
                 let mon = primary_monitor_rect();
                 let mut abd = APPBARDATA {
@@ -1994,7 +1999,7 @@ impl Bar {
     /// solid backing so it reads as lifted above the row.
     fn draw_entry(&self, i: usize, cx: f32, floating: bool) {
         let r = &self.renderer;
-        let bar_h = theme::BAR_HEIGHT;
+        let bar_h = theme::bar_height();
         let e = &self.entries[i];
         let key = self.entry_keys[i];
         let a = self.anims.get(&key).copied().unwrap_or_default();
@@ -2125,7 +2130,7 @@ impl Bar {
     /// Status cluster between tray and clock: [한/A][net][vol][batt].
     fn draw_status(&self) {
         let r = &self.renderer;
-        let bar_h = theme::BAR_HEIGHT;
+        let bar_h = theme::bar_height();
         let cells = self.status_cells();
         let left = self.status_left();
         unsafe {
@@ -2241,7 +2246,7 @@ impl Bar {
                                 left: START_X,
                                 top: 4.0,
                                 right: START_X + START_BTN_W,
-                                bottom: theme::BAR_HEIGHT - 4.0,
+                                bottom: theme::bar_height() - 4.0,
                             },
                             radiusX: theme::BUTTON_RADIUS,
                             radiusY: theme::BUTTON_RADIUS,
@@ -2253,7 +2258,7 @@ impl Bar {
             let color = if engaged { theme::accent() } else { theme::TEXT };
             if let Ok(b) = r.brush(color) {
                 let cx = START_X + START_BTN_W / 2.0;
-                let cy = theme::BAR_HEIGHT / 2.0;
+                let cy = theme::bar_height() / 2.0;
                 for (dx, dy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                     let (sx, sy) = (cx + dx * 4.5, cy + dy * 4.5);
                     r.dc.FillRoundedRectangle(
@@ -2277,7 +2282,7 @@ impl Bar {
     fn paint(&mut self) {
         let r = &self.renderer;
         let scale = self.scale();
-        let bar_h = theme::BAR_HEIGHT;
+        let bar_h = theme::bar_height();
         unsafe {
             r.dc.BeginDraw();
             r.dc.Clear(Some(&theme::BAR_BG));
@@ -2419,7 +2424,15 @@ impl Bar {
             let hhmm: Vec<u16> = clock_time_string(&self.cfg, &now).encode_utf16().collect();
             let clock_left = self.clock_right_edge() - self.clock_w();
             let clock_right = self.clock_right_edge() - 8.0;
-            let (time_top, time_bot) = if self.cfg.clock_date { (4.0, 22.0) } else { (11.0, 33.0) };
+            // Centre the block within the (density-dependent) bar: a 33px
+            // two-line stack or an 18px single line.
+            let bar_h = theme::bar_height();
+            let time_top = if self.cfg.clock_date {
+                ((bar_h - 33.0) / 2.0).max(1.0)
+            } else {
+                ((bar_h - 18.0) / 2.0).max(1.0)
+            };
+            let time_bot = time_top + 18.0;
             if let Ok(b) = r.brush(theme::TEXT) {
                 r.dc.DrawText(
                     &hhmm,
@@ -2444,7 +2457,7 @@ impl Bar {
                     r.dc.DrawText(
                         &date,
                         &r.fmt_date,
-                        &D2D_RECT_F { left: clock_left, top: 22.0, right: clock_right, bottom: 37.0 },
+                        &D2D_RECT_F { left: clock_left, top: time_bot, right: clock_right, bottom: time_bot + 15.0 },
                         &b,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
@@ -2493,14 +2506,14 @@ impl Bar {
                 if self.desk_hover {
                     if let Ok(b) = r.brush(theme::rgba(255, 255, 255, theme::HOVER_FILL.a)) {
                         r.dc.FillRectangle(
-                            &D2D_RECT_F { left: sx, top: 0.0, right: self.width, bottom: theme::BAR_HEIGHT },
+                            &D2D_RECT_F { left: sx, top: 0.0, right: self.width, bottom: theme::bar_height() },
                             &b,
                         );
                     }
                 }
                 if let Ok(b) = r.brush(theme::rgba(255, 255, 255, 0.10)) {
                     r.dc.FillRectangle(
-                        &D2D_RECT_F { left: sx, top: 8.0, right: sx + 1.0, bottom: theme::BAR_HEIGHT - 8.0 },
+                        &D2D_RECT_F { left: sx, top: 8.0, right: sx + 1.0, bottom: theme::bar_height() - 8.0 },
                         &b,
                     );
                 }

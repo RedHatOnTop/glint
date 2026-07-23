@@ -103,7 +103,7 @@ impl Secondary {
             let scale = dpi / 96.0;
             // Floating slab, same as the primary bar: reserve BAR_HEIGHT +
             // PANEL_MARGIN_BOTTOM of strut, then inset the window into it.
-            let strut = ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
+            let strut = ((theme::bar_height() + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
             let band = crate::taskbar::appbar_negotiate_on(hwnd, strut, mon);
             let rect = crate::taskbar::panel_rect(band, scale);
             let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -152,7 +152,7 @@ impl Secondary {
             let dpi = GetDpiForWindow(self.hwnd) as f32;
             self.scale = dpi / 96.0;
             let strut =
-                ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * self.scale).round() as i32;
+                ((theme::bar_height() + theme::PANEL_MARGIN_BOTTOM) * self.scale).round() as i32;
             let band = crate::taskbar::appbar_requery(self.hwnd, strut, mi.rcMonitor);
             let rect = crate::taskbar::panel_rect(band, self.scale);
             let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -191,7 +191,7 @@ impl Secondary {
 
             for i in 0..self.entries.len() {
                 let x = BTN_X0 + i as f32 * BTN_W;
-                let rc = rect(x, 4.0, x + BTN_W - 4.0, theme::BAR_HEIGHT - 4.0);
+                let rc = rect(x, 4.0, x + BTN_W - 4.0, theme::bar_height() - 4.0);
                 let (key, active, flash) = {
                     let e = &self.entries[i];
                     (e.hwnd, e.active, e.flash)
@@ -210,9 +210,9 @@ impl Secondary {
                 let cx = x + (BTN_W - 4.0) / 2.0;
                 let ic = rect(
                     cx - ICON / 2.0,
-                    (theme::BAR_HEIGHT - ICON) / 2.0 - 2.0,
+                    (theme::bar_height() - ICON) / 2.0 - 2.0,
                     cx + ICON / 2.0,
-                    (theme::BAR_HEIGHT + ICON) / 2.0 - 2.0,
+                    (theme::bar_height() + ICON) / 2.0 - 2.0,
                 );
                 match icon {
                     Some(bmp) => r.dc.DrawBitmap(
@@ -239,9 +239,9 @@ impl Secondary {
                     self.fill_round(
                         rect(
                             cx - 8.0,
-                            theme::BAR_HEIGHT - theme::UNDERLINE_H - 1.0,
+                            theme::bar_height() - theme::UNDERLINE_H - 1.0,
                             cx + 8.0,
-                            theme::BAR_HEIGHT - 1.0,
+                            theme::bar_height() - 1.0,
                         ),
                         1.5,
                         color,
@@ -273,7 +273,7 @@ impl Secondary {
             self.text(
                 &date,
                 &r.fmt_date.clone(),
-                rect(cx0, 21.0, self.width - 10.0, theme::BAR_HEIGHT - 3.0),
+                rect(cx0, 21.0, self.width - 10.0, theme::bar_height() - 3.0),
                 theme::TEXT_DIM,
             );
 

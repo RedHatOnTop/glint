@@ -96,6 +96,7 @@ enum Act {
     Tweak(usize),
     Link(usize),
     Accent(u8),
+    Density(u8),
 }
 
 enum RowKind {
@@ -111,6 +112,8 @@ enum RowKind {
     Link(usize),
     /// The glide accent swatch strip; rendered as color circles, not a switch.
     Accent,
+    /// The bar-density segmented control (compact/normal/large).
+    Density,
     Info,
 }
 
@@ -140,6 +143,7 @@ pub struct SettingsApp {
     fmt_cat: IDWriteTextFormat,
     fmt_row: IDWriteTextFormat,
     fmt_sub: IDWriteTextFormat,
+    fmt_seg: IDWriteTextFormat,
     fmt_g16: IDWriteTextFormat,
     scale: f32,
     w: f32,
@@ -214,6 +218,11 @@ impl SettingsApp {
                 f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             }
+            // Centred label for the density segmented control.
+            let fmt_seg = mkv(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            fmt_seg.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            fmt_seg.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_seg.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let fmt_g16 = mk(w!("Segoe Fluent Icons"), 16.0, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe MDL2 Assets"), 16.0, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_g16.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
@@ -226,6 +235,7 @@ impl SettingsApp {
                 fmt_cat,
                 fmt_row,
                 fmt_sub,
+                fmt_seg,
                 fmt_g16,
                 scale,
                 w: (cw as f32) / scale,
@@ -315,6 +325,11 @@ impl SettingsApp {
                 win(WinTgl::TitleAccent, "제목 표시줄 강조색", "제목 표시줄과 창 테두리에 강조색 적용"),
             ],
             CAT_TASKBAR => vec![
+                Row {
+                    title: "바 밀도".to_string(),
+                    sub: "표시줄 높이 — 재시작 후 적용".to_string(),
+                    kind: RowKind::Density,
+                },
                 row(0),
                 row(1),
                 row(5),
@@ -483,6 +498,17 @@ impl SettingsApp {
         self.paint();
     }
 
+    fn density_pick(&mut self, d: u8) {
+        if self.cfg.bar_density == d {
+            return;
+        }
+        self.cfg.bar_density = d;
+        crate::config::save(&self.cfg);
+        // Density bakes into the appbar strut at launch, so no live nudge to the
+        // bar — the picker just reflects the new choice until the next start.
+        self.paint();
+    }
+
     fn hit(&self, x: f32, y: f32) -> Option<Act> {
         self.hits
             .iter()
@@ -630,20 +656,23 @@ impl SettingsApp {
             let card = rect(cx0, y, cx1, y + CARD_H);
             // act = clickable target; sw = switch state (toggle rows); link =
             // draw a chevron and open on click instead of a switch.
-            let (act, sw, link, accent): (Option<Act>, Option<bool>, bool, bool) = match row.kind {
-                RowKind::Toggle(t) => (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false, false),
-                RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false, false),
-                RowKind::Startup(s) => (
-                    Some(Act::Startup(s)),
-                    Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
-                    false,
-                    false,
-                ),
-                RowKind::Tweak(t) => (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false, false),
-                RowKind::Link(l) => (Some(Act::Link(l)), None, true, false),
-                RowKind::Accent => (None, None, false, true),
-                RowKind::Info => (None, None, false, false),
-            };
+            let (act, sw, link, accent, density): (Option<Act>, Option<bool>, bool, bool, Option<u8>) =
+                match row.kind {
+                    RowKind::Toggle(t) => (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false, false, None),
+                    RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false, false, None),
+                    RowKind::Startup(s) => (
+                        Some(Act::Startup(s)),
+                        Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
+                        false,
+                        false,
+                        None,
+                    ),
+                    RowKind::Tweak(t) => (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false, false, None),
+                    RowKind::Link(l) => (Some(Act::Link(l)), None, true, false, None),
+                    RowKind::Accent => (None, None, false, true, None),
+                    RowKind::Density => (None, None, false, false, Some(self.cfg.bar_density)),
+                    RowKind::Info => (None, None, false, false, None),
+                };
             let hot = act.map(|a| self.hover == Some(a)).unwrap_or(false);
             self.fill_round(card, 6.0, theme::rgba(255, 255, 255, if hot { 0.075 } else { 0.045 }));
             self.text(
@@ -678,6 +707,30 @@ impl SettingsApp {
                         rect(scx - 14.0, y, scx + 14.0, y + CARD_H),
                         Act::Accent(k as u8),
                     ));
+                }
+            }
+            if let Some(sel) = density {
+                // Three-segment pill, right-aligned; the chosen segment carries
+                // the accent, and each is its own hit target.
+                let labels = ["컴팩트", "보통", "크게"];
+                let seg_w = 58.0;
+                let seg_h = 30.0;
+                let gap = 4.0;
+                let cy = y + CARD_H / 2.0;
+                let total = seg_w * labels.len() as f32 + gap * (labels.len() as f32 - 1.0);
+                let x0 = cx1 - 14.0 - total;
+                for (k, lbl) in labels.iter().enumerate() {
+                    let sx = x0 + k as f32 * (seg_w + gap);
+                    let seg = rect(sx, cy - seg_h / 2.0, sx + seg_w, cy + seg_h / 2.0);
+                    let on = sel == k as u8;
+                    self.fill_round(seg, 6.0, if on { theme::accent() } else { theme::rgba(255, 255, 255, 0.08) });
+                    self.text(
+                        lbl,
+                        &self.fmt_seg.clone(),
+                        seg,
+                        if on { theme::rgba(23, 24, 28, 1.0) } else { theme::TEXT_DIM },
+                    );
+                    self.hits.push((seg, Act::Density(k as u8)));
                 }
             }
             if let Some(a) = act {
@@ -796,6 +849,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                     Some(Act::Startup(s)) => app.startup_flip(s),
                     Some(Act::Tweak(t)) => app.tweak_flip(t),
                     Some(Act::Accent(i)) => app.accent_pick(i),
+                    Some(Act::Density(d)) => app.density_pick(d),
                     Some(Act::Link(l)) => {
                         if let Some(e) = LINKS.get(l) {
                             crate::winsettings::launch(e.2);
