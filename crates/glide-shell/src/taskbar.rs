@@ -482,7 +482,7 @@ pub(crate) fn appbar_requery(hwnd: HWND, height_px: i32, mon: RECT) -> RECT {
 /// Inset the negotiated full-width strut into the floating slab: gaps on the
 /// left and right that the desktop shows through, and the panel pinned to the
 /// strut's top so PANEL_MARGIN_BOTTOM of gap sits beneath it.
-fn panel_rect(band: RECT, scale: f32) -> RECT {
+pub(crate) fn panel_rect(band: RECT, scale: f32) -> RECT {
     let mx = (theme::PANEL_MARGIN_X * scale).round() as i32;
     let ph = (theme::BAR_HEIGHT * scale).round() as i32;
     RECT {

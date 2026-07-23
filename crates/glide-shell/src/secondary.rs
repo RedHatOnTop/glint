@@ -14,7 +14,8 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{DWRITE_MEASURING_MODE_NATURAL, IDWriteTextFormat};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
@@ -90,11 +91,21 @@ impl Secondary {
             let backdrop: i32 = 3;
             let _ =
                 DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
+            let round = DWMWCP_ROUND.0;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &round as *const _ as _,
+                4,
+            );
 
             let dpi = GetDpiForWindow(hwnd) as f32;
             let scale = dpi / 96.0;
-            let bar_h = (theme::BAR_HEIGHT * scale).round() as i32;
-            let rect = crate::taskbar::appbar_negotiate_on(hwnd, bar_h, mon);
+            // Floating slab, same as the primary bar: reserve BAR_HEIGHT +
+            // PANEL_MARGIN_BOTTOM of strut, then inset the window into it.
+            let strut = ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * scale).round() as i32;
+            let band = crate::taskbar::appbar_negotiate_on(hwnd, strut, mon);
+            let rect = crate::taskbar::panel_rect(band, scale);
             let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
             MoveWindow(hwnd, rect.left, rect.top, w_px, h_px, true)?;
             let renderer = Renderer::new(hwnd, w_px as u32, h_px as u32, dpi)?;
@@ -140,8 +151,10 @@ impl Secondary {
             }
             let dpi = GetDpiForWindow(self.hwnd) as f32;
             self.scale = dpi / 96.0;
-            let bar_h = (theme::BAR_HEIGHT * self.scale).round() as i32;
-            let rect = crate::taskbar::appbar_requery(self.hwnd, bar_h, mi.rcMonitor);
+            let strut =
+                ((theme::BAR_HEIGHT + theme::PANEL_MARGIN_BOTTOM) * self.scale).round() as i32;
+            let band = crate::taskbar::appbar_requery(self.hwnd, strut, mi.rcMonitor);
+            let rect = crate::taskbar::panel_rect(band, self.scale);
             let (w_px, h_px) = (rect.right - rect.left, rect.bottom - rect.top);
             let _ = MoveWindow(self.hwnd, rect.left, rect.top, w_px, h_px, true);
             let _ = self.renderer.resize(w_px as u32, h_px as u32, dpi);
