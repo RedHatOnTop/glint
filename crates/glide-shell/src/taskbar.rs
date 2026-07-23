@@ -63,6 +63,11 @@ const BUTTON_MIN_W: f32 = 48.0;
 const CLOCK_W: f32 = 84.0;
 const LAUNCHER_W: f32 = 40.0;
 const TRAY_CELL_W: f32 = 24.0;
+/// Icons past this many stay on the strip; the rest fall into the overflow
+/// flyout behind the `^` chevron.
+const TRAY_MAX_VISIBLE: usize = 6;
+/// The `^` chevron cell, left of the promoted tray icons.
+const CHEVRON_W: f32 = 20.0;
 const STATUS_CELL_W: f32 = 26.0;
 const MENU_PIN: usize = 1;
 const MENU_UNPIN: usize = 2;
@@ -90,6 +95,9 @@ struct TrayIcon {
     callback: u32,
     version: u32,
     bitmap: Option<ID2D1Bitmap1>,
+    /// Kept so the overflow flyout, which draws on its own dc, can
+    /// re-rasterise a demoted icon (bitmaps don't cross device contexts).
+    hicon: isize,
     tip: String,
     hidden: bool,
 }
@@ -156,6 +164,8 @@ pub struct Bar {
     width: f32, // logical
     tray_icons: Vec<TrayIcon>,
     tray_hover: Option<usize>,
+    overflow: crate::trayoverflow::TrayOverflow,
+    chevron_hover: bool,
     status: crate::status::Status,
     status_hover: Option<usize>,
     preview: crate::preview::Preview,
@@ -264,6 +274,8 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             width: w_px as f32 / scale,
             tray_icons: Vec::new(),
             tray_hover: None,
+            overflow: crate::trayoverflow::TrayOverflow::new(dpi)?,
+            chevron_hover: false,
             status: crate::status::Status::new(),
             status_hover: None,
             preview: crate::preview::Preview::new(dpi)?,
@@ -522,20 +534,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     bar.drag_move(x);
                 } else {
                     let th = bar.tray_hit(x);
+                    let ch = bar.chevron_hit(x);
                     let sh = bar.status_hit(x);
                     let sth = th.is_none() && sh.is_none() && bar.start_hit(x);
                     let dh = bar.desk_hit(x);
                     let nh = bar.notif_hit(x);
-                    let eh = if th.is_none() && sh.is_none() { bar.hit_test(x) } else { None };
+                    let eh = if th.is_none() && sh.is_none() && !ch {
+                        bar.hit_test(x)
+                    } else {
+                        None
+                    };
                     let changed =
                         th != bar.tray_hover || sh != bar.status_hover || eh != bar.hover;
                     if th != bar.tray_hover
+                        || ch != bar.chevron_hover
                         || sh != bar.status_hover
                         || sth != bar.start_hover
                         || dh != bar.desk_hover
                         || nh != bar.notif_hover
                     {
                         bar.tray_hover = th;
+                        bar.chevron_hover = ch;
                         bar.status_hover = sh;
                         bar.start_hover = sth;
                         bar.desk_hover = dh;
@@ -566,6 +585,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 bar.preview.hide();
                 if bar.tray_hover.take().is_some()
                     | bar.status_hover.take().is_some()
+                    | std::mem::take(&mut bar.chevron_hover)
                     | std::mem::take(&mut bar.start_hover)
                     | std::mem::take(&mut bar.desk_hover)
                     | std::mem::take(&mut bar.notif_hover)
@@ -638,6 +658,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if bar.tray_icons.get(t).is_some_and(|i| i.version >= 4) {
                         bar.tray_forward(t, NIN_SELECT);
                     }
+                } else if bar.chevron_hit(x) {
+                    bar.chevron_toggle(hwnd);
                 } else if bar.start_hit(x) {
                     bar.start_toggle(hwnd, true);
                 } else if let Some(s) = bar.status_hit(x) {
@@ -868,6 +890,7 @@ impl Bar {
                             callback: 0,
                             version: 0,
                             bitmap: None,
+                            hicon: 0,
                             tip: String::new(),
                             hidden: false,
                         });
@@ -881,6 +904,7 @@ impl Bar {
                         windows::Win32::UI::WindowsAndMessaging::HICON(hicon as *mut _),
                     );
                     self.tray_icons[idx].bitmap = bmp;
+                    self.tray_icons[idx].hicon = hicon;
                 }
                 let t = &mut self.tray_icons[idx];
                 if flags & NIF_MESSAGE != 0 {
@@ -918,6 +942,22 @@ impl Bar {
         (0..self.tray_icons.len())
             .filter(|i| !self.tray_icons[*i].hidden)
             .collect()
+    }
+
+    /// Icons that ride the strip: the first TRAY_MAX_VISIBLE visible ones.
+    fn tray_promoted(&self) -> Vec<usize> {
+        let mut v = self.tray_visible();
+        v.truncate(TRAY_MAX_VISIBLE);
+        v
+    }
+
+    /// Icons demoted into the overflow flyout (visible, past the cap).
+    fn tray_overflow_ids(&self) -> Vec<usize> {
+        self.tray_visible().into_iter().skip(TRAY_MAX_VISIBLE).collect()
+    }
+
+    fn has_overflow(&self) -> bool {
+        self.tray_visible().len() > TRAY_MAX_VISIBLE
     }
 
     fn status_cells(&self) -> Vec<StatusCell> {
@@ -1005,57 +1045,90 @@ impl Bar {
         Some(((x - left) / STATUS_CELL_W) as usize)
     }
 
-    /// Logical x of the tray area's left edge.
+    /// Logical x of the promoted tray icons' left edge.
     fn tray_left(&self) -> f32 {
-        self.status_left() - (self.tray_visible().len() as f32 * TRAY_CELL_W) - 4.0
+        self.status_left() - (self.tray_promoted().len() as f32 * TRAY_CELL_W) - 4.0
     }
 
-    /// x → index into tray_icons.
+    /// Logical x of the `^` chevron cell's left edge (only meaningful when
+    /// `has_overflow`); the chevron sits just left of the promoted icons.
+    fn chevron_left(&self) -> f32 {
+        self.tray_left() - CHEVRON_W - 2.0
+    }
+
+    /// Leftmost x of the whole tray cluster, chevron included — the boundary
+    /// the running-window buttons may not cross.
+    fn tray_cluster_left(&self) -> f32 {
+        if self.has_overflow() {
+            self.chevron_left()
+        } else {
+            self.tray_left()
+        }
+    }
+
+    fn chevron_hit(&self, x: f32) -> bool {
+        self.has_overflow() && {
+            let left = self.chevron_left();
+            x >= left && x < left + CHEVRON_W
+        }
+    }
+
+    /// x → index into tray_icons (promoted strip only).
     fn tray_hit(&self, x: f32) -> Option<usize> {
-        let visible = self.tray_visible();
-        if visible.is_empty() {
+        let promoted = self.tray_promoted();
+        if promoted.is_empty() {
             return None;
         }
         let left = self.tray_left();
-        if x < left || x >= left + visible.len() as f32 * TRAY_CELL_W {
+        if x < left || x >= left + promoted.len() as f32 * TRAY_CELL_W {
             return None;
         }
         let cell = ((x - left) / TRAY_CELL_W) as usize;
-        visible.get(cell).copied()
+        promoted.get(cell).copied()
     }
 
-    /// Version-aware Shell_NotifyIcon callback: v4 packs coords in wParam and
-    /// (event, uid) in lParam; v0-v3 use (uid, event).
+    /// Deliver a tray callback to the promoted icon at `idx` (the overflow
+    /// flyout forwards its own via the same `tray::forward`).
     fn tray_forward(&self, idx: usize, event: u32) {
         let Some(t) = self.tray_icons.get(idx) else { return };
-        if t.callback == 0 {
-            return;
-        }
+        crate::tray::forward(t.owner, t.uid, t.callback, t.version, event);
+    }
+
+    /// Toggle the overflow flyout from the `^` chevron; guard-aware like the
+    /// other popups, mutually exclusive with them.
+    fn chevron_toggle(&mut self, hwnd: HWND) {
         unsafe {
-            // We are WS_EX_NOACTIVATE, so the click never made anyone
-            // foreground — hand our received-last-input right to the owner or
-            // its ShowWindow/SetForegroundWindow response gets denied.
-            let mut pid = 0u32;
-            let _ = GetWindowThreadProcessId(t.owner, Some(&mut pid));
-            if pid != 0 {
-                let _ = AllowSetForegroundWindow(pid);
-            }
-            if event == WM_RBUTTONDOWN {
-                // Owner's popup menu must be able to take foreground.
-                let _ = SetForegroundWindow(t.owner);
-            }
-            let (wparam, lparam) = if t.version >= 4 {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                (
-                    WPARAM((((pt.y as u32 as usize) & 0xFFFF) << 16) | (pt.x as u32 as usize & 0xFFFF)),
-                    LPARAM((((t.uid as isize) & 0xFFFF) << 16) | (event as isize & 0xFFFF)),
-                )
-            } else {
-                (WPARAM(t.uid as usize), LPARAM(event as isize))
-            };
-            let _ = SendNotifyMessageW(t.owner, t.callback, wparam, lparam);
+            let _ = KillTimer(Some(hwnd), TIMER_PREVIEW);
         }
+        self.preview.hide();
+        self.start.hide();
+        self.flyout.hide();
+        self.actioncenter.hide();
+        let srcs: Vec<crate::trayoverflow::Src> = self
+            .tray_overflow_ids()
+            .iter()
+            .map(|&i| {
+                let t = &self.tray_icons[i];
+                crate::trayoverflow::Src {
+                    owner: t.owner,
+                    uid: t.uid,
+                    callback: t.callback,
+                    version: t.version,
+                    hicon: t.hicon,
+                }
+            })
+            .collect();
+        let scale = self.scale();
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        // Right edge of the chevron cell in device px; the flyout grows up and
+        // left from there, like the status flyouts.
+        let anchor_right = rect.left + ((self.chevron_left() + CHEVRON_W) * scale) as i32;
+        let anchor_bottom = rect.top - (6.0 * scale) as i32;
+        self.overflow.toggle(srcs, anchor_right, anchor_bottom);
+        self.paint();
     }
 
     /// Rebuild entries with stable ordering: pins first (pin order), then
@@ -1209,7 +1282,7 @@ impl Bar {
         for e in &mut self.entries {
             e.width = e.full_width;
         }
-        let avail = self.tray_left() - ENTRY_X0 - 4.0;
+        let avail = self.tray_cluster_left() - ENTRY_X0 - 4.0;
         let total: f32 = self.entries.iter().map(|e| e.width + 4.0).sum();
         if total <= avail {
             return;
@@ -1233,10 +1306,15 @@ impl Bar {
     /// Dismiss the start menu and any flyout (clicks on non-toggle targets;
     /// the toggle buttons manage their own popup instead).
     fn close_popups(&mut self) {
-        if self.start.open || self.flyout.kind.is_some() || self.actioncenter.open {
+        if self.start.open
+            || self.flyout.kind.is_some()
+            || self.actioncenter.open
+            || self.overflow.open
+        {
             self.start.hide();
             self.flyout.hide();
             self.actioncenter.hide();
+            self.overflow.hide();
             self.paint();
         }
     }
@@ -1249,6 +1327,7 @@ impl Bar {
         self.preview.hide();
         self.start.hide();
         self.flyout.hide();
+        self.overflow.hide();
         let mut rect = RECT::default();
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rect);
@@ -1262,7 +1341,11 @@ impl Bar {
     /// nothing, clicks on this bar are left to its own handlers (which
     /// toggle), anything else dismisses.
     fn click_away(&mut self, pt: POINT) {
-        if !self.start.open && self.flyout.kind.is_none() && !self.actioncenter.open {
+        if !self.start.open
+            && self.flyout.kind.is_none()
+            && !self.actioncenter.open
+            && !self.overflow.open
+        {
             return;
         }
         let inside = |h: HWND| unsafe {
@@ -1277,12 +1360,14 @@ impl Bar {
             || (self.start.open && inside(self.start.hwnd()))
             || (self.flyout.kind.is_some() && inside(self.flyout.hwnd()))
             || (self.actioncenter.open && inside(self.actioncenter.hwnd()))
+            || (self.overflow.open && inside(self.overflow.hwnd()))
         {
             return;
         }
         self.start.dismiss();
         self.flyout.dismiss();
         self.actioncenter.dismiss();
+        self.overflow.dismiss();
         self.paint();
     }
 
@@ -1297,6 +1382,7 @@ impl Bar {
         self.preview.hide();
         self.flyout.hide();
         self.actioncenter.hide();
+        self.overflow.hide();
         if self.start.open {
             self.start.hide();
         } else if !(mouse && self.start.just_dismissed()) {
@@ -1319,6 +1405,7 @@ impl Bar {
         self.preview.hide();
         self.start.hide();
         self.actioncenter.hide();
+        self.overflow.hide();
         if self.flyout.kind == Some(kind) {
             self.flyout.hide();
         } else if !self.flyout.just_dismissed(kind) {
@@ -1399,8 +1486,8 @@ impl Bar {
             if icon.tip.is_empty() {
                 return;
             }
-            let visible = self.tray_visible();
-            let Some(cell) = visible.iter().position(|v| *v == ti) else { return };
+            let promoted = self.tray_promoted();
+            let Some(cell) = promoted.iter().position(|v| *v == ti) else { return };
             let center = self.tray_left() + cell as f32 * TRAY_CELL_W + TRAY_CELL_W / 2.0;
             let tip: Vec<u16> = icon.tip.encode_utf16().collect();
             self.preview.show_tip(Target::Tray(ti), &tip, anchor(center), rect.top);
@@ -2093,7 +2180,7 @@ impl Bar {
 
             // Tray cells, right of the running section, left of the clock.
             {
-                let visible = self.tray_visible();
+                let visible = self.tray_promoted();
                 let left = self.tray_left();
                 for (cell, idx) in visible.iter().enumerate() {
                     let t = &self.tray_icons[*idx];
@@ -2136,6 +2223,44 @@ impl Bar {
                             &b,
                         );
                     }
+                }
+            }
+
+            // `^` chevron for the overflow flyout, left of the promoted icons.
+            if self.has_overflow() {
+                let cx = self.chevron_left();
+                if self.chevron_hover || self.overflow.open {
+                    let fill = if self.chevron_hover {
+                        theme::HOVER_FILL
+                    } else {
+                        theme::ACTIVE_FILL
+                    };
+                    if let Ok(b) = r.brush(fill) {
+                        r.dc.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT {
+                                rect: D2D_RECT_F {
+                                    left: cx,
+                                    top: 7.0,
+                                    right: cx + CHEVRON_W,
+                                    bottom: bar_h - 7.0,
+                                },
+                                radiusX: 4.0,
+                                radiusY: 4.0,
+                            },
+                            &b,
+                        );
+                    }
+                }
+                let color = if self.overflow.open { theme::ACCENT } else { theme::TEXT_DIM };
+                if let Ok(b) = r.brush(color) {
+                    r.dc.DrawText(
+                        &[0xE70Eu16], // ChevronUp
+                        &r.fmt_glyph,
+                        &D2D_RECT_F { left: cx, top: 0.0, right: cx + CHEVRON_W, bottom: bar_h },
+                        &b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
                 }
             }
 

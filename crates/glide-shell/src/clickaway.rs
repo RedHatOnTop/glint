@@ -27,6 +27,7 @@ static BAR: AtomicIsize = AtomicIsize::new(0);
 static START_OPEN: AtomicBool = AtomicBool::new(false);
 static FLYOUT_OPEN: AtomicBool = AtomicBool::new(false);
 static AC_OPEN: AtomicBool = AtomicBool::new(false);
+static OVERFLOW_OPEN: AtomicBool = AtomicBool::new(false);
 
 pub fn set_start_open(v: bool) {
     START_OPEN.store(v, Ordering::Relaxed);
@@ -38,6 +39,10 @@ pub fn set_flyout_open(v: bool) {
 
 pub fn set_ac_open(v: bool) {
     AC_OPEN.store(v, Ordering::Relaxed);
+}
+
+pub fn set_overflow_open(v: bool) {
+    OVERFLOW_OPEN.store(v, Ordering::Relaxed);
 }
 
 /// Install on the taskbar thread; failure is non-fatal (popups then only
@@ -56,7 +61,8 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         if code >= 0
             && (START_OPEN.load(Ordering::Relaxed)
                 || FLYOUT_OPEN.load(Ordering::Relaxed)
-                || AC_OPEN.load(Ordering::Relaxed))
+                || AC_OPEN.load(Ordering::Relaxed)
+                || OVERFLOW_OPEN.load(Ordering::Relaxed))
         {
             let msg = wparam.0 as u32;
             if msg == WM_LBUTTONDOWN

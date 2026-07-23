@@ -9,12 +9,48 @@
 //! NOTIFYICONDATA in the **32-bit layout regardless of sender bitness** —
 //! hWnd/hIcon travel as u32. HICONs are USER objects, valid cross-process.
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 use crate::taskbar::Bar;
+
+/// NIN_SELECT — v4 icons act on this, not the raw button pair.
+pub const NIN_SELECT: u32 = 0x0400;
+
+/// Deliver one Shell_NotifyIcon callback to the icon's owner. The bar strip
+/// and the overflow flyout both route clicks through here so a demoted icon
+/// behaves identically to a promoted one. v4 packs coords in wParam and
+/// (uid, event) in lParam; v0–v3 use (uid, event) directly. We are
+/// WS_EX_NOACTIVATE, so hand the owner our foreground right or its own
+/// SetForegroundWindow (menus, restore) gets denied.
+pub fn forward(owner: HWND, uid: u32, callback: u32, version: u32, event: u32) {
+    if callback == 0 {
+        return;
+    }
+    unsafe {
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(owner, Some(&mut pid));
+        if pid != 0 {
+            let _ = AllowSetForegroundWindow(pid);
+        }
+        if event == WM_RBUTTONDOWN {
+            let _ = SetForegroundWindow(owner);
+        }
+        let (wparam, lparam) = if version >= 4 {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            (
+                WPARAM((((pt.y as u32 as usize) & 0xFFFF) << 16) | (pt.x as u32 as usize & 0xFFFF)),
+                LPARAM((((uid as isize) & 0xFFFF) << 16) | (event as isize & 0xFFFF)),
+            )
+        } else {
+            (WPARAM(uid as usize), LPARAM(event as isize))
+        };
+        let _ = SendNotifyMessageW(owner, callback, wparam, lparam);
+    }
+}
 
 pub const NIM_ADD: u32 = 0;
 pub const NIM_MODIFY: u32 = 1;

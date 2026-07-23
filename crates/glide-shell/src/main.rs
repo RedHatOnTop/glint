@@ -27,6 +27,7 @@ mod taskbar;
 mod theme;
 mod toasts;
 mod tray;
+mod trayoverflow;
 mod wifi;
 mod winkey;
 
