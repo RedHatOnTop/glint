@@ -235,7 +235,7 @@ impl Secondary {
                     }
                 }
                 if active || flash {
-                    let color = if flash { theme::FLASH } else { theme::ACCENT };
+                    let color = if flash { theme::FLASH } else { theme::accent() };
                     self.fill_round(
                         rect(
                             cx - 8.0,

@@ -36,6 +36,20 @@ use windows::core::{PCWSTR, w};
 use crate::render::Renderer;
 use crate::theme;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Live gate for own-notification toasts (settings: "알림 표시"). The worker
+/// keeps polling either way; this only decides whether arrivals become cards.
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_APP_TOAST: u32 = WM_APP + 11;
 const TIMER_LIFE: usize = 1;
@@ -186,6 +200,11 @@ impl Toasts {
     }
 
     fn on_arrivals(&mut self) {
+        if !enabled() {
+            // Toasts off: drain the channel so it never backs up, show nothing.
+            while self.arrivals.try_recv().is_ok() {}
+            return;
+        }
         let mut new = false;
         while let Ok(a) = self.arrivals.try_recv() {
             let title = a.texts.first().cloned().unwrap_or_default();
@@ -410,7 +429,7 @@ impl Toasts {
         self.fill_round(
             rect(rc.left + 6.0, rc.top + 10.0, rc.left + 9.0, rc.bottom - 10.0),
             1.5,
-            fade(theme::ACCENT),
+            fade(theme::accent()),
         );
 
         let x0 = rc.left + 20.0;

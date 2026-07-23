@@ -200,6 +200,8 @@ enum StatusCell {
 }
 
 pub fn run(claim_tray: bool) -> anyhow::Result<()> {
+    // Point the accent atom at the saved swatch before the first paint.
+    theme::set_accent(crate::config::load().accent);
     unsafe {
         // Status cluster (volume/network) talks COM on this thread.
         let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -325,6 +327,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         // Toast cards and the volume OSD live on this thread but own their
         // windows; the bar never needs to know about them.
         let mut toasts = crate::toasts::Toasts::new(dpi)?;
+        crate::toasts::set_enabled(bar.cfg.toasts_enabled);
         toasts.arm();
         let mut osd = crate::osd::Osd::new(dpi)?;
         osd.arm();
@@ -527,6 +530,27 @@ fn launch_exe(exe: &str) {
     let wide: Vec<u16> = exe.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+/// The clock's top line, honouring the 12/24-hour and seconds settings.
+/// 12-hour uses 오전/오후 rather than AM/PM.
+fn clock_time_string(cfg: &crate::config::Settings, now: &chrono::DateTime<chrono::Local>) -> String {
+    use chrono::Timelike;
+    if cfg.clock_24h {
+        now.format(if cfg.clock_seconds { "%H:%M:%S" } else { "%H:%M" }).to_string()
+    } else {
+        let h = now.hour();
+        let (ap, h12) = if h < 12 {
+            ("오전", if h == 0 { 12 } else { h })
+        } else {
+            ("오후", if h > 12 { h - 12 } else { h })
+        };
+        if cfg.clock_seconds {
+            format!("{ap} {h12}:{:02}:{:02}", now.minute(), now.second())
+        } else {
+            format!("{ap} {h12}:{:02}", now.minute())
+        }
     }
 }
 
@@ -892,6 +916,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             crate::settings::WM_SETTINGS_CHANGED => {
                 bar.cfg = crate::config::load();
+                theme::set_accent(bar.cfg.accent);
+                crate::toasts::set_enabled(bar.cfg.toasts_enabled);
                 bar.refresh();
                 bar.rebuild_secondaries();
                 bar.paint();
@@ -1090,7 +1116,12 @@ impl Bar {
 
     /// Clock cell width; seconds need the wider cut.
     fn clock_w(&self) -> f32 {
-        if self.cfg.clock_seconds { 110.0 } else { CLOCK_W }
+        match (self.cfg.clock_24h, self.cfg.clock_seconds) {
+            (true, false) => CLOCK_W,
+            (true, true) => 110.0,
+            (false, false) => 108.0,
+            (false, true) => 132.0,
+        }
     }
 
     /// Logical x of the status cluster's left edge (right of it: clock).
@@ -2032,7 +2063,7 @@ impl Bar {
                     None,
                     None,
                 );
-            } else if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.5 * opacity)) {
+            } else if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.5 * opacity)) {
                 r.dc.FillRoundedRectangle(
                     &D2D1_ROUNDED_RECT { rect: icon_rect, radiusX: 4.0, radiusY: 4.0 },
                     &b,
@@ -2070,7 +2101,7 @@ impl Bar {
                 let (color, alpha) = if e.flash {
                     (theme::FLASH, 1.0)
                 } else {
-                    (theme::ACCENT, 0.5 + 0.5 * a.active)
+                    (theme::accent(), 0.5 + 0.5 * a.active)
                 };
                 if let Ok(b) = r.brush(theme::with_alpha(color, alpha)) {
                     r.dc.FillRoundedRectangle(
@@ -2139,7 +2170,7 @@ impl Bar {
                     StatusCell::Ime => {
                         let hangul = self.status.ime_hangul == Some(true);
                         let (s, color) = if hangul {
-                            ("한", theme::ACCENT)
+                            ("한", theme::accent())
                         } else {
                             ("A", theme::TEXT)
                         };
@@ -2182,7 +2213,7 @@ impl Bar {
                     StatusCell::Bat => {
                         if let Some((pct, on_ac)) = self.status.battery {
                             let color = if on_ac {
-                                theme::ACCENT
+                                theme::accent()
                             } else if pct <= 20 {
                                 theme::FLASH
                             } else {
@@ -2219,7 +2250,7 @@ impl Bar {
                     );
                 }
             }
-            let color = if engaged { theme::ACCENT } else { theme::TEXT };
+            let color = if engaged { theme::accent() } else { theme::TEXT };
             if let Ok(b) = r.brush(color) {
                 let cx = START_X + START_BTN_W / 2.0;
                 let cy = theme::BAR_HEIGHT / 2.0;
@@ -2252,7 +2283,7 @@ impl Bar {
             r.dc.Clear(Some(&theme::BAR_BG));
 
             // Top hairline: 1px accent-tinted separation from content above.
-            if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.25)) {
+            if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.25)) {
                 r.dc.FillRectangle(
                     &D2D_RECT_F { left: 0.0, top: 0.0, right: self.width, bottom: 1.0 / scale },
                     &b,
@@ -2367,7 +2398,7 @@ impl Bar {
                         );
                     }
                 }
-                let color = if self.overflow.open { theme::ACCENT } else { theme::TEXT_DIM };
+                let color = if self.overflow.open { theme::accent() } else { theme::TEXT_DIM };
                 if let Ok(b) = r.brush(color) {
                     r.dc.DrawText(
                         &[0xE70Eu16], // ChevronUp
@@ -2382,43 +2413,43 @@ impl Bar {
 
             self.draw_status();
 
-            // Clock block, right-aligned: HH:MM over M/D (요일).
+            // Clock block, right-aligned: time over M/D (요일). The date line is
+            // optional; without it the time centres in the bar.
             let now = chrono::Local::now();
-            let hhmm: Vec<u16> = now
-                .format(if self.cfg.clock_seconds { "%H:%M:%S" } else { "%H:%M" })
-                .to_string()
-                .encode_utf16()
-                .collect();
-            let wd = ["월", "화", "수", "목", "금", "토", "일"]
-                [chrono::Datelike::weekday(&now).num_days_from_monday() as usize];
-            let date: Vec<u16> = format!(
-                "{}/{} ({wd})",
-                chrono::Datelike::month(&now),
-                chrono::Datelike::day(&now)
-            )
-            .encode_utf16()
-            .collect();
+            let hhmm: Vec<u16> = clock_time_string(&self.cfg, &now).encode_utf16().collect();
             let clock_left = self.clock_right_edge() - self.clock_w();
             let clock_right = self.clock_right_edge() - 8.0;
+            let (time_top, time_bot) = if self.cfg.clock_date { (4.0, 22.0) } else { (11.0, 33.0) };
             if let Ok(b) = r.brush(theme::TEXT) {
                 r.dc.DrawText(
                     &hhmm,
                     &r.fmt_clock,
-                    &D2D_RECT_F { left: clock_left, top: 4.0, right: clock_right, bottom: 22.0 },
+                    &D2D_RECT_F { left: clock_left, top: time_top, right: clock_right, bottom: time_bot },
                     &b,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
-            if let Ok(b) = r.brush(theme::TEXT_DIM) {
-                r.dc.DrawText(
-                    &date,
-                    &r.fmt_date,
-                    &D2D_RECT_F { left: clock_left, top: 22.0, right: clock_right, bottom: 37.0 },
-                    &b,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+            if self.cfg.clock_date {
+                let wd = ["월", "화", "수", "목", "금", "토", "일"]
+                    [chrono::Datelike::weekday(&now).num_days_from_monday() as usize];
+                let date: Vec<u16> = format!(
+                    "{}/{} ({wd})",
+                    chrono::Datelike::month(&now),
+                    chrono::Datelike::day(&now)
+                )
+                .encode_utf16()
+                .collect();
+                if let Ok(b) = r.brush(theme::TEXT_DIM) {
+                    r.dc.DrawText(
+                        &date,
+                        &r.fmt_date,
+                        &D2D_RECT_F { left: clock_left, top: 22.0, right: clock_right, bottom: 37.0 },
+                        &b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
             }
 
             // Action-center bell, right of the clock.
@@ -2443,7 +2474,7 @@ impl Bar {
                         );
                     }
                 }
-                let color = if self.actioncenter.open { theme::ACCENT } else { theme::TEXT };
+                let color = if self.actioncenter.open { theme::accent() } else { theme::TEXT };
                 if let Ok(b) = r.brush(color) {
                     r.dc.DrawText(
                         &[0xE7E7u16], // Ringer

@@ -395,8 +395,8 @@ impl Desktop {
             for (i, item) in self.items.iter().enumerate() {
                 let cell = rect(item.x, item.y, item.x + CELL_W, item.y + CELL_H);
                 if item.selected {
-                    fill_round(r, cell, 6.0, theme::with_alpha(theme::ACCENT, 0.22));
-                    if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.7)) {
+                    fill_round(r, cell, 6.0, theme::with_alpha(theme::accent(), 0.22));
+                    if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.7)) {
                         r.dc.DrawRoundedRectangle(
                             &D2D1_ROUNDED_RECT { rect: cell, radiusX: 6.0, radiusY: 6.0 },
                             &b,
@@ -439,10 +439,10 @@ impl Desktop {
 
             if let Some(m) = &self.marquee {
                 let sel = rect(m.x0.min(m.x1), m.y0.min(m.y1), m.x0.max(m.x1), m.y0.max(m.y1));
-                if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.12)) {
+                if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.12)) {
                     r.dc.FillRectangle(&sel, &b);
                 }
-                if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.6)) {
+                if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.6)) {
                     r.dc.DrawRectangle(&sel, &b, 1.0, None);
                 }
             }

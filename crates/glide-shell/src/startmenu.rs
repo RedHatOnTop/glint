@@ -1431,7 +1431,7 @@ impl StartMenu {
 
             // Header: search echo while typing, else title + hint.
             if !self.query.is_empty() {
-                self.text(&[0xE721], &self.fmt_glyph, rect(16.0, 0.0, 40.0, HEADER_H), theme::ACCENT);
+                self.text(&[0xE721], &self.fmt_glyph, rect(16.0, 0.0, 40.0, HEADER_H), theme::accent());
                 let q: Vec<u16> = self.query.encode_utf16().collect();
                 self.text(&q, &self.fmt_head, rect(44.0, 0.0, self.w - 60.0, HEADER_H), theme::TEXT);
                 let n: Vec<u16> = format!("{}", self.results.len()).encode_utf16().collect();
@@ -1568,7 +1568,7 @@ impl StartMenu {
                 } else {
                     rect(TILES_X0 - 6.0, self.list_top(), TILES_X0 - 2.0, self.list_top() + TILE)
                 };
-                self.fill_round(rc, 2.0, theme::ACCENT);
+                self.fill_round(rc, 2.0, theme::accent());
             }
             Some(DropSpot::Into(i)) => {
                 let items = self.tile_items();
@@ -1588,7 +1588,7 @@ impl StartMenu {
                     } else {
                         return;
                     };
-                    self.fill_round(rc, 2.0, theme::ACCENT);
+                    self.fill_round(rc, 2.0, theme::accent());
                 }
             }
             Some(DropSpot::OutOfFolder) => {
@@ -1631,7 +1631,7 @@ impl StartMenu {
 
     fn accent_outline(&self, rc: D2D_RECT_F) {
         unsafe {
-            if let Ok(b) = self.renderer.brush(theme::ACCENT) {
+            if let Ok(b) = self.renderer.brush(theme::accent()) {
                 self.renderer.dc.DrawRoundedRectangle(
                     &D2D1_ROUNDED_RECT { rect: rc, radiusX: 3.0, radiusY: 3.0 },
                     &b,
@@ -1793,7 +1793,7 @@ impl StartMenu {
                 self.fill_round(
                     rect(8.0, y + 1.0, SPLIT_X - 12.0, y + ROW_H - 1.0),
                     6.0,
-                    theme::with_alpha(theme::ACCENT, 0.22),
+                    theme::with_alpha(theme::accent(), 0.22),
                 );
             } else if self.hover == Some(Act::Result(i)) {
                 self.fill_round(
@@ -1841,7 +1841,7 @@ impl StartMenu {
                         label,
                         &self.fmt_section,
                         rect(18.0, y, SPLIT_X - 12.0, y + SECTION_H),
-                        theme::ACCENT,
+                        theme::accent(),
                     );
                 }
                 Row::App(_) | Row::Freq(_) => {

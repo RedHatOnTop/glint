@@ -62,6 +62,7 @@ fn main() -> anyhow::Result<()> {
                 let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
                     windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
                 );
+                theme::set_accent(config::load().accent);
                 let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem() as f32;
                 let mut app = settings::SettingsApp::new(dpi)?;
                 app.open(windows::Win32::Foundation::HWND(std::ptr::null_mut()));

@@ -2,6 +2,7 @@
 //! crates/glide/src/theme.rs — keep the two in sync by hand; this crate
 //! cannot depend on egui types.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
 pub const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
@@ -13,8 +14,40 @@ pub const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {
     }
 }
 
-/// glide ACCENT (70,192,202) — teal.
-pub const ACCENT: D2D1_COLOR_F = rgba(70, 192, 202, 1.0);
+/// glide accent swatches (KDE-style). Index 0 (teal) is the default; the
+/// settings app writes the chosen index to config and calls `set_accent`.
+pub const ACCENT_PRESETS: [(&str, u8, u8, u8); 8] = [
+    ("틸", 70, 192, 202),
+    ("블루", 77, 144, 254),
+    ("퍼플", 167, 139, 250),
+    ("핑크", 244, 114, 182),
+    ("그린", 52, 199, 123),
+    ("오렌지", 251, 146, 60),
+    ("레드", 248, 113, 113),
+    ("그래파이트", 148, 163, 184),
+];
+
+/// Current accent, packed 0x00RRGGBB. Read on every paint via `accent()`.
+static ACCENT_RGB: AtomicU32 = AtomicU32::new(0x0046C0CA);
+
+/// Point the accent at a preset index (out-of-range falls back to teal).
+pub fn set_accent(idx: u8) {
+    let (_, r, g, b) = ACCENT_PRESETS
+        .get(idx as usize)
+        .copied()
+        .unwrap_or(ACCENT_PRESETS[0]);
+    ACCENT_RGB.store(
+        ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+        Ordering::Relaxed,
+    );
+}
+
+/// The live accent colour. Was a const; now runtime so the picker applies
+/// without a relaunch.
+pub fn accent() -> D2D1_COLOR_F {
+    let v = ACCENT_RGB.load(Ordering::Relaxed);
+    rgba((v >> 16) as u8, (v >> 8) as u8, v as u8, 1.0)
+}
 /// glide SURFACE (23,24,28), at partial alpha so DWM acrylic reads through.
 pub const BAR_BG: D2D1_COLOR_F = rgba(23, 24, 28, 0.72);
 pub const TEXT: D2D1_COLOR_F = rgba(232, 233, 238, 1.0);

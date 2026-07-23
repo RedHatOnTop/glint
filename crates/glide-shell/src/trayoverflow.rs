@@ -266,7 +266,7 @@ impl TrayOverflow {
             let r = &self.renderer;
             r.dc.BeginDraw();
             r.dc.Clear(Some(&theme::rgba(26, 27, 32, 0.9)));
-            if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.25)) {
+            if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.25)) {
                 r.dc.FillRectangle(&rect(0.0, 0.0, self.w, 1.0 / self.scale), &b);
             }
         }

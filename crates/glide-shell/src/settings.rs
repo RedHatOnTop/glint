@@ -94,6 +94,7 @@ enum Act {
     Startup(usize),
     Tweak(usize),
     Link(usize),
+    Accent(u8),
 }
 
 enum RowKind {
@@ -107,6 +108,8 @@ enum RowKind {
     Tweak(usize),
     /// Index into LINKS — a deep-link to a stock panel; opens on click.
     Link(usize),
+    /// The glide accent swatch strip; rendered as color circles, not a switch.
+    Accent,
     Info,
 }
 
@@ -118,12 +121,15 @@ struct Row {
 
 /// Toggle id → (category, title, sub). Ids are stable; `flip` maps them onto
 /// config fields.
-const TOGGLES: [(&str, &str); 5] = [
+const TOGGLES: [(&str, &str); 8] = [
     ("창 버튼 라벨", "끄면 Win10 기본처럼 아이콘만 표시"),
-    ("시계 초 표시", "시계를 HH:MM:SS로"),
+    ("시계 초 표시", "시계를 초까지 표시"),
     ("바탕화면 보기 버튼", "바 오른쪽 끝 슬리버 — 클릭 = 전체 최소화/복원"),
     ("보조 모니터 작업 표시줄", "모니터마다 아이콘 전용 바 + 시계"),
     ("Win 키로 시작 메뉴 열기", "끄면 Win 키가 glint 검색을 엽니다 (Win+S는 항상 검색)"),
+    ("24시간제 시계", "끄면 오전/오후 12시간제"),
+    ("시계에 날짜 표시", "끄면 시간만 표시 (날짜 줄 숨김)"),
+    ("알림 표시", "앱 알림을 glide 토스트로 — 끄면 조용히"),
 ];
 
 pub struct SettingsApp {
@@ -295,13 +301,27 @@ impl SettingsApp {
             kind: RowKind::Win(w),
         };
         let info = |title: &str, sub: String| Row { title: title.to_string(), sub, kind: RowKind::Info };
+        let accent = || Row {
+            title: "glide 강조색".to_string(),
+            sub: "바 · 스위치 · 강조 전반에 쓰이는 색 — 즉시 적용".to_string(),
+            kind: RowKind::Accent,
+        };
         match self.cat {
             CAT_PERSONALIZE => vec![
+                accent(),
                 win(WinTgl::Dark, "어두운 모드", "앱·시스템을 어두운 테마로 — Windows 설정과 동기화"),
                 win(WinTgl::Transparency, "투명 효과", "창·패널 배경의 아크릴/미카 투명"),
                 win(WinTgl::TitleAccent, "제목 표시줄 강조색", "제목 표시줄과 창 테두리에 강조색 적용"),
             ],
-            CAT_TASKBAR => vec![row(0), row(1), row(2), row(3)],
+            CAT_TASKBAR => vec![
+                row(0),
+                row(1),
+                row(5),
+                row(6),
+                row(2),
+                row(3),
+                row(7),
+            ],
             CAT_STARTUP => {
                 if self.startup.is_empty() {
                     vec![info(
@@ -408,7 +428,10 @@ impl SettingsApp {
             1 => self.cfg.clock_seconds,
             2 => self.cfg.desk_sliver,
             3 => self.cfg.secondary_bars,
-            _ => self.cfg.winkey_start,
+            4 => self.cfg.winkey_start,
+            5 => self.cfg.clock_24h,
+            6 => self.cfg.clock_date,
+            _ => self.cfg.toasts_enabled,
         }
     }
 
@@ -418,8 +441,31 @@ impl SettingsApp {
             1 => self.cfg.clock_seconds = !self.cfg.clock_seconds,
             2 => self.cfg.desk_sliver = !self.cfg.desk_sliver,
             3 => self.cfg.secondary_bars = !self.cfg.secondary_bars,
-            _ => self.cfg.winkey_start = !self.cfg.winkey_start,
+            4 => self.cfg.winkey_start = !self.cfg.winkey_start,
+            5 => self.cfg.clock_24h = !self.cfg.clock_24h,
+            6 => self.cfg.clock_date = !self.cfg.clock_date,
+            _ => self.cfg.toasts_enabled = !self.cfg.toasts_enabled,
         }
+        crate::config::save(&self.cfg);
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.bar as *mut _)),
+                WM_SETTINGS_CHANGED,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        self.paint();
+    }
+
+    fn accent_pick(&mut self, idx: u8) {
+        if self.cfg.accent == idx {
+            return;
+        }
+        self.cfg.accent = idx;
+        // Apply to this window immediately, persist, and nudge the bar so its
+        // accent changes without a relaunch.
+        crate::theme::set_accent(idx);
         crate::config::save(&self.cfg);
         unsafe {
             let _ = PostMessageW(
@@ -485,7 +531,7 @@ impl SettingsApp {
     /// Win11 switch: 44×22 pill, accent when on, knob slides.
     fn switch(&self, right: f32, cy: f32, on: bool) {
         let pill = D2D_RECT_F { left: right - 44.0, top: cy - 11.0, right, bottom: cy + 11.0 };
-        self.fill_round(pill, 11.0, if on { theme::ACCENT } else { theme::rgba(255, 255, 255, 0.14) });
+        self.fill_round(pill, 11.0, if on { theme::accent() } else { theme::rgba(255, 255, 255, 0.14) });
         unsafe {
             let c = if on { theme::rgba(23, 24, 28, 1.0) } else { theme::rgba(200, 203, 210, 1.0) };
             if let Ok(b) = self.renderer.brush(c) {
@@ -497,6 +543,28 @@ impl SettingsApp {
                     },
                     &b,
                 );
+            }
+        }
+    }
+
+    /// A colour circle for the accent picker; `sel` draws a white ring.
+    fn swatch(&self, cx: f32, cy: f32, c: D2D1_COLOR_F, sel: bool) {
+        unsafe {
+            if let Ok(b) = self.renderer.brush(c) {
+                self.renderer.dc.FillEllipse(
+                    &D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: 10.0, radiusY: 10.0 },
+                    &b,
+                );
+            }
+            if sel {
+                if let Ok(b) = self.renderer.brush(theme::rgba(255, 255, 255, 0.95)) {
+                    self.renderer.dc.DrawEllipse(
+                        &D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: 13.0, radiusY: 13.0 },
+                        &b,
+                        2.0,
+                        None,
+                    );
+                }
             }
         }
     }
@@ -526,7 +594,7 @@ impl SettingsApp {
                 self.fill_round(
                     rect(8.0, y + 12.0, 11.0, y + NAV_ITEM_H - 12.0),
                     1.5,
-                    theme::ACCENT,
+                    theme::accent(),
                 );
             } else if self.hover == Some(Act::Nav(i)) {
                 self.fill_round(item, 6.0, theme::HOVER_FILL);
@@ -557,17 +625,19 @@ impl SettingsApp {
             let card = rect(cx0, y, cx1, y + CARD_H);
             // act = clickable target; sw = switch state (toggle rows); link =
             // draw a chevron and open on click instead of a switch.
-            let (act, sw, link): (Option<Act>, Option<bool>, bool) = match row.kind {
-                RowKind::Toggle(t) => (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false),
-                RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false),
+            let (act, sw, link, accent): (Option<Act>, Option<bool>, bool, bool) = match row.kind {
+                RowKind::Toggle(t) => (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false, false),
+                RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false, false),
                 RowKind::Startup(s) => (
                     Some(Act::Startup(s)),
                     Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
                     false,
+                    false,
                 ),
-                RowKind::Tweak(t) => (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false),
-                RowKind::Link(l) => (Some(Act::Link(l)), None, true),
-                RowKind::Info => (None, None, false),
+                RowKind::Tweak(t) => (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false, false),
+                RowKind::Link(l) => (Some(Act::Link(l)), None, true, false),
+                RowKind::Accent => (None, None, false, true),
+                RowKind::Info => (None, None, false, false),
             };
             let hot = act.map(|a| self.hover == Some(a)).unwrap_or(false);
             self.fill_round(card, 6.0, theme::rgba(255, 255, 255, if hot { 0.075 } else { 0.045 }));
@@ -589,6 +659,21 @@ impl SettingsApp {
             if link {
                 // ChevronRight — the Win11 "opens elsewhere" affordance.
                 self.glyph(0xE76C, rect(cx1 - 44.0, y, cx1 - 12.0, y + CARD_H), theme::TEXT_DIM);
+            }
+            if accent {
+                // Swatch strip, right-aligned in the card; each circle is its
+                // own hit target.
+                let cy = y + CARD_H / 2.0;
+                let n = theme::ACCENT_PRESETS.len();
+                let gap = 30.0;
+                for (k, (_, r8, g8, b8)) in theme::ACCENT_PRESETS.iter().enumerate() {
+                    let scx = cx1 - 26.0 - ((n - 1 - k) as f32) * gap;
+                    self.swatch(scx, cy, theme::rgba(*r8, *g8, *b8, 1.0), self.cfg.accent as usize == k);
+                    self.hits.push((
+                        rect(scx - 14.0, y, scx + 14.0, y + CARD_H),
+                        Act::Accent(k as u8),
+                    ));
+                }
             }
             if let Some(a) = act {
                 self.hits.push((card, a));
@@ -705,6 +790,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                     Some(Act::Win(w)) => app.win_flip(w),
                     Some(Act::Startup(s)) => app.startup_flip(s),
                     Some(Act::Tweak(t)) => app.tweak_flip(t),
+                    Some(Act::Accent(i)) => app.accent_pick(i),
                     Some(Act::Link(l)) => {
                         if let Some(e) = LINKS.get(l) {
                             crate::winsettings::launch(e.2);

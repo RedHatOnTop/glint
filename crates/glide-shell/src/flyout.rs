@@ -708,7 +708,7 @@ impl Flyout {
             let r = &self.renderer;
             r.dc.BeginDraw();
             r.dc.Clear(Some(&theme::rgba(26, 27, 32, 0.9)));
-            if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.25)) {
+            if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.25)) {
                 r.dc.FillRectangle(
                     &rect(0.0, 0.0, self.w, 1.0 / self.scale),
                     &b,
@@ -756,7 +756,7 @@ impl Flyout {
                     self.fill_round(row, 6.0, theme::HOVER_FILL);
                 }
                 if *default {
-                    self.glyph(0xE73E, &self.fmt_g16.clone(), rect(14.0, y, 44.0, y + DEV_ROW_H), theme::ACCENT);
+                    self.glyph(0xE73E, &self.fmt_g16.clone(), rect(14.0, y, 44.0, y + DEV_ROW_H), theme::accent());
                 }
                 let tc = if *default { theme::TEXT } else { theme::TEXT_DIM };
                 self.text(name, &self.renderer.fmt_title.clone(), rect(52.0, y, 330.0, y + DEV_ROW_H), tc);
@@ -784,10 +784,10 @@ impl Flyout {
         self.fill_round(
             rect(track.left, track.top, fx.max(track.left + 2.0), track.bottom),
             2.0,
-            if muted { theme::rgba(148, 152, 162, 1.0) } else { theme::ACCENT },
+            if muted { theme::rgba(148, 152, 162, 1.0) } else { theme::accent() },
         );
         unsafe {
-            let color = if muted { theme::TEXT_DIM } else { theme::ACCENT };
+            let color = if muted { theme::TEXT_DIM } else { theme::accent() };
             if let Ok(b) = self.renderer.brush(color) {
                 self.renderer.dc.FillEllipse(
                     &D2D1_ELLIPSE {
@@ -814,7 +814,7 @@ impl Flyout {
         self.fill_round(
             pill,
             11.0,
-            if on { theme::ACCENT } else { theme::rgba(255, 255, 255, 0.15) },
+            if on { theme::accent() } else { theme::rgba(255, 255, 255, 0.15) },
         );
         unsafe {
             let c = if on { theme::rgba(23, 24, 28, 1.0) } else { theme::TEXT_DIM };
@@ -848,13 +848,13 @@ impl Flyout {
                 if self.hover == Some(Act::Row(i)) {
                     self.fill_round(row, 6.0, theme::HOVER_FILL);
                 }
-                let gc = if n.connected { theme::ACCENT } else { theme::TEXT };
+                let gc = if n.connected { theme::accent() } else { theme::TEXT };
                 self.glyph(wifi_glyph(n.signal), &self.fmt_g16.clone(), rect(14.0, y, 44.0, y + ROW_H), gc);
                 self.text(&n.ssid, &self.renderer.fmt_title.clone(), rect(52.0, y, 236.0, y + ROW_H), theme::TEXT);
                 if self.connecting.as_deref() == Some(n.ssid.as_str()) && !n.connected {
                     self.text_right("연결 중…", rect(240.0, y, 330.0, y + ROW_H), theme::TEXT_DIM);
                 } else if n.connected {
-                    self.text_right("연결됨", rect(240.0, y, 330.0, y + ROW_H), theme::ACCENT);
+                    self.text_right("연결됨", rect(240.0, y, 330.0, y + ROW_H), theme::accent());
                 } else if n.secured {
                     self.glyph(0xE72E, &self.fmt_g16.clone(), rect(306.0, y, 330.0, y + ROW_H), theme::TEXT_DIM);
                 }
@@ -929,7 +929,7 @@ impl Flyout {
         let wd = ["월", "화", "수", "목", "금", "토", "일"]
             [now.weekday().num_days_from_monday() as usize];
         let date = format!("{}년 {}월 {}일 {}요일", now.year(), now.month(), now.day(), wd);
-        self.text(&date, &self.renderer.fmt_title.clone(), rect(16.0, 52.0, 328.0, 76.0), theme::ACCENT);
+        self.text(&date, &self.renderer.fmt_title.clone(), rect(16.0, 52.0, 328.0, 76.0), theme::accent());
 
         self.fill_round(rect(14.0, 84.0, 330.0, 85.0), 0.0, theme::rgba(255, 255, 255, 0.08));
 
@@ -968,7 +968,7 @@ impl Flyout {
                 self.fill_round(
                     rect(cell.left + px, cell.top + 2.0, cell.right - px, cell.bottom - 2.0),
                     4.0,
-                    theme::ACCENT,
+                    theme::accent(),
                 );
             }
             let c = if d == today {

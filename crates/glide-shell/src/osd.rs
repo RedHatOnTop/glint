@@ -376,7 +376,7 @@ impl Osd {
             let fill = if dim_fill {
                 fade(theme::with_alpha(theme::TEXT_DIM, 0.6))
             } else {
-                fade(theme::ACCENT)
+                fade(theme::accent())
             };
             let fx = tx0 + (tx1 - tx0) * frac;
             if fx > tx0 {

@@ -201,7 +201,7 @@ impl Preview {
             let lw = w as f32 / self.scale;
             r.dc.BeginDraw();
             r.dc.Clear(Some(&theme::rgba(26, 27, 32, 0.86)));
-            if let Ok(b) = r.brush(theme::with_alpha(theme::ACCENT, 0.25)) {
+            if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.25)) {
                 r.dc.FillRectangle(
                     &D2D_RECT_F { left: 0.0, top: 0.0, right: lw, bottom: 1.0 / self.scale },
                     &b,
