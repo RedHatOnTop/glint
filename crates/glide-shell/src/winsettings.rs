@@ -177,6 +177,34 @@ pub fn set_startup_enabled(item: &StartupItem, enabled: bool) {
     set_approved(subkey, &name, enabled);
 }
 
+// ---- glide's own logon autostart -------------------------------------------
+
+/// HKCU\Run value name for glide's bar. Distinct from the shell registration
+/// (safety::register writes Winlogon Shell=); this just launches the bar at
+/// logon alongside explorer, for daily-driving before a full swap.
+const GLIDE_RUN_NAME: &str = "glide-shell";
+
+pub fn glide_autostart() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN, KEY_READ)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>(GLIDE_RUN_NAME).ok())
+        .is_some()
+}
+
+pub fn set_glide_autostart(on: bool) {
+    let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(RUN) else {
+        return;
+    };
+    if on {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = k.set_value(GLIDE_RUN_NAME, &exe.to_string_lossy().to_string());
+        }
+    } else {
+        let _ = k.delete_value(GLIDE_RUN_NAME);
+    }
+}
+
 // ---- system info (About) ---------------------------------------------------
 
 /// (label, value) rows for the About page — the System control-panel applet,

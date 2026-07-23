@@ -84,6 +84,7 @@ enum WinTgl {
     Dark,
     Transparency,
     TitleAccent,
+    GlideAutostart,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -323,22 +324,24 @@ impl SettingsApp {
                 row(7),
             ],
             CAT_STARTUP => {
+                let mut v = vec![win(
+                    WinTgl::GlideAutostart,
+                    "로그온 시 glide 자동 시작",
+                    "Windows 시작과 함께 glide 바 실행 (HKCU\\Run — explorer와 병행)",
+                )];
                 if self.startup.is_empty() {
-                    vec![info(
-                        "등록된 시작 프로그램 없음",
-                        "로그온 시 자동 실행되는 앱이 없습니다".to_string(),
-                    )]
+                    v.push(info(
+                        "그 밖의 시작 프로그램 없음",
+                        "로그온 시 자동 실행되는 다른 앱이 없습니다".to_string(),
+                    ));
                 } else {
-                    self.startup
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| Row {
-                            title: s.name.clone(),
-                            sub: trunc(&s.detail, 78),
-                            kind: RowKind::Startup(i),
-                        })
-                        .collect()
+                    v.extend(self.startup.iter().enumerate().map(|(i, s)| Row {
+                        title: s.name.clone(),
+                        sub: trunc(&s.detail, 78),
+                        kind: RowKind::Startup(i),
+                    }));
                 }
+                v
             }
             CAT_TWEAKS => crate::winsettings::TWEAKS
                 .iter()
@@ -386,6 +389,7 @@ impl SettingsApp {
             WinTgl::Dark => crate::winsettings::dark_mode(),
             WinTgl::Transparency => crate::winsettings::transparency(),
             WinTgl::TitleAccent => crate::winsettings::title_accent(),
+            WinTgl::GlideAutostart => crate::winsettings::glide_autostart(),
         }
     }
 
@@ -395,6 +399,7 @@ impl SettingsApp {
             WinTgl::Dark => crate::winsettings::set_dark_mode(!now),
             WinTgl::Transparency => crate::winsettings::set_transparency(!now),
             WinTgl::TitleAccent => crate::winsettings::set_title_accent(!now),
+            WinTgl::GlideAutostart => crate::winsettings::set_glide_autostart(!now),
         }
         self.paint();
     }
