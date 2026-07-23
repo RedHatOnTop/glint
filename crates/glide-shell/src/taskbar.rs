@@ -34,11 +34,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::Shell::{
-    ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA, SHAppBarMessage,
-    ShellExecuteW,
+    ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA, IShellLinkW,
+    SHAppBarMessage, ShellExecuteW, ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, PCWSTR, PWSTR, w};
+use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READ,
+};
+use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+use windows::core::{BOOL, Interface, PCWSTR, PWSTR, w};
 
 use crate::render::Renderer;
 use crate::{icons, theme};
@@ -352,14 +357,100 @@ fn pins_path() -> std::path::PathBuf {
 }
 
 fn load_pins() -> Vec<String> {
-    std::fs::read_to_string(pins_path())
-        .map(|s| {
-            s.lines()
-                .map(|l| l.trim().to_lowercase())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    if let Ok(s) = std::fs::read_to_string(pins_path()) {
+        return s
+            .lines()
+            .map(|l| l.trim().to_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
+    // First run: no pins.txt yet. Seed from the user's existing Windows
+    // taskbar so the swap starts with the same pinned apps they already had,
+    // not an empty dock. Persist it so later pin/unpin edits stick and we
+    // never re-import over the user's choices.
+    let imported = import_windows_taskbar_pins();
+    if !imported.is_empty() {
+        save_pins(&imported);
+    }
+    imported
+}
+
+/// The user's Windows taskbar pins live as .lnk shortcuts under Quick Launch\
+/// User Pinned\TaskBar. Resolve each to its target exe path (glide's pin model
+/// is exe-keyed). Win32 exes only — UWP/Store pins carry an AppUserModelID
+/// with no filesystem path and are skipped. COM is already STA on this thread
+/// (Bar::run CoInitializeEx'd before load_pins), so resolve inline.
+fn import_windows_taskbar_pins() -> Vec<String> {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return Vec::new();
+    };
+    let dir = std::path::PathBuf::from(appdata)
+        .join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut lnks: Vec<std::path::PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")))
+        .collect();
+    // The real taskbar order is an opaque Taskband\Favorites registry blob;
+    // filename order is a stable-enough first cut (the user can drag to reorder).
+    lnks.sort();
+    let mut out = Vec::new();
+    for lnk in &lnks {
+        if let Some(exe) = resolve_lnk_target(lnk) {
+            let lc = exe.to_lowercase();
+            if lc.ends_with(".exe") && !out.contains(&lc) {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
+/// Target exe of a .lnk via IShellLink, RAWPATH so it reads the stored path
+/// without a resolve search (fast, no UI, no network probe).
+fn resolve_lnk_target(lnk: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let pf: IPersistFile = link.cast().ok()?;
+        let wpath: Vec<u16> = lnk.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        pf.Load(PCWSTR(wpath.as_ptr()), STGM_READ).ok()?;
+        let mut buf = [0u16; 260];
+        let mut fd = WIN32_FIND_DATAW::default();
+        const SLGP_RAWPATH: u32 = 4;
+        link.GetPath(&mut buf, &mut fd, SLGP_RAWPATH).ok()?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        if len == 0 {
+            return None;
+        }
+        // ExpandEnvironmentStrings: raw paths can carry %windir% etc.
+        let raw = String::from_utf16_lossy(&buf[..len]);
+        Some(expand_env(&raw))
+    }
+}
+
+fn expand_env(s: &str) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe {
+        let src: Vec<u16> = std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let need = ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), None);
+        if need == 0 {
+            return s.to_string();
+        }
+        let mut dst = vec![0u16; need as usize];
+        let got = ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut dst));
+        if got == 0 {
+            return s.to_string();
+        }
+        let len = dst.iter().position(|&c| c == 0).unwrap_or(dst.len());
+        String::from_utf16_lossy(&dst[..len])
+    }
 }
 
 fn save_pins(pins: &[String]) {
