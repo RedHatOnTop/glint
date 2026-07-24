@@ -1,2 +1,14 @@
+# Build output
 /target
 /build.err
+
+# Rust
+**/*.rs.bk
+*.pdb
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
