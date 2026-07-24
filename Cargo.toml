@@ -60,6 +60,10 @@ windows = { version = "0.62.2", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_System_Environment",
     "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Services",
     "Win32_Graphics_Imaging",
     "Win32_System_Wmi",
 ] }

@@ -5,25 +5,31 @@
 //! re-runs: UserNotificationListener passed PASS-POLLING on this box 0721.
 
 mod actioncenter;
+mod apps;
 mod audiopolicy;
 mod autostart;
 mod clickaway;
 mod config;
+mod datetime;
 mod desktop;
 mod flyout;
 mod icons;
 mod osd;
+mod power;
 mod preview;
+mod procs;
 mod quicksettings;
 mod render;
 mod safety;
 mod secondary;
+mod services;
 mod settings;
 mod shellmenu;
 mod spike_toasts;
 mod startmenu;
 mod status;
 mod taskbar;
+mod taskmgr;
 mod theme;
 mod toasts;
 mod tray;
@@ -66,6 +72,31 @@ fn main() -> anyhow::Result<()> {
                 let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem() as f32;
                 let mut app = settings::SettingsApp::new(dpi)?;
                 app.open(windows::Win32::Foundation::HWND(std::ptr::null_mut()));
+                let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+                while windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0)
+                    .into()
+                {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                }
+            }
+            Ok(())
+        }
+        Some("--taskmgr") => {
+            // Standalone glide Task Manager (also how the settings 서비스 / 작업
+            // 관리자 entries open it — a spawned `glide-shell --taskmgr`).
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                );
+                let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                    windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                );
+                theme::set_accent(config::load().accent);
+                let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem() as f32;
+                let mut app = taskmgr::TaskManagerApp::new(dpi)?;
+                app.open();
                 let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
                 while windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0)
                     .into()

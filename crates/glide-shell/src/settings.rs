@@ -21,25 +21,31 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::ValidateRect;
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 use windows_numerics::Vector2;
 
+use crate::quicksettings::{self, RadioSnapshot, Tri};
 use crate::render::Renderer;
 use crate::theme;
+use crate::wifi::Wifi;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Bar reloads settings.txt when it receives this.
 pub const WM_SETTINGS_CHANGED: u32 = WM_APP + 14;
 
-const NAV_W: f32 = 250.0;
-const NAV_ITEM_H: f32 = 40.0;
 const CARD_H: f32 = 68.0;
 const CARD_GAP: f32 = 4.0;
+/// Samsung two-pane master list: pane width, an icon row's height, and the gap
+/// a group separator occupies.
+const NAV_W2: f32 = 340.0;
+const NAV_ROW_H: f32 = 50.0;
+const NAV_SEP: f32 = 15.0;
 
-const CATS: [(&str, u16); 7] = [
+const CATS: [(&str, u16); 12] = [
     ("개인화", 0xE771),
     ("작업 표시줄", 0xE7F4),
     ("시작 프로그램", 0xE7B5),
@@ -47,6 +53,11 @@ const CATS: [(&str, u16); 7] = [
     ("단축키", 0xE765),
     ("고급 · 도구", 0xEC7A),
     ("시스템 정보", 0xE946),
+    ("소리", 0xE767),
+    ("전원 · 배터리", 0xE83E),
+    ("네트워크", 0xE839),
+    ("앱 · 프로그램", 0xE71D),
+    ("날짜 · 시간", 0xE917),
 ];
 const CAT_PERSONALIZE: usize = 0;
 const CAT_TASKBAR: usize = 1;
@@ -55,6 +66,11 @@ const CAT_TWEAKS: usize = 3;
 const CAT_SHORTCUTS: usize = 4;
 const CAT_ADVANCED: usize = 5;
 const CAT_ABOUT: usize = 6;
+const CAT_SOUND: usize = 7;
+const CAT_POWER: usize = 8;
+const CAT_NETWORK: usize = 9;
+const CAT_APPS: usize = 10;
+const CAT_DATETIME: usize = 11;
 
 /// (label, subtitle, deep-link URI). The stock panels glide doesn't own yet —
 /// surfaced here so the settings app is one door to the whole system, and the
@@ -78,6 +94,65 @@ const LINKS: [(&str, &str, &str); 11] = [
     ("glide 설정 폴더", "%APPDATA%\\glide-shell — 설정 파일 직접", "%APPDATA%\\glide-shell"),
 ];
 
+/// One landing row: a vivid round icon + label, Samsung-settings style. A row
+/// either drills into a glide detail category or launches a classic panel.
+struct HomeRow {
+    label: &'static str,
+    glyph: u16,
+    color: (u8, u8, u8),
+    act: HomeAct,
+}
+#[derive(Clone, Copy)]
+enum HomeAct {
+    Cat(usize),
+    Link(usize),
+    /// Opens the glide Task Manager (processes + services).
+    TaskMgr,
+}
+
+/// The landing, grouped into cards the way Samsung's settings clusters rows.
+/// Network / sound / power / apps sit at the top level here, not buried.
+const HOME: &[&[HomeRow]] = &[
+    &[
+        HomeRow { label: "네트워크", glyph: 0xE839, color: (46, 127, 239), act: HomeAct::Cat(CAT_NETWORK) },
+        HomeRow { label: "소리", glyph: 0xE767, color: (245, 146, 60), act: HomeAct::Cat(CAT_SOUND) },
+        HomeRow { label: "전원 · 배터리", glyph: 0xE83E, color: (52, 199, 123), act: HomeAct::Cat(CAT_POWER) },
+    ],
+    &[
+        HomeRow { label: "개인화", glyph: 0xE771, color: (244, 114, 182), act: HomeAct::Cat(CAT_PERSONALIZE) },
+        HomeRow { label: "작업 표시줄", glyph: 0xE7F4, color: (70, 192, 202), act: HomeAct::Cat(CAT_TASKBAR) },
+    ],
+    &[
+        HomeRow { label: "앱 · 프로그램", glyph: 0xE71D, color: (167, 139, 250), act: HomeAct::Cat(CAT_APPS) },
+        HomeRow { label: "시작 프로그램", glyph: 0xE7B5, color: (99, 102, 241), act: HomeAct::Cat(CAT_STARTUP) },
+    ],
+    &[
+        HomeRow { label: "Windows 조정", glyph: 0xE90F, color: (100, 116, 139), act: HomeAct::Cat(CAT_TWEAKS) },
+        HomeRow { label: "날짜 · 시간", glyph: 0xE917, color: (34, 211, 238), act: HomeAct::Cat(CAT_DATETIME) },
+        HomeRow { label: "제어판 (클래식)", glyph: 0xE713, color: (148, 163, 184), act: HomeAct::Link(5) },
+    ],
+    &[
+        HomeRow { label: "작업 관리자", glyph: 0xE9D9, color: (251, 191, 36), act: HomeAct::TaskMgr },
+        HomeRow { label: "장치 관리자", glyph: 0xE772, color: (59, 130, 246), act: HomeAct::Link(6) },
+        HomeRow { label: "디스크 관리", glyph: 0xEDA2, color: (16, 185, 129), act: HomeAct::Link(8) },
+        HomeRow { label: "레지스트리 편집기", glyph: 0xE943, color: (244, 63, 94), act: HomeAct::Link(9) },
+    ],
+    &[
+        HomeRow { label: "단축키", glyph: 0xE765, color: (139, 92, 246), act: HomeAct::Cat(CAT_SHORTCUTS) },
+        HomeRow { label: "시스템 정보", glyph: 0xE946, color: (56, 189, 248), act: HomeAct::Cat(CAT_ABOUT) },
+        HomeRow { label: "glide 설정 폴더", glyph: 0xE8B7, color: (148, 163, 184), act: HomeAct::Link(10) },
+    ],
+];
+
+/// Flattened landing rows matching the current query (all rows when empty).
+fn home_matches(query: &str) -> Vec<&'static HomeRow> {
+    let q = query.trim();
+    HOME.iter()
+        .flat_map(|g| g.iter())
+        .filter(|r| q.is_empty() || r.label.contains(q))
+        .collect()
+}
+
 /// A Windows-side toggle (registry-backed), distinct from glide's own config.
 #[derive(Clone, Copy, PartialEq)]
 enum WinTgl {
@@ -95,8 +170,32 @@ enum Act {
     Startup(usize),
     Tweak(usize),
     Link(usize),
+    Panel(usize),
     Accent(u8),
     Density(u8),
+    /// Volume-slider track; the click x maps to a level within [l, r].
+    Vol { l: f32, r: f32 },
+    /// The mute button next to the volume slider.
+    Mute,
+    /// Pick cached render endpoint `i` as the default output device.
+    AudioDev(usize),
+    /// Activate cached power scheme `i`.
+    PowerPlan(usize),
+    /// Wi-Fi software radio toggle.
+    WifiRadio,
+    /// Connect to cached network `i` (or open the flyout for an unsaved one).
+    WifiNet(usize),
+    /// Bluetooth radio toggle.
+    Bluetooth,
+    /// Airplane-mode toggle.
+    Airplane,
+    /// Launch the uninstaller for cached app `i`.
+    App(usize),
+    /// Switch to cached time zone `i`.
+    TimeZone(usize),
+    /// Open the glide Task Manager.
+    TaskMgr,
+    Search,
 }
 
 enum RowKind {
@@ -114,6 +213,24 @@ enum RowKind {
     Accent,
     /// The bar-density segmented control (compact/normal/large).
     Density,
+    /// Master-volume slider + mute button for the default output.
+    Volume,
+    /// A selectable render endpoint (index into `audio_devs`).
+    AudioDev(usize),
+    /// A selectable power scheme (index into `power_plans`).
+    PowerPlan(usize),
+    /// Wi-Fi software-radio switch.
+    WifiRadio,
+    /// An available network (index into `net.nets`).
+    WifiNet(usize),
+    /// Bluetooth radio switch.
+    Bluetooth,
+    /// Airplane-mode switch.
+    Airplane,
+    /// An installed program (index into `apps`); click launches its uninstaller.
+    App(usize),
+    /// A selectable time zone (index into `zones`).
+    TimeZone(usize),
     Info,
 }
 
@@ -121,6 +238,36 @@ struct Row {
     title: String,
     sub: String,
     kind: RowKind,
+}
+
+/// Cached network state for the 네트워크 pane. Wi-Fi comes from wlanapi (any
+/// apartment); the radios come from WinRT gathered on an MTA worker.
+struct NetState {
+    wifi_present: bool,
+    wifi_on: bool,
+    nets: Vec<crate::wifi::Net>,
+    bt: Tri,
+    airplane: Tri,
+}
+
+impl Default for NetState {
+    fn default() -> Self {
+        NetState { wifi_present: false, wifi_on: false, nets: Vec::new(), bt: Tri::Absent, airplane: Tri::Absent }
+    }
+}
+
+/// Run a WinRT/COM job on a short-lived MTA thread and block for its result —
+/// the settings UI thread is STA, and `Windows.Devices.Radios` async joins
+/// deadlock there. Returns None only if the worker itself panicked.
+fn on_mta<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        f()
+    })
+    .join()
+    .ok()
 }
 
 /// Toggle id → (category, title, sub). Ids are stable; `flip` maps them onto
@@ -139,7 +286,6 @@ const TOGGLES: [(&str, &str); 8] = [
 pub struct SettingsApp {
     hwnd: HWND,
     renderer: Renderer,
-    fmt_app: IDWriteTextFormat,
     fmt_cat: IDWriteTextFormat,
     fmt_row: IDWriteTextFormat,
     fmt_sub: IDWriteTextFormat,
@@ -148,13 +294,35 @@ pub struct SettingsApp {
     scale: f32,
     w: f32,
     h: f32,
+    /// Selected glide category shown in the right pane (when `panel` is None).
     cat: usize,
+    /// When Some, the right pane shows a launch card for LINKS[panel] instead of
+    /// a category; the matching master row is highlighted.
+    panel: Option<usize>,
+    /// Live filter typed into the master-list search pill (committed chars).
+    query: String,
     hover: Option<Act>,
     tracking: bool,
     hits: Vec<(D2D_RECT_F, Act)>,
     cfg: crate::config::Settings,
     startup: Vec<crate::winsettings::StartupItem>,
+    /// Render endpoints, cached on entry to the 소리 pane (COM enumerate is slow).
+    audio_devs: Vec<crate::audiopolicy::Endpoint>,
+    /// Default-output volume/mute, cached alongside `audio_devs`.
+    vol: Option<(f32, bool)>,
+    /// Power schemes, cached on entry to the 전원 pane.
+    power_plans: Vec<crate::power::Plan>,
+    /// Wi-Fi + radio state, cached on entry to the 네트워크 pane.
+    net: NetState,
+    /// Installed programs, cached on entry to the 앱 pane.
+    apps: Vec<crate::apps::App>,
+    /// Time zones, cached on entry to the 날짜·시간 pane.
+    zones: Vec<crate::datetime::Zone>,
+    /// Right-pane detail scroll; the master list has its own `nav_scroll`.
     scroll: f32,
+    nav_scroll: f32,
+    /// Last cursor client-x (logical), to route the wheel to a pane.
+    mouse_x: f32,
     bar: isize,
 }
 
@@ -210,11 +378,10 @@ impl SettingsApp {
             };
             let family = w!("Segoe UI Variable");
             let mkv = |size, weight| mk(family, size, weight).or_else(|_| mk(w!("Segoe UI"), size, weight));
-            let fmt_app = mkv(14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let fmt_cat = mkv(24.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             let fmt_row = mkv(13.5, DWRITE_FONT_WEIGHT_NORMAL)?;
             let fmt_sub = mkv(11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
-            for f in [&fmt_app, &fmt_cat, &fmt_row, &fmt_sub] {
+            for f in [&fmt_cat, &fmt_row, &fmt_sub] {
                 f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             }
@@ -231,7 +398,6 @@ impl SettingsApp {
             Ok(SettingsApp {
                 hwnd,
                 renderer,
-                fmt_app,
                 fmt_cat,
                 fmt_row,
                 fmt_sub,
@@ -241,12 +407,22 @@ impl SettingsApp {
                 w: (cw as f32) / scale,
                 h: (ch as f32) / scale,
                 cat: 0,
+                panel: None,
+                query: String::new(),
                 hover: None,
                 tracking: false,
                 hits: Vec::new(),
                 cfg: crate::config::load(),
                 startup: Vec::new(),
+                audio_devs: Vec::new(),
+                vol: None,
+                power_plans: Vec::new(),
+                net: NetState::default(),
+                apps: Vec::new(),
+                zones: Vec::new(),
                 scroll: 0.0,
+                nav_scroll: 0.0,
+                mouse_x: 0.0,
                 bar: 0,
             })
         }
@@ -257,6 +433,10 @@ impl SettingsApp {
         self.cfg = crate::config::load();
         self.startup = crate::winsettings::list_startup();
         self.scroll = 0.0;
+        self.nav_scroll = 0.0;
+        self.cat = 0;
+        self.panel = None;
+        self.query.clear();
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut SettingsApp as isize);
             if !IsWindowVisible(self.hwnd).as_bool() {
@@ -395,6 +575,141 @@ impl SettingsApp {
                 v.push(info("크래시 로그", "%APPDATA%\\glide-shell\\crash.log".to_string()));
                 v
             }
+            CAT_SOUND => {
+                let sub = match self.vol {
+                    Some((v, true)) => format!("음소거됨 · {}%", (v * 100.0).round() as u32),
+                    Some((v, false)) => format!("{}%", (v * 100.0).round() as u32),
+                    None => "기본 출력 장치 없음".to_string(),
+                };
+                let mut v = vec![Row { title: "볼륨".to_string(), sub, kind: RowKind::Volume }];
+                if self.audio_devs.is_empty() {
+                    v.push(info("출력 장치 없음", "재생 가능한 오디오 장치가 없습니다".to_string()));
+                } else {
+                    v.extend(self.audio_devs.iter().enumerate().map(|(i, d)| Row {
+                        title: if d.name.is_empty() { "(이름 없는 장치)".to_string() } else { d.name.clone() },
+                        sub: if d.default { "기본 출력 장치".to_string() } else { "탭하여 기본으로 설정".to_string() },
+                        kind: RowKind::AudioDev(i),
+                    }));
+                }
+                v
+            }
+            CAT_POWER => {
+                let bat = crate::power::battery();
+                let mut v = vec![if bat.present {
+                    let state = if bat.charging {
+                        "충전 중"
+                    } else if bat.ac {
+                        "전원 연결됨"
+                    } else {
+                        "배터리 사용 중"
+                    };
+                    info("배터리", format!("{}% · {}", bat.percent, state))
+                } else {
+                    info("배터리", "배터리 없음 — 상시 전원 (데스크톱)".to_string())
+                }];
+                if self.power_plans.is_empty() {
+                    v.push(info("전원 계획 없음", "powrprof에서 계획을 읽지 못했습니다".to_string()));
+                } else {
+                    v.extend(self.power_plans.iter().enumerate().map(|(i, p)| Row {
+                        title: if p.name.is_empty() { "(이름 없는 계획)".to_string() } else { p.name.clone() },
+                        sub: if p.active { "현재 활성 계획".to_string() } else { "탭하여 이 계획으로 전환".to_string() },
+                        kind: RowKind::PowerPlan(i),
+                    }));
+                }
+                v
+            }
+            CAT_NETWORK => {
+                let mut v = Vec::new();
+                if self.net.wifi_present {
+                    v.push(Row {
+                        title: "Wi‑Fi".to_string(),
+                        sub: if self.net.wifi_on {
+                            "켜짐 — 사용 가능한 네트워크".to_string()
+                        } else {
+                            "꺼짐".to_string()
+                        },
+                        kind: RowKind::WifiRadio,
+                    });
+                    if self.net.wifi_on {
+                        if self.net.nets.is_empty() {
+                            v.push(info("검색된 네트워크 없음", "잠시 후 다시 열면 목록이 채워집니다".to_string()));
+                        } else {
+                            v.extend(self.net.nets.iter().enumerate().map(|(i, n)| {
+                                let mut tags = format!("{}%", n.signal);
+                                if n.secured {
+                                    tags.push_str(" · 보안");
+                                }
+                                if n.connected {
+                                    tags.push_str(" · 연결됨");
+                                } else if n.profile.is_some() {
+                                    tags.push_str(" · 저장됨");
+                                }
+                                Row { title: n.ssid.clone(), sub: tags, kind: RowKind::WifiNet(i) }
+                            }));
+                        }
+                    }
+                } else {
+                    v.push(info("Wi‑Fi 없음", "무선 어댑터를 찾지 못했습니다".to_string()));
+                }
+                if self.net.bt.present() {
+                    v.push(Row {
+                        title: "Bluetooth".to_string(),
+                        sub: if self.net.bt.is_on() { "켜짐".to_string() } else { "꺼짐".to_string() },
+                        kind: RowKind::Bluetooth,
+                    });
+                }
+                if self.net.airplane.present() {
+                    v.push(Row {
+                        title: "비행기 모드".to_string(),
+                        sub: if self.net.airplane.is_on() {
+                            "모든 무선 꺼짐".to_string()
+                        } else {
+                            "꺼짐".to_string()
+                        },
+                        kind: RowKind::Airplane,
+                    });
+                }
+                v
+            }
+            CAT_APPS => {
+                if self.apps.is_empty() {
+                    vec![info("설치된 프로그램 없음", "레지스트리에서 항목을 찾지 못했습니다".to_string())]
+                } else {
+                    let mut v = vec![info(
+                        "설치된 프로그램",
+                        format!("{}개 — 항목을 탭하면 제거 관리자가 실행됩니다", self.apps.len()),
+                    )];
+                    v.extend(self.apps.iter().enumerate().map(|(i, a)| {
+                        let mut sub = a.publisher.clone();
+                        if !a.version.is_empty() {
+                            if !sub.is_empty() {
+                                sub.push_str(" · ");
+                            }
+                            sub.push_str(&a.version);
+                        }
+                        if sub.is_empty() {
+                            sub.push_str("탭하여 제거");
+                        }
+                        Row { title: a.name.clone(), sub: trunc(&sub, 80), kind: RowKind::App(i) }
+                    }));
+                    v
+                }
+            }
+            CAT_DATETIME => {
+                let (date, time) = crate::datetime::now();
+                let mut v = vec![
+                    info("날짜", date),
+                    info("시간", time),
+                    info("시간대 선택", "탭하여 표준 시간대를 변경합니다 (관리자 권한 불필요)".to_string()),
+                ];
+                v.extend(self.zones.iter().enumerate().map(|(i, z)| Row {
+                    title: z.display.clone(),
+                    sub: z.key.clone(),
+                    kind: RowKind::TimeZone(i),
+                }));
+                v.push(info("시계·자동 동기화", "시각 설정과 인터넷 시간 동기화는 관리자 권한 — 고급·도구의 날짜·시간에서".to_string()));
+                v
+            }
             _ => Vec::new(),
         }
     }
@@ -425,6 +740,139 @@ impl SettingsApp {
         }
         // Re-read so the switch reflects the truth (writes can be no-ops).
         self.startup = crate::winsettings::list_startup();
+        self.paint();
+    }
+
+    /// Reload the COM-backed caches for whichever dynamic pane is now shown.
+    /// Cheap panes (personalize, tweaks…) leave the caches untouched.
+    fn refresh_dynamic(&mut self) {
+        match self.cat {
+            CAT_SOUND => {
+                self.audio_devs = crate::audiopolicy::list_render();
+                self.vol = crate::audiopolicy::volume();
+            }
+            CAT_POWER => {
+                self.power_plans = crate::power::plans();
+            }
+            CAT_NETWORK => self.refresh_network(),
+            CAT_APPS => self.apps = crate::apps::installed(),
+            CAT_DATETIME => self.zones = crate::datetime::zones(),
+            _ => {}
+        }
+    }
+
+    fn zone_pick(&mut self, i: usize) {
+        if let Some(z) = self.zones.get(i) {
+            if z.current {
+                return;
+            }
+            crate::datetime::set_zone(z);
+        }
+        // Re-enumerate so the check mark and the clock reflect the new zone.
+        self.zones = crate::datetime::zones();
+        self.paint();
+    }
+
+    /// Re-read Wi-Fi (wlanapi, this thread) and the radios (WinRT via MTA).
+    fn refresh_network(&mut self) {
+        let (wifi_present, wifi_on, nets) = if let Some(w) = Wifi::open() {
+            w.scan(); // async — populates the cache the next entry reads
+            (true, w.radio_on(), w.networks())
+        } else {
+            (false, false, Vec::new())
+        };
+        let snap = on_mta(quicksettings::snapshot)
+            .unwrap_or(RadioSnapshot { bluetooth: Tri::Absent, airplane: Tri::Absent });
+        self.net = NetState { wifi_present, wifi_on, nets, bt: snap.bluetooth, airplane: snap.airplane };
+    }
+
+    fn wifi_toggle(&mut self) {
+        if let Some(w) = Wifi::open() {
+            w.set_radio(!self.net.wifi_on);
+        }
+        self.refresh_network();
+        self.paint();
+    }
+
+    fn wifi_connect(&mut self, i: usize) {
+        if let Some(n) = self.net.nets.get(i) {
+            match n.profile.clone() {
+                Some(prof) => {
+                    if let Some(w) = Wifi::open() {
+                        w.connect(&prof);
+                    }
+                }
+                // No saved profile → needs a password UI we don't own; hand the
+                // one join we can't do to the stock Wi-Fi entry.
+                None => crate::winsettings::launch("ms-settings:network-wifi"),
+            }
+        }
+        self.refresh_network();
+        self.paint();
+    }
+
+    fn bt_toggle(&mut self) {
+        let on = self.net.bt.is_on();
+        if let Some(snap) =
+            on_mta(move || {
+                quicksettings::set_bluetooth(!on);
+                quicksettings::snapshot()
+            })
+        {
+            self.net.bt = snap.bluetooth;
+            self.net.airplane = snap.airplane;
+        }
+        self.paint();
+    }
+
+    fn airplane_toggle(&mut self) {
+        let on = self.net.airplane.is_on();
+        let _ = on_mta(move || quicksettings::set_airplane(!on));
+        // Airplane flips Wi-Fi too, so re-read the whole pane.
+        self.refresh_network();
+        self.paint();
+    }
+
+    fn app_uninstall(&mut self, i: usize) {
+        if let Some(a) = self.apps.get(i) {
+            crate::apps::uninstall(&a.uninstall);
+        }
+    }
+
+    fn vol_set(&mut self, level: f32) {
+        crate::audiopolicy::set_volume(level);
+        self.vol = crate::audiopolicy::volume();
+        self.paint();
+    }
+
+    fn mute_toggle(&mut self) {
+        let now = self.vol.map(|(_, m)| m).unwrap_or(false);
+        crate::audiopolicy::set_mute(!now);
+        self.vol = crate::audiopolicy::volume();
+        self.paint();
+    }
+
+    fn output_pick(&mut self, i: usize) {
+        if let Some(dev) = self.audio_devs.get(i) {
+            if dev.default {
+                return;
+            }
+            let _ = crate::audiopolicy::set_default_endpoint(&dev.id);
+        }
+        // Re-read so the check mark and volume follow the new default.
+        self.audio_devs = crate::audiopolicy::list_render();
+        self.vol = crate::audiopolicy::volume();
+        self.paint();
+    }
+
+    fn plan_pick(&mut self, i: usize) {
+        if let Some(p) = self.power_plans.get(i) {
+            if p.active {
+                return;
+            }
+            crate::power::set_plan(&p.guid);
+        }
+        self.power_plans = crate::power::plans();
         self.paint();
     }
 
@@ -600,52 +1048,151 @@ impl SettingsApp {
         }
     }
 
+    /// The right (detail) pane's content column, to the right of the master nav.
+    fn right_col(&self) -> (f32, f32) {
+        let cx0 = NAV_W2 + 28.0;
+        let cx1 = (self.w - 32.0).max(cx0 + 120.0);
+        (cx0, cx1)
+    }
+
     fn paint(&mut self) {
         self.hits.clear();
-        let r = &self.renderer;
         unsafe {
-            r.dc.BeginDraw();
+            self.renderer.dc.BeginDraw();
             // Low alpha: Mica does the wallpaper tinting, we just darken.
-            r.dc.Clear(Some(&theme::rgba(24, 25, 30, 0.72)));
+            self.renderer.dc.Clear(Some(&theme::rgba(24, 25, 30, 0.72)));
         }
-
-        // -- left nav --
-        self.text(
-            "glide-shell 설정",
-            &self.fmt_app.clone(),
-            rect(20.0, 18.0, NAV_W - 12.0, 46.0),
-            theme::TEXT,
-        );
-        for (i, (name, glyph)) in CATS.iter().enumerate() {
-            let y = 64.0 + i as f32 * (NAV_ITEM_H + 2.0);
-            let item = rect(8.0, y, NAV_W - 8.0, y + NAV_ITEM_H);
-            if self.cat == i {
-                self.fill_round(item, 6.0, theme::rgba(255, 255, 255, 0.08));
-                // Accent indicator, the Win11 nav gesture.
-                self.fill_round(
-                    rect(8.0, y + 12.0, 11.0, y + NAV_ITEM_H - 12.0),
-                    1.5,
-                    theme::accent(),
-                );
-            } else if self.hover == Some(Act::Nav(i)) {
-                self.fill_round(item, 6.0, theme::HOVER_FILL);
-            }
-            self.glyph(*glyph, rect(16.0, y, 48.0, y + NAV_ITEM_H), theme::TEXT);
-            self.text(name, &self.fmt_row.clone(), rect(52.0, y, NAV_W - 12.0, y + NAV_ITEM_H), theme::TEXT);
-            self.hits.push((item, Act::Nav(i)));
-        }
-
-        // -- content pane --
-        let cx0 = NAV_W + 28.0;
-        let cx1 = (self.w - 32.0).max(cx0 + 120.0);
-        self.text(CATS[self.cat].0, &self.fmt_cat.clone(), rect(cx0, 18.0, cx1, 62.0), theme::TEXT);
-
-        // Content scrolls under the fixed title; clip so scrolled rows never
-        // paint over the title or the nav pane.
-        let content_top = 72.0;
-        let clip = rect(cx0 - 4.0, content_top, self.w, self.h);
+        self.paint_nav();
+        self.paint_right();
         unsafe {
-            r.dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            let _ = self.renderer.dc.EndDraw(None, None);
+            let _ = self.renderer.present();
+        }
+    }
+
+    /// Total scroll height of the master list (for the wheel clamp).
+    fn nav_content_h(&self) -> f32 {
+        if self.query.trim().is_empty() {
+            HOME.iter().map(|g| g.len() as f32 * NAV_ROW_H).sum::<f32>()
+                + (HOME.len().saturating_sub(1)) as f32 * NAV_SEP
+        } else {
+            home_matches(&self.query).len() as f32 * NAV_ROW_H
+        }
+    }
+
+    /// One master-list row: colour circle + label, selection/hover fill.
+    fn paint_nav_row(&mut self, y: f32, hr: &HomeRow) -> f32 {
+        let (act, selected) = match hr.act {
+            HomeAct::Cat(c) => (Act::Nav(c), self.panel.is_none() && self.cat == c),
+            HomeAct::Link(l) => (Act::Panel(l), self.panel == Some(l)),
+            HomeAct::TaskMgr => (Act::TaskMgr, false),
+        };
+        let row = rect(10.0, y, NAV_W2 - 10.0, y + NAV_ROW_H);
+        if selected {
+            self.fill_round(row, 12.0, theme::rgba(255, 255, 255, 0.10));
+        } else if self.hover == Some(act) {
+            self.fill_round(row, 12.0, theme::HOVER_FILL);
+        }
+        self.icon_circle(40.0, y + NAV_ROW_H / 2.0, hr.color, hr.glyph);
+        self.text(hr.label, &self.fmt_row.clone(), rect(72.0, y, NAV_W2 - 16.0, y + NAV_ROW_H), theme::TEXT);
+        self.hits.push((row, act));
+        y + NAV_ROW_H
+    }
+
+    /// The left master list (Samsung two-pane): grouped colour-icon rows with
+    /// separators, a selection highlight, and a pinned search pill.
+    fn paint_nav(&mut self) {
+        self.fill_round(rect(NAV_W2, 0.0, NAV_W2 + 1.0, self.h), 0.0, theme::rgba(255, 255, 255, 0.06));
+        let content_top = 14.0;
+        let clip = rect(0.0, content_top, NAV_W2, self.h - 66.0);
+        unsafe {
+            self.renderer.dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        let mut y = 18.0 - self.nav_scroll;
+        if self.query.trim().is_empty() {
+            for (gi, g) in HOME.iter().enumerate() {
+                for hr in g.iter() {
+                    y = self.paint_nav_row(y, hr);
+                }
+                if gi + 1 < HOME.len() {
+                    self.fill_round(rect(24.0, y + 7.0, NAV_W2 - 24.0, y + 8.0), 0.0, theme::rgba(255, 255, 255, 0.06));
+                    y += NAV_SEP;
+                }
+            }
+        } else {
+            let rows = home_matches(&self.query);
+            if rows.is_empty() {
+                self.text("결과 없음", &self.fmt_row.clone(), rect(24.0, y + 6.0, NAV_W2 - 12.0, y + 46.0), theme::TEXT_DIM);
+            } else {
+                for hr in &rows {
+                    y = self.paint_nav_row(y, hr);
+                }
+            }
+        }
+        unsafe {
+            self.renderer.dc.PopAxisAlignedClip();
+        }
+
+        // Pinned search pill (Samsung docks it bottom-left).
+        let pill = rect(14.0, self.h - 54.0, NAV_W2 - 14.0, self.h - 14.0);
+        let hot = self.hover == Some(Act::Search);
+        self.fill_round(pill, 20.0, theme::rgba(255, 255, 255, if hot { 0.12 } else { 0.08 }));
+        self.glyph(0xE721, rect(22.0, self.h - 54.0, 54.0, self.h - 14.0), theme::TEXT_DIM);
+        let (txt, tcol) = if self.query.is_empty() {
+            ("설정 검색".to_string(), theme::TEXT_DIM)
+        } else {
+            (format!("{}|", self.query), theme::TEXT)
+        };
+        self.text(&txt, &self.fmt_row.clone(), rect(56.0, self.h - 54.0, NAV_W2 - 22.0, self.h - 14.0), tcol);
+        self.hits.push((pill, Act::Search));
+    }
+
+    /// A vivid filled circle with a white glyph — the Samsung row icon.
+    fn icon_circle(&self, cx: f32, cy: f32, color: (u8, u8, u8), glyph: u16) {
+        unsafe {
+            if let Ok(b) = self.renderer.brush(theme::rgba(color.0, color.1, color.2, 1.0)) {
+                self.renderer.dc.FillEllipse(
+                    &D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: 18.0, radiusY: 18.0 },
+                    &b,
+                );
+            }
+        }
+        self.glyph(glyph, rect(cx - 18.0, cy - 18.0, cx + 18.0, cy + 18.0), theme::rgba(255, 255, 255, 1.0));
+    }
+
+    /// The right detail pane: a launch card for a classic Windows panel, or the
+    /// selected glide category's cards.
+    fn paint_right(&mut self) {
+        let (cx0, cx1) = self.right_col();
+        if let Some(p) = self.panel {
+            let (label, sub, _) = LINKS[p];
+            self.text(label, &self.fmt_cat.clone(), rect(cx0, 14.0, cx1, 58.0), theme::TEXT);
+            let card = rect(cx0, 80.0, cx1, 214.0);
+            self.fill_round(card, 12.0, theme::rgba(255, 255, 255, 0.05));
+            self.text(sub, &self.fmt_row.clone(), rect(cx0 + 22.0, 98.0, cx1 - 22.0, 132.0), theme::TEXT);
+            self.text(
+                "장치·서비스·디스크·레지스트리는 별도 시스템 콘솔입니다 — glide가 직접 실행합니다.",
+                &self.fmt_sub.clone(),
+                rect(cx0 + 22.0, 130.0, cx1 - 22.0, 158.0),
+                theme::TEXT_DIM,
+            );
+            let btn = rect(cx0 + 22.0, 166.0, cx0 + 132.0, 200.0);
+            let hot = self.hover == Some(Act::Link(p));
+            self.fill_round(btn, 8.0, if hot { theme::accent() } else { theme::rgba(255, 255, 255, 0.12) });
+            self.text(
+                "열기",
+                &self.fmt_seg.clone(),
+                btn,
+                if hot { theme::rgba(23, 24, 28, 1.0) } else { theme::TEXT },
+            );
+            self.hits.push((btn, Act::Link(p)));
+            return;
+        }
+        self.text(CATS[self.cat].0, &self.fmt_cat.clone(), rect(cx0, 14.0, cx1, 58.0), theme::TEXT);
+        let content_top = 72.0;
+        let clip = rect(cx0 - 6.0, content_top, cx1 + 6.0, self.h);
+        unsafe {
+            self.renderer.dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
         }
         let rows = self.rows();
         for (i, row) in rows.iter().enumerate() {
@@ -656,23 +1203,84 @@ impl SettingsApp {
             let card = rect(cx0, y, cx1, y + CARD_H);
             // act = clickable target; sw = switch state (toggle rows); link =
             // draw a chevron and open on click instead of a switch.
-            let (act, sw, link, accent, density): (Option<Act>, Option<bool>, bool, bool, Option<u8>) =
-                match row.kind {
-                    RowKind::Toggle(t) => (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false, false, None),
-                    RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false, false, None),
-                    RowKind::Startup(s) => (
-                        Some(Act::Startup(s)),
-                        Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
-                        false,
-                        false,
-                        None,
-                    ),
-                    RowKind::Tweak(t) => (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false, false, None),
-                    RowKind::Link(l) => (Some(Act::Link(l)), None, true, false, None),
-                    RowKind::Accent => (None, None, false, true, None),
-                    RowKind::Density => (None, None, false, false, Some(self.cfg.bar_density)),
-                    RowKind::Info => (None, None, false, false, None),
-                };
+            #[allow(clippy::type_complexity)]
+            let (act, sw, link, accent, density, volume, check): (
+                Option<Act>,
+                Option<bool>,
+                bool,
+                bool,
+                Option<u8>,
+                bool,
+                Option<bool>,
+            ) = match row.kind {
+                RowKind::Toggle(t) => {
+                    (Some(Act::Toggle(t)), Some(self.toggle_value(t)), false, false, None, false, None)
+                }
+                RowKind::Win(w) => (Some(Act::Win(w)), Some(self.win_value(w)), false, false, None, false, None),
+                RowKind::Startup(s) => (
+                    Some(Act::Startup(s)),
+                    Some(self.startup.get(s).map(|x| x.enabled).unwrap_or(false)),
+                    false,
+                    false,
+                    None,
+                    false,
+                    None,
+                ),
+                RowKind::Tweak(t) => {
+                    (Some(Act::Tweak(t)), Some(self.tweak_value(t)), false, false, None, false, None)
+                }
+                RowKind::Link(l) => (Some(Act::Link(l)), None, true, false, None, false, None),
+                RowKind::Accent => (None, None, false, true, None, false, None),
+                RowKind::Density => (None, None, false, false, Some(self.cfg.bar_density), false, None),
+                RowKind::Volume => (None, None, false, false, None, true, None),
+                RowKind::AudioDev(i) => (
+                    Some(Act::AudioDev(i)),
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    Some(self.audio_devs.get(i).map(|d| d.default).unwrap_or(false)),
+                ),
+                RowKind::PowerPlan(i) => (
+                    Some(Act::PowerPlan(i)),
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    Some(self.power_plans.get(i).map(|p| p.active).unwrap_or(false)),
+                ),
+                RowKind::WifiRadio => {
+                    (Some(Act::WifiRadio), Some(self.net.wifi_on), false, false, None, false, None)
+                }
+                RowKind::WifiNet(i) => (
+                    Some(Act::WifiNet(i)),
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    Some(self.net.nets.get(i).map(|n| n.connected).unwrap_or(false)),
+                ),
+                RowKind::Bluetooth => {
+                    (Some(Act::Bluetooth), Some(self.net.bt.is_on()), false, false, None, false, None)
+                }
+                RowKind::Airplane => {
+                    (Some(Act::Airplane), Some(self.net.airplane.is_on()), false, false, None, false, None)
+                }
+                RowKind::App(i) => (Some(Act::App(i)), None, true, false, None, false, None),
+                RowKind::TimeZone(i) => (
+                    Some(Act::TimeZone(i)),
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    Some(self.zones.get(i).map(|z| z.current).unwrap_or(false)),
+                ),
+                RowKind::Info => (None, None, false, false, None, false, None),
+            };
             let hot = act.map(|a| self.hover == Some(a)).unwrap_or(false);
             self.fill_round(card, 6.0, theme::rgba(255, 255, 255, if hot { 0.075 } else { 0.045 }));
             self.text(
@@ -733,14 +1341,54 @@ impl SettingsApp {
                     self.hits.push((seg, Act::Density(k as u8)));
                 }
             }
+            if volume {
+                let (level, muted) = self.vol.map(|(v, m)| (v, m)).unwrap_or((0.0, false));
+                let cy = y + CARD_H / 2.0;
+                // Mute button on the far right; accent-filled when muted.
+                let mb = rect(cx1 - 44.0, cy - 15.0, cx1 - 14.0, cy + 15.0);
+                self.fill_round(mb, 8.0, if muted { theme::accent() } else { theme::rgba(255, 255, 255, 0.10) });
+                self.glyph(
+                    if muted { 0xE74F } else { 0xE767 },
+                    mb,
+                    if muted { theme::rgba(23, 24, 28, 1.0) } else { theme::TEXT },
+                );
+                self.hits.push((mb, Act::Mute));
+                // Slider track between the labels and the mute button.
+                let tx0 = cx0 + 150.0;
+                let tx1 = cx1 - 62.0;
+                if tx1 > tx0 + 20.0 {
+                    let knob = tx0 + level.clamp(0.0, 1.0) * (tx1 - tx0);
+                    self.fill_round(rect(tx0, cy - 2.0, tx1, cy + 2.0), 2.0, theme::rgba(255, 255, 255, 0.16));
+                    if !muted {
+                        self.fill_round(rect(tx0, cy - 2.0, knob, cy + 2.0), 2.0, theme::accent());
+                    }
+                    unsafe {
+                        let kc = if muted { theme::rgba(160, 163, 170, 1.0) } else { theme::accent() };
+                        if let Ok(b) = self.renderer.brush(kc) {
+                            self.renderer.dc.FillEllipse(
+                                &D2D1_ELLIPSE { point: Vector2 { X: knob, Y: cy }, radiusX: 8.0, radiusY: 8.0 },
+                                &b,
+                            );
+                        }
+                    }
+                    self.hits.push((
+                        rect(tx0 - 8.0, cy - 14.0, tx1 + 8.0, cy + 14.0),
+                        Act::Vol { l: tx0, r: tx1 },
+                    ));
+                }
+            }
+            if let Some(sel) = check {
+                if sel {
+                    // A radio-style check on the selected device / active plan.
+                    self.glyph(0xE73E, rect(cx1 - 46.0, y, cx1 - 14.0, y + CARD_H), theme::accent());
+                }
+            }
             if let Some(a) = act {
                 self.hits.push((card, a));
             }
         }
         unsafe {
-            r.dc.PopAxisAlignedClip();
-            let _ = r.dc.EndDraw(None, None);
-            let _ = r.present();
+            self.renderer.dc.PopAxisAlignedClip();
         }
     }
 }
@@ -802,6 +1450,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
             WM_MOUSEMOVE => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / app.scale;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / app.scale;
+                app.mouse_x = x;
                 let h = app.hit(x, y);
                 if h != app.hover {
                     app.hover = h;
@@ -831,8 +1480,10 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                 let x = (lparam.0 & 0xFFFF) as i16 as f32 / app.scale;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32 / app.scale;
                 match app.hit(x, y) {
+                    // A master-list category selects the right pane.
                     Some(Act::Nav(i)) => {
-                        if app.cat != i {
+                        if app.panel.is_some() || app.cat != i {
+                            app.panel = None;
                             app.cat = i;
                             app.scroll = 0.0;
                             // Startup can change out from under us (installers,
@@ -840,16 +1491,48 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
                             if i == CAT_STARTUP {
                                 app.startup = crate::winsettings::list_startup();
                             }
+                            // Sound/power panes read live COM state on entry.
+                            app.refresh_dynamic();
                             app.hover = None;
                             app.paint();
                         }
                     }
+                    // A classic-panel row shows its launch card on the right.
+                    Some(Act::Panel(p)) => {
+                        if app.panel != Some(p) {
+                            app.panel = Some(p);
+                            app.scroll = 0.0;
+                            app.hover = None;
+                            app.paint();
+                        }
+                    }
+                    // The pill only marks focus; typing filters live.
+                    Some(Act::Search) => {}
                     Some(Act::Toggle(t)) => app.flip(t),
                     Some(Act::Win(w)) => app.win_flip(w),
                     Some(Act::Startup(s)) => app.startup_flip(s),
                     Some(Act::Tweak(t)) => app.tweak_flip(t),
                     Some(Act::Accent(i)) => app.accent_pick(i),
                     Some(Act::Density(d)) => app.density_pick(d),
+                    Some(Act::Vol { l, r }) => {
+                        let frac = ((x - l) / (r - l)).clamp(0.0, 1.0);
+                        app.vol_set(frac);
+                    }
+                    Some(Act::Mute) => app.mute_toggle(),
+                    Some(Act::AudioDev(i)) => app.output_pick(i),
+                    Some(Act::PowerPlan(i)) => app.plan_pick(i),
+                    Some(Act::WifiRadio) => app.wifi_toggle(),
+                    Some(Act::WifiNet(i)) => app.wifi_connect(i),
+                    Some(Act::Bluetooth) => app.bt_toggle(),
+                    Some(Act::Airplane) => app.airplane_toggle(),
+                    Some(Act::App(i)) => app.app_uninstall(i),
+                    Some(Act::TimeZone(i)) => app.zone_pick(i),
+                    Some(Act::TaskMgr) => {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).arg("--taskmgr").spawn();
+                        }
+                    }
+                    // The launch card's 열기 button opens the classic panel.
                     Some(Act::Link(l)) => {
                         if let Some(e) = LINKS.get(l) {
                             crate::winsettings::launch(e.2);
@@ -861,13 +1544,44 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0 * 52.0;
-                let n = app.rows().len();
-                let content_h = n as f32 * (CARD_H + CARD_GAP);
-                let vis = (app.h - 92.0).max(0.0);
-                let max = (content_h - vis).max(0.0);
-                let ns = (app.scroll - delta).clamp(0.0, max);
-                if ns != app.scroll {
-                    app.scroll = ns;
+                // Route the wheel to whichever pane the cursor was last over.
+                if app.mouse_x < NAV_W2 {
+                    let vis = (app.h - 80.0).max(0.0);
+                    let max = (app.nav_content_h() - vis).max(0.0);
+                    let ns = (app.nav_scroll - delta).clamp(0.0, max);
+                    if ns != app.nav_scroll {
+                        app.nav_scroll = ns;
+                        app.hover = None;
+                        app.paint();
+                    }
+                } else if app.panel.is_none() {
+                    let content_h = app.rows().len() as f32 * (CARD_H + CARD_GAP);
+                    let vis = (app.h - 92.0).max(0.0);
+                    let max = (content_h - vis).max(0.0);
+                    let ns = (app.scroll - delta).clamp(0.0, max);
+                    if ns != app.scroll {
+                        app.scroll = ns;
+                        app.hover = None;
+                        app.paint();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CHAR => {
+                // Type-to-filter the master list. WM_CHAR delivers committed
+                // characters (including whole Hangul syllables post-IME).
+                let c = wparam.0 as u32;
+                let mut changed = false;
+                if c == 0x08 {
+                    changed = app.query.pop().is_some();
+                } else if c >= 0x20 && c != 0x7F {
+                    if let Some(ch) = char::from_u32(c) {
+                        app.query.push(ch);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    app.nav_scroll = 0.0;
                     app.hover = None;
                     app.paint();
                 }
@@ -875,7 +1589,14 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
             }
             WM_KEYDOWN => {
                 if wparam.0 == VK_ESCAPE.0 as usize {
-                    app.hide();
+                    // Esc clears an active filter first, else closes.
+                    if !app.query.is_empty() {
+                        app.query.clear();
+                        app.nav_scroll = 0.0;
+                        app.paint();
+                    } else {
+                        app.hide();
+                    }
                 }
                 LRESULT(0)
             }
