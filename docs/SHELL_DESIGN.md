@@ -865,6 +865,25 @@ CLI + 확인 프롬프트**로 한다(파일 관리자에 셸 스왑 버튼은 �
   PostMessage로 열어 밀도 세그(보통=teal) + 시계/라벨 토글 행 렌더 확인. 강조색 재색은
   이전 라운드 스와치 클릭으로 라이브 검증. 밀도 컴팩트/크게 시계 오프셋은 산술 유도만
   (풀 appbar 기동은 유저 작업 창을 밀어내 미실행) — 보통은 구 값과 동일.**
+- **설정 인라인 컨트롤 + 자체 작업 관리자 SHIPPED 0724 (`b237c93`)** *(유저 "일단
+  구현부터 다 하고 말해" → "아래쪽 윈도우로 떠넘기는 설정들도 마저 다 구현" → "일부
+  기능은 자체 제작 작업 관리자로 빼던가" → "프로세서 해커 2 정도 기능" → "CPU랑 메모리
+  표시 고쳐" → "이정도면 나쁘지 않네 - 인정")*. ① **설정 인라인화** — 클래식 패널을
+  `[열기]` 런치 카드 대신 glide 렌더 컨트롤로: 소리(볼륨/음소거/출력장치, Core Audio
+  `IAudioEndpointVolume`+`IMMDeviceEnumerator`), 전원(배터리/전원 계획,
+  `GetSystemPowerStatus`+powrprof, 권한상승 없이 계획 전환), 네트워크(Wi-Fi/BT/비행기,
+  wlanapi + WinRT `Radios`는 **STA 데드락 회피 위해 단명 MTA 워커**), 앱(설치 목록 3-하이브
+  Uninstall 열거 + 제거), 날짜·시간(타임존, `SetDynamicTimeZoneInformation` + SE_TIME_ZONE
+  권한). 진짜 관리 콘솔(장치관리자·디스크·regedit)은 런처 유지 — Win11 설정·KDE/GNOME도
+  런치하고 재구현은 slop. ② **자체 작업 관리자**(`--taskmgr`, 설정 항목서도 스폰) — Win11
+  작업 관리자 골격: **제품(FileDescription) 단위 앱 그룹**(개수+접기+합계, ppid-subtree
+  아님 → explorer가 전 유저 프로세스 삼키던 버그 제거), **앱별 아이콘**(`icons::exe_icon`
+  재사용 path별 캐시), 라이브 검색, **값 비례 폭 CPU/메모리 히트바**, 소유자 컬럼, 2-step
+  끝내기/트리 종료/중단/재개/우선순위(그룹은 전 멤버 적용). 서비스 탭=SCM 시작/중지.
+  백엔드 새 모듈 procs/services/apps/datetime/power. **검증(스샷 5회 반복): --taskmgr 자체
+  창 화면 BitBlt로 그룹·아이콘·히트바·컬럼 정렬 라이브 확인, 탐색기 2.8GB→133MB 정상화
+  확증.** 아이콘 인프라는 taskbar/secondary와 동일 idiom(DrawBitmap+`Option<ID2D1Bitmap1>`
+  캐시). 남은 nice-to-have=헤더 집계 총계(22% CPU식).
 - **M7 — 스왑 + 도그푸드** (1세션 + 2h)
   롤백 리허설 → HKCU Shell= 스왑 → 체크리스트: **한글 IME**, GLM-Proxy 태스크,
   오디오/볼륨 키, 150% DPI, Duo 패널 탈착, 절전/복귀, 게임 풀스크린, UAC, 파일
