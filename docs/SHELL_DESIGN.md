@@ -590,7 +590,7 @@ SSID 5개·연결됨 표시·신호별 글리프·토글 on), 배터리(51%·"�
 
 **롤백 리허설(M7 첫 단계)**: 스왑 → 로그온 확인 → 즉시 사다리 4번으로 복귀 →
 재스왑. 리허설이 통과해야 도그푸드 시작. 리허설 전 `RESTORE-SHELL.ps1`(사다리 5의
-reg delete + explorer 스폰)을 바탕화면과 `C:\Users\jin14\system-optimize-backup\`에
+reg delete + explorer 스폰)을 바탕화면과 `%USERPROFILE%\system-optimize-backup\`에
 복사해 둔다(디블로트 RESTORE.ps1과 같은 장소 = 유저가 아는 장소).
 
 등록 UI는 glide gear 팝업이 아니라 **glide-shell 자체의 `--register`/`--unregister`
