@@ -108,18 +108,22 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         None | Some("--tray-claim") => {
-            // --tray-claim: also register as Shell_TrayWnd. Racy while
-            // explorer lives — meant for explorer-kill sessions (M2 gate).
-            let claim = args.first().map(String::as_str) == Some("--tray-claim");
             unsafe {
                 let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
                     windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
                 );
             }
+            let system_shell = autostart::is_system_shell();
+            // Registering as Shell_TrayWnd is not optional once Winlogon starts
+            // us: SHAppBarMessage is served by whichever window holds that
+            // class, so with no explorer and no claim there is nobody to honour
+            // an appbar reservation — our own bar included — and real apps have
+            // nowhere to put a tray icon. --tray-claim only exists to force it
+            // in an explorer-kill session, where it is racy on purpose (M2).
+            let claim = system_shell || args.first().map(String::as_str) == Some("--tray-claim");
             // Shell duty (SHELL_DESIGN §6.5): the Run keys and Startup folders
             // only fire from here once Winlogon Shell= points at us; while
             // explorer is the shell this is a no-op, never a double launch.
-            let system_shell = autostart::is_system_shell();
             if system_shell {
                 std::thread::spawn(autostart::run_all);
             }
