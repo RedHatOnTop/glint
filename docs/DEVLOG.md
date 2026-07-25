@@ -68,9 +68,24 @@ not only at milestone boundaries.
   moved.
 
 Verification: `cargo clippy --workspace --all-targets` silent, `cargo test
---workspace` 6 passed, Task Manager launched and screenshot-checked after the
-render change. The taskbar itself was not relaunched — the boxing change is
-address-only, and the bar takes over the user's desktop when it starts.
+--workspace` 6 passed, and the shell was launched and driven end to end.
+
+Every surface the audit touched was captured after the fixes — bar, start menu,
+action center, Wi-Fi flyout, volume flyout, Task Manager. All render. The bar
+was driven by posting `WM_LBUTTONDOWN`/`UP` into its own window (no global input
+injection): Start opened the app list with 초성 sections, the tile grid and its
+folder group; the notification cell opened the backlog plus the Quick Settings
+grid (the tile foreground touched by `563ed6d`); the tray cells opened the live
+SSID scan and the 출력/입력 device panel (the `DeviceSection` alias from
+`f596410`). Closed with `WM_CLOSE`, which runs the `ABM_REMOVE` path — the work
+area went back from 1536×840 to 1536×912, so the appbar reservation was
+released and nothing was left stranded.
+
+One capture artifact, chased down rather than assumed: the first full-screen
+shot after launch showed only the desktop window with no bar. A fresh launch
+captured clean with no intervention, and the bar carries `WS_EX_TOPMOST`
+(`0x8200088`) while the desktop window does not (`0x8200080`), so it was a
+startup-timing artifact of the capture, not a z-order bug.
 
 Left undone, deliberately: the audit also suggested extracting the repeated
 window scaffold (class registration + wndproc + `GWLP_USERDATA` + D2D setup,
