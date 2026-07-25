@@ -87,6 +87,31 @@ captured clean with no intervention, and the bar carries `WS_EX_TOPMOST`
 (`0x8200088`) while the desktop window does not (`0x8200080`), so it was a
 startup-timing artifact of the capture, not a z-order bug.
 
+**Polish pass, from what the screenshots actually showed.**
+
+- `6dde3c2` **ellipsis instead of a hard clip.** Every text cell in the shell is
+  fixed width and its content is not, and no format carried a DirectWrite
+  trimming sign — so D2D clipped at the layout edge. In Korean that cuts a
+  syllable apart: the live captures had `pubg-training 및 1개 ᄃ` on a task
+  button, `고급 보안이 포함된 Windows Defer` in the app list, and
+  `Microphone Array(디지털 마이크용 인텔® 스마트` in the volume flyout.
+  `desktop.rs` already did the right thing for icon labels; that block became
+  `render::ellipsize` and now covers the taskbar title format, the Start menu's
+  app rows / grid labels / tile labels, the action-center card fields, the toast
+  fields, the Task Manager's columns and the settings rows. Character
+  granularity, not word — Korean rarely offers a word break near the edge.
+  Re-captured the bar, Start menu and volume flyout: all three offenders now end
+  in `…`. The notification card fields are the one path still unproven on
+  screen — the backlog was empty at capture time.
+- `29cfc64` **Task Manager exited nothing.** `WM_CLOSE` called `hide()`, but the
+  Task Manager is its own process (`glide-shell --taskmgr`), so closing it left
+  a windowless process spinning a message loop with a live sampler thread —
+  one orphan per open, each re-enumerating every process on the box every
+  1.5 s. Found by counting processes after the verification run, not by reading
+  code. Both `WM_CLOSE` and Escape now `DestroyWindow`, and `WM_DESTROY` kills
+  the timer and posts the quit. Verified: 1 process before the close, 0 three
+  seconds after.
+
 Left undone, deliberately: the audit also suggested extracting the repeated
 window scaffold (class registration + wndproc + `GWLP_USERDATA` + D2D setup,
 written out eight times). That is a restructuring of every UI module with real
