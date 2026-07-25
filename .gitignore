@@ -6,6 +6,9 @@
 **/*.rs.bk
 *.pdb
 
+# Lab VM guest credential (DPAPI-encrypted, still not ours to publish)
+/scripts/lab-cred.xml
+
 # Editors / OS
 .vscode/
 .idea/

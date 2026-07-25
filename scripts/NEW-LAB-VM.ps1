@@ -40,11 +40,9 @@ Set-VMMemory    $Name -DynamicMemoryEnabled $true -MinimumBytes 2GB -MaximumByte
 Set-VMProcessor $Name -Count $Cpus
 
 # Windows 11 also requires TPM 2.0, and a vTPM needs a key protector first.
-# On a standalone host that means a local (untrusted-root) guardian.
-$guardian = Get-HgsGuardian -Name UntrustedGuardian -ErrorAction SilentlyContinue
-if (-not $guardian) { $guardian = New-HgsGuardian -Name UntrustedGuardian -GenerateCertificates }
-$protector = New-HgsKeyProtector -Owner $guardian -AllowUntrustedRoot
-Set-VMKeyProtector -VMName $Name -KeyProtector $protector.RawData
+# -NewLocalKeyProtector does it in one call; the New-HgsGuardian route works
+# too but writes certificates into the host's store for no benefit here.
+Set-VMKeyProtector -VMName $Name -NewLocalKeyProtector
 Enable-VMTPM -VMName $Name
 
 # Standard checkpoints capture running state. Production checkpoints quiesce
@@ -54,8 +52,12 @@ Enable-VMTPM -VMName $Name
 Set-VM $Name -CheckpointType Standard -AutomaticCheckpointsEnabled $false
 
 # Guest Service Interface lets Copy-VMFile push a fresh glide-shell.exe into
-# the VM with no network share and no logged-in session.
-Enable-VMIntegrationService -VMName $Name -Name 'Guest Service Interface'
+# the VM with no network share and no logged-in session. Matched by its
+# well-known component GUID, not by name — integration service names come back
+# localized, and this host is ko-KR.
+$gsi = Get-VMIntegrationService -VMName $Name | Where-Object { $_.Id -match '6C09BB55-D683-4DA0-8931-C9BF705F6A00' }
+if ($gsi) { Enable-VMIntegrationService -VMIntegrationService $gsi }
+else      { Write-Warning 'Guest Service Interface not found — Copy-VMFile will not work; use PowerShell Direct instead.' }
 
 $sw = Get-VMSwitch -Name 'Default Switch' -ErrorAction SilentlyContinue
 if ($sw) { Connect-VMNetworkAdapter -VMName $Name -SwitchName $sw.Name }

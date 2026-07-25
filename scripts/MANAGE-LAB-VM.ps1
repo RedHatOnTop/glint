@@ -4,22 +4,37 @@
 # shell, reboot, look. Everything here is scripted because the interesting part
 # is the twentieth iteration, not the first.
 #
+# 'exec' and 'pull' go over PowerShell Direct — a VMBus session that needs no
+# network, no RDP and no working shell in the guest. That is the whole reason
+# this lab is on Hyper-V: once Winlogon\Shell points at a binary that crashes,
+# VMBus is the only way left in.
+#
 # Elevated, like every Hyper-V cmdlet — unless the account is in the local
 # Hyper-V Administrators group.
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('status', 'start', 'stop', 'push', 'checkpoint', 'revert', 'checkpoints')]
+    [ValidateSet('status', 'start', 'stop', 'push', 'exec', 'pull', 'checkpoint', 'revert', 'checkpoints', 'setcred')]
     [string]$Action,
     [string]$Name = 'glint-lab',
     # checkpoint / revert target.
     [string]$Snapshot = 'clean',
     # push source; the release build once there is one.
     [string]$Exe = "$PSScriptRoot\..\target\debug\glide-shell.exe",
-    [string]$GuestDir = 'C:\glint'
+    [string]$GuestDir = 'C:\glint',
+    # exec: PowerShell to run inside the guest.
+    [string]$Command,
+    # pull: guest path to copy out, and where to put it on the host.
+    [string]$GuestPath,
+    [string]$Out
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Guest credentials for PowerShell Direct, stashed once by -Action setcred.
+# Export-Clixml encrypts under DPAPI for this user on this machine, so the file
+# is useless if it leaves the box. Gitignored regardless.
+$CredPath = Join-Path $PSScriptRoot 'lab-cred.xml'
 
 function Get-Lab {
     $vm = Get-VM -Name $Name -ErrorAction SilentlyContinue
@@ -27,7 +42,18 @@ function Get-Lab {
     $vm
 }
 
+function Get-LabCred {
+    if (-not (Test-Path $CredPath)) { throw "No saved guest credential — run: .\MANAGE-LAB-VM.ps1 -Action setcred" }
+    Import-Clixml $CredPath
+}
+
 switch ($Action) {
+    'setcred' {
+        # Interactive on purpose; run it yourself once.
+        Get-Credential -Message "Local account inside the '$Name' guest" | Export-Clixml $CredPath
+        Write-Host "saved -> $CredPath"
+    }
+
     'status' {
         $vm = Get-Lab
         $vm | Format-List Name, State, Uptime, CPUUsage, MemoryAssigned, Status
@@ -50,7 +76,6 @@ switch ($Action) {
         $vm = Get-Lab
         if ($vm.State -ne 'Running') { throw "VM is $($vm.State) — 'push' needs it running with integration services up." }
         $dest = Join-Path $GuestDir (Split-Path $Exe -Leaf)
-        # -Force overwrites the previous drop; -CreateFullPath makes C:\glint.
         Copy-VMFile -Name $Name -SourcePath $Exe -DestinationPath $dest `
                     -FileSource Host -CreateFullPath -Force
         Write-Host "pushed  ->  $dest   ($([math]::Round((Get-Item $Exe).Length/1MB,1)) MB)"
@@ -61,8 +86,25 @@ In the guest, make it the shell for that user and log off:
   reg add "HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /t REG_SZ /d "$dest" /f
 
 To undo from inside a broken session: Ctrl+Alt+Del > 작업 관리자 > 새 작업 실행
-> the RESTORE-SHELL.ps1 line. From outside: revert the checkpoint.
+> the RESTORE-SHELL.ps1 line. From outside: revert the checkpoint, or
+
+  .\MANAGE-LAB-VM.ps1 -Action exec -Command 'reg delete "HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" /v Shell /f'
 "@
+    }
+
+    'exec' {
+        if (-not $Command) { throw "-Command is required for 'exec'." }
+        Invoke-Command -VMName $Name -Credential (Get-LabCred) -ScriptBlock ([scriptblock]::Create($Command))
+    }
+
+    'pull' {
+        if (-not $GuestPath) { throw "-GuestPath is required for 'pull'." }
+        if (-not $Out) { $Out = Join-Path (Get-Location) (Split-Path $GuestPath -Leaf) }
+        # Copy-VMFile is host-to-guest only, so the way back out is a session.
+        $s = New-PSSession -VMName $Name -Credential (Get-LabCred)
+        try   { Copy-Item -FromSession $s -Path $GuestPath -Destination $Out -Force }
+        finally { Remove-PSSession $s }
+        Write-Host "pulled  $GuestPath  ->  $Out"
     }
 
     'checkpoint' {
