@@ -12,6 +12,8 @@
 //! applies to every member.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
@@ -44,10 +46,58 @@ use crate::services::{self, Svc};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Posted by the sampler thread once a snapshot is waiting in the inbox.
+const WM_SNAPSHOT: u32 = WM_APP + 1;
 const ROW_H: f32 = 30.0;
 const REFRESH_MS: u32 = 1500;
 const WIN_W: f32 = 940.0;
 const WIN_H: f32 = 620.0;
+
+/// What the sampler thread is asked to produce, and hands back.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Procs,
+    Svcs,
+}
+
+enum Snap {
+    Procs(Vec<Proc>, HashSet<u32>),
+    Svcs(Vec<Svc>),
+}
+
+/// Own the sampler on a worker thread and answer requests on it.
+///
+/// A cold enumeration costs ~1.3 s on this box — the per-process version
+/// resource read (`FileDescription`, which is what gives a group its friendly
+/// name) is disk I/O and dominates. Run on the UI thread that is a frozen
+/// window for the whole first second, so the sampler lives here instead and
+/// posts `WM_SNAPSHOT` when a result is ready. The caches inside `Sampler` mean
+/// every later refresh is ~20 ms, but it stays off the UI thread regardless:
+/// a machine that spawns processes in bulk pays the cold price again.
+fn spawn_sampler(hwnd: isize, inbox: Arc<Mutex<Vec<Snap>>>) -> Sender<Kind> {
+    let (tx, rx) = channel::<Kind>();
+    std::thread::spawn(move || {
+        let mut sampler = procs::Sampler::new();
+        while let Ok(kind) = rx.recv() {
+            let snap = match kind {
+                Kind::Procs => Snap::Procs(sampler.sample(), procs::app_pids()),
+                Kind::Svcs => Snap::Svcs(services::list()),
+            };
+            let Ok(mut slot) = inbox.lock() else { return };
+            slot.push(snap);
+            drop(slot);
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut std::ffi::c_void)),
+                    WM_SNAPSHOT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
+    tx
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Act {
@@ -138,7 +188,14 @@ pub struct TaskManagerApp {
     max_cpu: f32,
     max_mem: u64,
     svcs: Vec<Svc>,
-    sampler: procs::Sampler,
+    /// Request channel to the sampler thread, and the slot it drops results in.
+    req: Sender<Kind>,
+    inbox: Arc<Mutex<Vec<Snap>>>,
+    /// A request is in flight — the auto-refresh timer must not pile more on.
+    pending: bool,
+    /// false until the first process snapshot lands, so the list can say so
+    /// instead of looking like a machine with no processes.
+    loaded: bool,
     sel: Sel,
     sel_svc: Option<String>,
     scroll: f32,
@@ -181,6 +238,12 @@ impl TaskManagerApp {
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
             let backdrop: i32 = 2; // DWMSBT_MAINWINDOW — Mica
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
+
+            // Start enumerating before the D2D device and fonts are built, so
+            // the cold sample runs alongside window setup rather than after it.
+            let inbox: Arc<Mutex<Vec<Snap>>> = Arc::new(Mutex::new(Vec::new()));
+            let req = spawn_sampler(hwnd.0 as isize, inbox.clone());
+            let _ = req.send(Kind::Procs);
 
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
@@ -241,7 +304,10 @@ impl TaskManagerApp {
                 max_cpu: 1.0,
                 max_mem: 1,
                 svcs: Vec::new(),
-                sampler: procs::Sampler::new(),
+                req,
+                inbox,
+                pending: true,
+                loaded: false,
                 sel: Sel::None,
                 sel_svc: None,
                 scroll: 0.0,
@@ -273,7 +339,10 @@ impl TaskManagerApp {
             let _ = SetForegroundWindow(self.hwnd);
             SetTimer(Some(self.hwnd), 1, REFRESH_MS, None);
         }
-        self.refresh();
+        // The prewarmed snapshot may have landed before GWLP_USERDATA was set,
+        // in which case its WM_SNAPSHOT hit a null app pointer and was dropped.
+        // Draining here is what makes that harmless.
+        self.drain();
         self.paint();
     }
 
@@ -299,14 +368,37 @@ impl TaskManagerApp {
         self.paint();
     }
 
+    /// Ask the sampler thread for a fresh snapshot of the current tab. Never
+    /// blocks; the list updates when `WM_SNAPSHOT` comes back.
     fn refresh(&mut self) {
-        if self.tab == 0 {
-            self.procs = self.sampler.sample();
-            self.apps = procs::app_pids();
-            self.build_groups();
-        } else {
-            self.svcs = services::list();
+        let kind = if self.tab == 0 { Kind::Procs } else { Kind::Svcs };
+        if self.req.send(kind).is_ok() {
+            self.pending = true;
         }
+    }
+
+    /// Apply everything the sampler thread has produced since the last drain.
+    /// Returns true when something changed and the window needs a repaint.
+    fn drain(&mut self) -> bool {
+        let Ok(mut slot) = self.inbox.lock() else { return false };
+        let snaps: Vec<Snap> = slot.drain(..).collect();
+        drop(slot);
+        if snaps.is_empty() {
+            return false;
+        }
+        self.pending = false;
+        for snap in snaps {
+            match snap {
+                Snap::Procs(procs, apps) => {
+                    self.procs = procs;
+                    self.apps = apps;
+                    self.loaded = true;
+                    self.build_groups();
+                }
+                Snap::Svcs(svcs) => self.svcs = svcs,
+            }
+        }
+        true
     }
 
     /// Fold processes into one group per application (by friendly/product name,
@@ -803,6 +895,10 @@ impl TaskManagerApp {
     }
 
     fn paint_procs(&mut self, top: f32, bottom: f32) {
+        if !self.loaded {
+            self.placeholder("프로세스를 읽는 중…", top, bottom);
+            return;
+        }
         let rows = self.display_rows();
         let c = self.cols();
         for (i, row) in rows.iter().enumerate() {
@@ -889,7 +985,18 @@ impl TaskManagerApp {
         self.hits.push((card, Act::Proc(pid)));
     }
 
+    /// Centred one-liner for the window's empty first frame, while the sampler
+    /// thread is still working.
+    fn placeholder(&mut self, msg: &str, top: f32, bottom: f32) {
+        let fmt = self.fmt_tab.clone();
+        self.text(msg, &fmt, rect(0.0, top, self.w, bottom), theme::TEXT_DIM);
+    }
+
     fn paint_svcs(&mut self, top: f32, bottom: f32) {
+        if self.svcs.is_empty() && self.pending {
+            self.placeholder("서비스를 읽는 중…", top, bottom);
+            return;
+        }
         let rows = self.display_svcs();
         for (i, idx) in rows.iter().enumerate() {
             let y = top - self.scroll + i as f32 * ROW_H;
@@ -992,8 +1099,15 @@ unsafe extern "system" fn taskmgr_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                 LRESULT(0)
             }
             WM_TIMER => {
-                if IsWindowVisible(hwnd).as_bool() {
+                // Only ask when the last answer is in — a cold sample outlives
+                // the refresh interval, and queued requests would never catch up.
+                if IsWindowVisible(hwnd).as_bool() && !app.pending {
                     app.refresh();
+                }
+                LRESULT(0)
+            }
+            WM_SNAPSHOT => {
+                if app.drain() {
                     app.paint();
                 }
                 LRESULT(0)
