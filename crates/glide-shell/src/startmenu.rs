@@ -1187,9 +1187,7 @@ impl StartMenu {
                 order.push(pi);
             }
         }
-        let mut old: Vec<Option<Entry>> =
-            std::mem::take(&mut self.pins).into_iter().map(Some).collect();
-        self.pins = order.iter().map(|&i| old[i].take().unwrap()).collect();
+        self.pins = permute(std::mem::take(&mut self.pins), &order);
         save_start_pins(&self.pins);
         self.rebuild_freq();
         self.paint();
@@ -1245,13 +1243,7 @@ impl StartMenu {
         let moved = order.remove(mj);
         let j = if mj < j { j - 1 } else { j };
         order.insert(j.min(order.len()), moved);
-        let mut old: Vec<Option<Entry>> =
-            std::mem::take(&mut self.pins).into_iter().map(Some).collect();
-        let entries: Vec<Entry> = order.iter().map(|&i| old[i].take().unwrap()).collect();
-        for (slot, e) in slots.iter().zip(entries) {
-            old[*slot] = Some(e);
-        }
-        self.pins = old.into_iter().flatten().collect();
+        self.pins = permute_slots(std::mem::take(&mut self.pins), &slots, &order);
         save_start_pins(&self.pins);
         self.paint();
     }
@@ -2024,6 +2016,44 @@ fn save_counts(counts: &HashMap<String, (u32, String)>) {
     let _ = std::fs::write(p, body);
 }
 
+// ---- pin reordering ---------------------------------------------------------
+//
+// Drag-and-drop reorders pins by index, and the indices come from tile geometry
+// that is rebuilt on every layout pass. A stale or repeated index there used to
+// panic — and a panic on the shell's UI thread takes the desktop with it — so
+// both permutations below are total: unusable indices are skipped, and no pin is
+// ever dropped on the floor.
+
+/// Reorder `pins` to follow `order`, appending anything `order` left out.
+fn permute(pins: Vec<Entry>, order: &[usize]) -> Vec<Entry> {
+    let mut old: Vec<Option<Entry>> = pins.into_iter().map(Some).collect();
+    let mut out: Vec<Entry> = order
+        .iter()
+        .filter_map(|&i| old.get_mut(i).and_then(Option::take))
+        .collect();
+    out.extend(old.into_iter().flatten());
+    out
+}
+
+/// Rewrite only the entries occupying `slots`, filling those slots with the
+/// entries named by `order` — a folder's members shuffle among themselves while
+/// the folder tile keeps its position in the grid.
+fn permute_slots(pins: Vec<Entry>, slots: &[usize], order: &[usize]) -> Vec<Entry> {
+    let mut old: Vec<Option<Entry>> = pins.into_iter().map(Some).collect();
+    let moved: Vec<Entry> = order
+        .iter()
+        .filter_map(|&i| old.get_mut(i).and_then(Option::take))
+        .collect();
+    // `moved` holds exactly what was taken, so zip places every one of them
+    // even when `order` came out shorter than `slots`.
+    for (slot, e) in slots.iter().zip(moved) {
+        if let Some(s) = old.get_mut(*slot) {
+            *s = Some(e);
+        }
+    }
+    old.into_iter().flatten().collect()
+}
+
 // ---- sorting ----------------------------------------------------------------
 
 /// Sort/section class: 0 = digits & symbols ("#"), 1 = 한글 초성, 2 = A–Z.
@@ -2616,5 +2646,57 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Entry, permute, permute_slots};
+
+    fn pins(names: &[&str]) -> Vec<Entry> {
+        names.iter().map(|n| Entry::new(n.to_string(), n.to_string())).collect()
+    }
+
+    fn names(pins: &[Entry]) -> Vec<&str> {
+        pins.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn permute_reorders() {
+        let out = permute(pins(&["a", "b", "c"]), &[2, 0, 1]);
+        assert_eq!(names(&out), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn permute_survives_repeated_index() {
+        // The old `old[i].take().unwrap()` panicked on the second visit to 0.
+        let out = permute(pins(&["a", "b", "c"]), &[0, 0, 1, 2]);
+        assert_eq!(names(&out), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn permute_survives_stale_index() {
+        let out = permute(pins(&["a", "b"]), &[9, 1, 0]);
+        assert_eq!(names(&out), ["b", "a"]);
+    }
+
+    #[test]
+    fn permute_keeps_unmentioned_pins() {
+        let out = permute(pins(&["a", "b", "c"]), &[2]);
+        assert_eq!(names(&out), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn permute_slots_shuffles_within_slots() {
+        // Folder members live at pins 1 and 3; swapping them must leave 0 and 2
+        // exactly where they are.
+        let out = permute_slots(pins(&["a", "b", "c", "d"]), &[1, 3], &[3, 1]);
+        assert_eq!(names(&out), ["a", "d", "c", "b"]);
+    }
+
+    #[test]
+    fn permute_slots_survives_stale_index() {
+        let out = permute_slots(pins(&["a", "b", "c"]), &[0, 2], &[7, 2, 0]);
+        assert_eq!(names(&out).len(), 3);
     }
 }
