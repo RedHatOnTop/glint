@@ -112,6 +112,55 @@ startup-timing artifact of the capture, not a z-order bug.
   the timer and posts the quit. Verified: 1 process before the close, 0 three
   seconds after.
 
+**Planning the M7 lab, which turned out to be a bug hunt.**
+
+The rehearsal needs a machine whose shell can be swapped, crash-looped on
+purpose, and reverted in seconds — a VM. Deciding how to build one kept walking
+into things that were broken in the product, not in the plan. Four of them, all
+in the class of "only fails on a machine we do not control":
+
+- `774249b` **static CRT.** The binaries imported `vcruntime140.dll`. A fresh
+  Windows image carries the Universal CRT but not the VC++ redistributable, so
+  the shell would have failed to load on the exact machine it is meant to be
+  the shell of — and there would have been no shell from which to install the
+  redistributable. All three binaries are clean now and the bar still renders.
+- `045926a` **WARP fallback.** `D3D11CreateDevice` asked for
+  `D3D_DRIVER_TYPE_HARDWARE` and propagated the failure. A Hyper-V guest has no
+  hardware device at all; neither does a real box for the seconds its GPU driver
+  is being replaced, or an RDP session. Verified by forcing a driver type this
+  box cannot provide: the fallback ran, the shell came up on WARP, and every
+  surface rendered identically.
+- `09d074a` **`safety::note()`.** The fallback above reported itself with
+  `eprintln!`, and once Winlogon starts us there is no console behind stderr —
+  the one condition worth reporting went nowhere. Now appended to `shell.log`
+  beside `crash.log`. Confirmed on disk, UTF-8, with the real `0x887A0004`.
+- `f5b745b` **claim `Shell_TrayWnd` whenever we are the system shell.** The
+  claim was gated on `--tray-claim` alone, but the swap points `Winlogon\Shell`
+  at a plain path. `SHAppBarMessage` is served by whichever window holds that
+  class, so with no explorer and no claim there is no server: our own appbar
+  reservation is dropped, maximized windows cover the bar, `SPI_GETWORKAREA`
+  keeps reporting the full screen, and real apps have nowhere to put a tray
+  icon. Three separate mysteries from one cause, found by reading the
+  boot-as-shell path while Windows installed rather than by hitting it.
+
+Scripts, all parse-checked: `NEW-LAB-VM.ps1` (Gen 2 + vTPM + Secure Boot for
+the Windows 11 requirements, standard checkpoints so a revert keeps running
+state, Guest Service Interface for `Copy-VMFile`), `MANAGE-LAB-VM.ps1` (push /
+exec / pull / checkpoint / revert), `VM-CONSOLE.ps1` (`Msvm_Keyboard` and
+`GetVirtualSystemThumbnailImage`, which read and drive the console with no
+cooperation from the guest — the only thing that still answers "what is on
+screen" when the shell does not come up).
+
+Reviewing those scripts before running them elevated caught three more, in
+`6d66f1f`: integration services were matched by display name on a ko-KR host,
+where they come back localized; the vTPM key protector went through
+`New-HgsGuardian`, writing certificates into the host store for no benefit;
+and `Copy-VMFile` is host-to-guest only, so nothing could come back out.
+
+Edition is Enterprise LTSC on purpose — Shell Launcher, the supported way to
+run a custom shell, does not exist on Pro (confirmed on this box: no
+`WESL_UserSetting` class, no `Eshell.exe`).
+
 Left undone, deliberately: the audit also suggested extracting the repeated
 window scaffold (class registration + wndproc + `GWLP_USERDATA` + D2D setup,
 written out eight times). That is a restructuring of every UI module with real
