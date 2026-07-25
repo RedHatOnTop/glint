@@ -76,12 +76,15 @@ impl Gpu {
             // none for the seconds its GPU driver is being replaced — without a
             // fallback either one takes the whole desktop down at startup.
             // WARP is software but complete: D2D and DirectComposition both
-            // run on it. Loud on the way down, because a silent WARP session
-            // just looks like a machine that got slow.
+            // run on it. Logged rather than printed — by the time this matters
+            // we are the shell, and there is no console behind stderr. A silent
+            // WARP session just looks like a machine that got slow.
             let d3d = match d3d_device(D3D_DRIVER_TYPE_HARDWARE) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("glide-shell: no D3D11 hardware device ({e}); falling back to WARP");
+                    crate::safety::note(&format!(
+                        "no D3D11 hardware device ({e}); falling back to WARP software rendering"
+                    ));
                     d3d_device(D3D_DRIVER_TYPE_WARP)?
                 }
             };

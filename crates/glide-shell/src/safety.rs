@@ -179,6 +179,23 @@ pub fn install_panic_log() {
     }));
 }
 
+/// Record something the user would want to know after the fact.
+///
+/// Once we are the shell there is no console behind stderr, so anything printed
+/// there is gone — and the conditions worth reporting (a missing GPU, a service
+/// that would not start) are exactly the ones nobody is watching a terminal
+/// for. Same directory as `crash.log`, so one place holds the whole story.
+pub fn note(msg: &str) {
+    let p = state_dir().join("shell.log");
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "[{}] {msg}", chrono::Local::now().format("%F %T"));
+    }
+    eprintln!("glide-shell: {msg}");
+}
+
 // ---- selftest -----------------------------------------------------------------
 
 /// M6 gate: 3-crash self-destruct simulation, against a temp state dir, never
