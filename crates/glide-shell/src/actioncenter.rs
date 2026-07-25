@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::quicksettings::{self, Tri};
-use crate::render::{Renderer, fill_round, rect};
+use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -205,11 +205,14 @@ impl ActionCenter {
                 )
             };
             let ui = w!("Segoe UI Variable");
-            let nowrap = |f: IDWriteTextFormat| -> windows::core::Result<IDWriteTextFormat> {
+            // One line, ellipsized: every field here is app-supplied text in a
+            // fixed-width card.
+            let line = |f: IDWriteTextFormat| -> windows::core::Result<IDWriteTextFormat> {
                 f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                ellipsize(&renderer.dwrite, &f);
                 Ok(f)
             };
-            let fmt_head = nowrap(
+            let fmt_head = line(
                 mk(ui, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)
                     .or_else(|_| mk(w!("Segoe UI"), 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD))?,
             )?;
@@ -221,15 +224,15 @@ impl ActionCenter {
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 f
             };
-            let fmt_app = nowrap(
+            let fmt_app = line(
                 mk(ui, 11.0, DWRITE_FONT_WEIGHT_NORMAL)
                     .or_else(|_| mk(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL))?,
             )?;
-            let fmt_title = nowrap(
+            let fmt_title = line(
                 mk(ui, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)
                     .or_else(|_| mk(w!("Segoe UI"), 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD))?,
             )?;
-            let fmt_body = nowrap(
+            let fmt_body = line(
                 mk(ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL)
                     .or_else(|_| mk(w!("Segoe UI"), 12.0, DWRITE_FONT_WEIGHT_NORMAL))?,
             )?;

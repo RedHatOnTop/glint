@@ -51,7 +51,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
-use crate::render::{Renderer, fill_round, rect};
+use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -332,11 +332,14 @@ impl StartMenu {
                 .or_else(|_| mk(w!("Segoe UI"), 12.5, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_item.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             fmt_item.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            // App display names run long; the row does not.
+            ellipsize(&renderer.dwrite, &fmt_item);
             let fmt_grid = mk(family, 11.0, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_grid.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             fmt_grid.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             fmt_grid.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            ellipsize(&renderer.dwrite, &fmt_grid);
             let fmt_center = mk(family, 12.5, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe UI"), 12.5, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_center.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
@@ -346,6 +349,7 @@ impl StartMenu {
                 .or_else(|_| mk(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_tile.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             fmt_tile.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR)?;
+            ellipsize(&renderer.dwrite, &fmt_tile);
             let fmt_section = mk(family, 11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)
                 .or_else(|_| mk(w!("Segoe UI"), 11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
             fmt_section.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;

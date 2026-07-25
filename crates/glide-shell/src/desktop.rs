@@ -21,8 +21,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER, IDWriteTextFormat,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_CENTER, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -44,7 +43,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::render::{Renderer, fill_round, rect};
+use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -153,15 +152,7 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
         )?;
         fmt_label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
         // Two wrapped lines, then a character-ellipsis — explorer's look.
-        let sign = renderer.dwrite.CreateEllipsisTrimmingSign(&fmt_label)?;
-        fmt_label.SetTrimming(
-            &DWRITE_TRIMMING {
-                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                delimiter: 0,
-                delimiterCount: 0,
-            },
-            &sign,
-        )?;
+        ellipsize(&renderer.dwrite, &fmt_label);
 
         let mut desk = Box::new(Desktop {
             renderer,

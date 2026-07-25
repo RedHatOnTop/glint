@@ -33,7 +33,7 @@ use windows::UI::Notifications::Management::{
 use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
 use windows::core::{PCWSTR, w};
 
-use crate::render::{Renderer, fill_round, rect};
+use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,12 +150,15 @@ impl Toasts {
             let fmt_app = mk(family, 11.0, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe UI"), 11.0, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_app.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            ellipsize(&renderer.dwrite, &fmt_app);
             let fmt_title = mk(family, 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)
                 .or_else(|_| mk(w!("Segoe UI"), 12.5, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
             fmt_title.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            ellipsize(&renderer.dwrite, &fmt_title);
             // Body wraps (up to two lines inside the card, then clipped).
             let fmt_body = mk(family, 12.0, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe UI"), 12.0, DWRITE_FONT_WEIGHT_NORMAL))?;
+            ellipsize(&renderer.dwrite, &fmt_body);
             let fmt_glyph = mk(w!("Segoe Fluent Icons"), 10.0, DWRITE_FONT_WEIGHT_NORMAL)
                 .or_else(|_| mk(w!("Segoe MDL2 Assets"), 10.0, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_glyph.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;

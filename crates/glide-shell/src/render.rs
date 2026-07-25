@@ -140,6 +140,8 @@ impl Renderer {
                 .or_else(|_| mk(w!("Segoe UI"), 12.5, DWRITE_FONT_WEIGHT_NORMAL))?;
             fmt_title.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             fmt_title.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            // Window titles are arbitrarily long; the task button is not.
+            ellipsize(&dwrite, &fmt_title);
             let fmt_clock = mk(family, 13.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)
                 .or_else(|_| mk(w!("Segoe UI"), 13.5, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
             fmt_clock.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
@@ -227,6 +229,27 @@ impl Renderer {
 
     pub fn present(&self) -> Result<()> {
         unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)).ok() }
+    }
+}
+
+/// End overflowing text with an ellipsis instead of a hard clip.
+///
+/// Everything in the shell draws into a fixed cell — a task button, an app row,
+/// a notification body, a device name. Without a trimming sign D2D just clips at
+/// the rect edge, which cuts a Hangul syllable apart into a stray jamo and gives
+/// no sign that anything is missing. Character granularity, not word: Korean
+/// rarely offers a word break near the edge.
+pub fn ellipsize(dwrite: &IDWriteFactory, fmt: &IDWriteTextFormat) {
+    unsafe {
+        let Ok(sign) = dwrite.CreateEllipsisTrimmingSign(fmt) else { return };
+        let _ = fmt.SetTrimming(
+            &DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                delimiter: 0,
+                delimiterCount: 0,
+            },
+            &sign,
+        );
     }
 }
 

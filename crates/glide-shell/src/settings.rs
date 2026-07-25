@@ -29,7 +29,7 @@ use windows::core::w;
 use windows_numerics::Vector2;
 
 use crate::quicksettings::{self, RadioSnapshot, Tri};
-use crate::render::{Renderer, fill_round, rect};
+use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 use crate::wifi::Wifi;
 
@@ -384,6 +384,8 @@ impl SettingsApp {
             for f in [&fmt_cat, &fmt_row, &fmt_sub] {
                 f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                // Installed-app and startup-entry names overrun their row.
+                ellipsize(&renderer.dwrite, f);
             }
             // Centred label for the density segmented control.
             let fmt_seg = mkv(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
