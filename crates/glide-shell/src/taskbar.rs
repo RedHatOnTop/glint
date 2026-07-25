@@ -274,7 +274,15 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         let shellhook_msg = RegisterWindowMessageW(w!("SHELLHOOK"));
         let _ = RegisterShellHookWindow(hwnd);
 
-        let mut bar = Bar {
+        // Boxed so the address handed to GWLP_USERDATA below belongs to the
+        // heap, not to this stack frame. Every window in the shell follows the
+        // same contract: the wndproc reads `self` back out of GWLP_USERDATA, so
+        // whatever address is registered has to outlive the window and never
+        // move. The panels embedded in Bar (start, flyout, actioncenter,
+        // settings, overflow) satisfy it by registering from show()/open()
+        // rather than new() — by then they sit at their final address inside
+        // Bar. Bar itself has no such moment, hence the box.
+        let mut bar = Box::new(Bar {
             hwnd,
             renderer,
             entries: Vec::new(),
@@ -309,12 +317,12 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
             desk_stash: Vec::new(),
             cfg: crate::config::load(),
             settings: crate::settings::SettingsApp::new(dpi)?,
-        };
+        });
         bar.refresh();
         bar.rebuild_secondaries();
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut bar as *mut Bar as isize);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *bar as *mut Bar as isize);
         if claim_tray {
-            crate::tray::claim(&mut bar as *mut Bar)?;
+            crate::tray::claim(&mut *bar as *mut Bar)?;
         }
 
         SetTimer(Some(hwnd), TIMER_CLOCK, 1000, None);
