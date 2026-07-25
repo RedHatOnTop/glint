@@ -73,6 +73,10 @@ enum Act {
     CalToday,
 }
 
+/// A device list drawn under one heading: the heading, its (name, is-default)
+/// rows, and the Act constructor that turns a row index into a click target.
+type DeviceSection = (&'static str, Vec<(String, bool)>, fn(usize) -> Act);
+
 /// One render/capture endpoint in the volume panel.
 struct AudioDev {
     /// Null-terminated MMDevice endpoint ID, ready for IPolicyConfig.
@@ -732,7 +736,7 @@ impl Flyout {
         // 출력/입력 device sections, default marked with a check; clicking a
         // non-default row switches the default endpoint (IPolicyConfig).
         let mut y = 8.0;
-        let sections: [(&str, Vec<(String, bool)>, fn(usize) -> Act); 2] = [
+        let sections: [DeviceSection; 2] = [
             (
                 "출력",
                 self.outs.iter().map(|d| (d.name.clone(), d.default)).collect(),

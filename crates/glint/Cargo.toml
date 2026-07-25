@@ -10,3 +10,6 @@ eframe.workspace = true
 env_logger.workspace = true
 log.workspace = true
 global-hotkey = "0.8.0"
+
+[lints]
+workspace = true

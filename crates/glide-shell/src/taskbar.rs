@@ -179,6 +179,7 @@ pub struct Bar {
     /// on WM_DISPLAYCHANGE. Boxed individually on purpose — each Secondary
     /// hands its own address to GWLP_USERDATA, so growing this vec must not
     /// move them.
+    #[allow(clippy::vec_box, reason = "elements are pinned by GWLP_USERDATA")]
     secondaries: Vec<Box<crate::secondary::Secondary>>,
     start: crate::startmenu::StartMenu,
     start_hover: bool,
@@ -1672,7 +1673,7 @@ impl Bar {
     }
 
     fn start_hit(&self, x: f32) -> bool {
-        x >= START_X - 4.0 && x < ENTRY_X0 - 2.0
+        (START_X - 4.0..ENTRY_X0 - 2.0).contains(&x)
     }
 
     fn hit_test(&self, x: f32) -> Option<usize> {

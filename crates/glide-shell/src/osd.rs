@@ -512,7 +512,7 @@ extern "system" fn osd_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_ERASEBKGND => LRESULT(1),
             // Display-only: everything falls through to whatever is beneath.
-            WM_NCHITTEST => LRESULT(HTTRANSPARENT as i32 as isize),
+            WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
             WM_APP_VOL => {
                 let muted = wparam.0 != 0;
                 let vol = lparam.0 as f32 / 1000.0;

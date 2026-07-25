@@ -83,9 +83,7 @@ unsafe extern "system" fn menu_subclass_proc(
     ) {
         let handled = MENU_FWD.with(|f| {
             let f = f.borrow();
-            let Some((cm2, cm3)) = f.as_ref() else {
-                return None;
-            };
+            let (cm2, cm3) = f.as_ref()?;
             if let Some(cm3) = cm3 {
                 let mut lres = LRESULT(0);
                 if unsafe { cm3.HandleMenuMsg2(msg, wparam, lparam, Some(&mut lres)) }.is_ok() {

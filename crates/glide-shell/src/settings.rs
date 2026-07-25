@@ -1342,7 +1342,7 @@ impl SettingsApp {
                 }
             }
             if volume {
-                let (level, muted) = self.vol.map(|(v, m)| (v, m)).unwrap_or((0.0, false));
+                let (level, muted) = self.vol.unwrap_or((0.0, false));
                 let cy = y + CARD_H / 2.0;
                 // Mute button on the far right; accent-filled when muted.
                 let mb = rect(cx1 - 44.0, cy - 15.0, cx1 - 14.0, cy + 15.0);

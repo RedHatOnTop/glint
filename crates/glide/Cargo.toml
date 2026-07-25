@@ -12,3 +12,6 @@ open.workspace = true
 chrono = "0.4"
 windows.workspace = true
 winreg.workspace = true
+
+[lints]
+workspace = true

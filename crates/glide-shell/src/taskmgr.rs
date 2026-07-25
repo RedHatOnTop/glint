@@ -2,10 +2,10 @@
 //! process view for scannability, with Process-Hacker-grade control underneath.
 //!
 //! 프로세스 tab groups processes the way stock Task Manager does: a windowed app
-//! and its whole child-process subtree collapse into one "앱" row (friendly name
-//! + process count + summed CPU/memory), expandable by its chevron; background
-//! processes fold by product name. CPU and memory cells carry a heat tint so the
-//! heavy consumers pop. 서비스 tab is the SCM list with start/stop.
+//! and its whole child-process subtree collapse into one "앱" row (friendly
+//! name + process count + summed CPU/memory), expandable by its chevron;
+//! background processes fold by product name. CPU and memory cells carry a heat
+//! tint so the heavy consumers pop. 서비스 tab is the SCM list with start/stop.
 //!
 //! Control is two-step — a click selects a row (or group), a footer button acts
 //! on it: terminate / kill-tree / suspend / resume / priority. A group action

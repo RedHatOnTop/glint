@@ -79,7 +79,7 @@ pub fn uninstall(cmd: &str) {
     // CreateProcessW may write to the command-line buffer, so it must be owned
     // and writable — hence a Vec, not a literal.
     let mut line: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut si = STARTUPINFOW {
+    let si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
@@ -94,7 +94,7 @@ pub fn uninstall(cmd: &str) {
             CREATE_UNICODE_ENVIRONMENT,
             None,
             None,
-            &mut si,
+            &si,
             &mut pi,
         )
         .is_ok();

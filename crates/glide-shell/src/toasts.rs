@@ -614,7 +614,7 @@ extern "system" fn toast_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 if t.card_at(x, y).is_some() {
                     LRESULT(HTCLIENT as isize)
                 } else {
-                    LRESULT(HTTRANSPARENT as i32 as isize)
+                    LRESULT(HTTRANSPARENT as isize)
                 }
             }
             WM_APP_TOAST => {

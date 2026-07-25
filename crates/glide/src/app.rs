@@ -2566,7 +2566,7 @@ impl GlideApp {
         rect: egui::Rect,
         h: &mut Hits,
     ) -> bool {
-        if !self.edit.as_ref().is_some_and(|ed| ed.target == *path) {
+        if self.edit.as_ref().is_none_or(|ed| ed.target != *path) {
             return false;
         }
         let ed = self.edit.as_mut().unwrap();

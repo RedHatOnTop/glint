@@ -201,7 +201,7 @@ impl TrayOverflow {
     }
 
     fn cols(&self) -> usize {
-        self.items.len().min(COLS).max(1)
+        self.items.len().clamp(1, COLS)
     }
 
     fn rows(&self) -> usize {

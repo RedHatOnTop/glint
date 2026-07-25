@@ -12,3 +12,6 @@ winreg.workspace = true
 raw-window-handle.workspace = true
 windows.workspace = true
 everything-sdk = "0.0.6"
+
+[lints]
+workspace = true

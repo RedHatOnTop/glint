@@ -2,6 +2,22 @@
 resolver = "2"
 members = ["crates/glint", "crates/glide", "crates/glint-core", "crates/glide-shell"]
 
+# Two clippy style lints ask for a shape this codebase deliberately does not
+# use, and 50-odd standing warnings hide the ones worth reading. Turning them
+# off here is the decision, written down.
+#
+# collapsible_if: since the 2024 edition this rewrites `if a { if b { … } }`
+# into a let-chain. The suggestion is fine Rust, but the win32 message handlers
+# are written as nested guards throughout, and converting them piecemeal would
+# leave the crate in two styles at once.
+#
+# too_many_arguments: the D2D and egui painters take geometry and palette
+# positionally (`x, cy, wide, label, act, danger, on`). Bundling those into
+# structs would add indirection to leaf drawing code and buy nothing.
+[workspace.lints.clippy]
+collapsible_if = "allow"
+too_many_arguments = "allow"
+
 [workspace.dependencies]
 glint-core = { path = "crates/glint-core" }
 egui = "0.33.3"

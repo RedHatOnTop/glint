@@ -930,7 +930,7 @@ impl StartMenu {
                     return Some(act);
                 }
             }
-            if x >= 10.0 && x < 10.0 + USER_W {
+            if (10.0..10.0 + USER_W).contains(&x) {
                 return Some(Act::User);
             }
             return None;
