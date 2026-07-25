@@ -8,7 +8,7 @@ use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 use windows_numerics::Vector2;
 
-use crate::render::Renderer;
+use crate::render::{Renderer, fill_round, rect};
 use crate::theme;
 
 // Not exported by WindowsAndMessaging (it's a TrackMouseEvent notification);
@@ -989,18 +989,7 @@ impl Flyout {
     // ---- draw helpers -----------------------------------------------------
 
     fn fill_round(&self, r: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
-        unsafe {
-            if let Ok(b) = self.renderer.brush(c) {
-                if radius > 0.0 {
-                    self.renderer.dc.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius },
-                        &b,
-                    );
-                } else {
-                    self.renderer.dc.FillRectangle(&r, &b);
-                }
-            }
-        }
+        fill_round(&self.renderer, r, radius, c);
     }
 
     fn text(&self, s: &str, fmt: &IDWriteTextFormat, r: D2D_RECT_F, c: D2D1_COLOR_F) {
@@ -1043,10 +1032,6 @@ impl Flyout {
             }
         }
     }
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left, top, right, bottom }
 }
 
 fn wifi_glyph(quality: u32) -> u16 {

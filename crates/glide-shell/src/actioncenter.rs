@@ -19,7 +19,7 @@ use windows::UI::Notifications::Management::{
 use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
-use windows::Win32::Graphics::Direct2D::{D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ROUNDED_RECT};
+use windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_CLIP;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::quicksettings::{self, Tri};
-use crate::render::Renderer;
+use crate::render::{Renderer, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -632,18 +632,7 @@ impl ActionCenter {
     // ---- draw helpers (mirror flyout.rs) ----------------------------------
 
     fn fill_round(&self, r: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
-        unsafe {
-            if let Ok(b) = self.renderer.brush(c) {
-                if radius > 0.0 {
-                    self.renderer.dc.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius },
-                        &b,
-                    );
-                } else {
-                    self.renderer.dc.FillRectangle(&r, &b);
-                }
-            }
-        }
+        fill_round(&self.renderer, r, radius, c);
     }
 
     fn text(&self, s: &str, fmt: &IDWriteTextFormat, r: D2D_RECT_F, c: D2D1_COLOR_F) {
@@ -676,10 +665,6 @@ impl ActionCenter {
             }
         }
     }
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left, top, right, bottom }
 }
 
 fn open_uri(uri: &str) {

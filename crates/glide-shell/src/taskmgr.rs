@@ -19,7 +19,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
+    D2D1_INTERPOLATION_MODE_LINEAR, ID2D1Bitmap1,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
@@ -41,7 +41,7 @@ use windows_numerics::Vector2;
 
 use crate::icons;
 use crate::procs::{self, PRIORITIES, Proc};
-use crate::render::Renderer;
+use crate::render::{Renderer, fill_round, rect};
 use crate::services::{self, Svc};
 use crate::theme;
 
@@ -678,13 +678,7 @@ impl TaskManagerApp {
     // ---- painting ----------------------------------------------------------
 
     fn fill_round(&self, r: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
-        unsafe {
-            if let Ok(b) = self.renderer.brush(c) {
-                self.renderer
-                    .dc
-                    .FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius }, &b);
-            }
-        }
+        fill_round(&self.renderer, r, radius, c);
     }
 
     fn text(&self, s: &str, fmt: &IDWriteTextFormat, r: D2D_RECT_F, c: D2D1_COLOR_F) {
@@ -1051,10 +1045,6 @@ fn dname(p: &Proc) -> String {
         .or_else(|| p.name.strip_suffix(".EXE"))
         .unwrap_or(&p.name)
         .to_string()
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left, top, right, bottom }
 }
 
 fn trunc(s: &str, max: usize) -> String {

@@ -229,3 +229,26 @@ impl Renderer {
         unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)).ok() }
     }
 }
+
+/// A D2D rect from four edges. Every painter in the shell wants this, and each
+/// one used to carry its own copy.
+pub fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
+    D2D_RECT_F { left, top, right, bottom }
+}
+
+/// Fill a rounded rectangle. Radius 0 takes the plain-rectangle path, which is
+/// what the hairlines and separators pass.
+pub fn fill_round(r: &Renderer, rc: D2D_RECT_F, radius: f32, color: D2D1_COLOR_F) {
+    unsafe {
+        if let Ok(b) = r.brush(color) {
+            if radius > 0.0 {
+                r.dc.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT { rect: rc, radiusX: radius, radiusY: radius },
+                    &b,
+                );
+            } else {
+                r.dc.FillRectangle(&rc, &b);
+            }
+        }
+    }
+}

@@ -7,7 +7,7 @@
 //! overflowed HICON on open (which is why the bar carries each icon's hicon).
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
 };
@@ -23,7 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
-use crate::render::Renderer;
+use crate::render::{Renderer, fill_round, rect};
 use crate::theme;
 use crate::tray::{NIN_SELECT, forward};
 
@@ -322,15 +322,8 @@ impl TrayOverflow {
         }
     }
 
-    fn fill_round(&self, r: D2D_RECT_F, radius: f32, c: windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F) {
-        unsafe {
-            if let Ok(b) = self.renderer.brush(c) {
-                self.renderer.dc.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius },
-                    &b,
-                );
-            }
-        }
+    fn fill_round(&self, r: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
+        fill_round(&self.renderer, r, radius, c);
     }
 
     fn text(
@@ -354,10 +347,6 @@ impl TrayOverflow {
             }
         }
     }
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left, top, right, bottom }
 }
 
 extern "system" fn overflow_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

@@ -44,7 +44,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::render::Renderer;
+use crate::render::{Renderer, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -486,21 +486,6 @@ impl Desktop {
         for item in &mut self.items {
             item.selected =
                 item.x < r && item.x + CELL_W > l && item.y < b && item.y + CELL_H > t;
-        }
-    }
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left, top, right, bottom }
-}
-
-fn fill_round(r: &Renderer, rc: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
-    unsafe {
-        if let Ok(b) = r.brush(c) {
-            r.dc.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT { rect: rc, radiusX: radius, radiusY: radius },
-                &b,
-            );
         }
     }
 }

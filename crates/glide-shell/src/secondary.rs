@@ -27,7 +27,7 @@ use windows::Win32::UI::Shell::{ABM_REMOVE, APPBARDATA, SHAppBarMessage};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
-use crate::render::Renderer;
+use crate::render::{Renderer, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -298,14 +298,7 @@ impl Secondary {
     }
 
     fn fill_round(&self, rc: D2D_RECT_F, radius: f32, color: D2D1_COLOR_F) {
-        unsafe {
-            if let Ok(b) = self.renderer.brush(color) {
-                self.renderer.dc.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT { rect: rc, radiusX: radius, radiusY: radius },
-                    &b,
-                );
-            }
-        }
+        fill_round(&self.renderer, rc, radius, color);
     }
 }
 
@@ -356,10 +349,6 @@ pub fn monitors() -> Vec<(RECT, bool)> {
         );
     }
     out
-}
-
-fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
-    D2D_RECT_F { left, top, right, bottom }
 }
 
 extern "system" fn sec_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
