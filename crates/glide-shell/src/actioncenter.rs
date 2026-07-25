@@ -592,13 +592,10 @@ impl ActionCenter {
                 theme::rgba(255, 255, 255, 0.04)
             };
             self.fill_round(r, 7.0, fill);
-            let fg = if !enabled {
-                theme::with_alpha(theme::TEXT_DIM, 0.45)
-            } else if on {
-                theme::TEXT
-            } else {
-                theme::TEXT
-            };
+            // The accent fill already carries the on-state; at 0.34 alpha the
+            // normal foreground still reads against it, so only the disabled
+            // case changes colour.
+            let fg = if enabled { theme::TEXT } else { theme::with_alpha(theme::TEXT_DIM, 0.45) };
             self.glyph(glyph, &self.fmt_glyph.clone(), rect(tx, ty + 8.0, tx + tile_w, ty + 34.0), fg);
             self.text(label, &self.fmt_tile.clone(), rect(tx + 4.0, ty + 36.0, tx + tile_w - 4.0, ty + 54.0), fg);
             self.hits.push((r, Act::Tap(tile)));
