@@ -1,0 +1,7 @@
+# Static CRT. glide-shell replaces explorer, so it has to start on a machine
+# where nothing has been installed yet — a fresh Windows image has the
+# Universal CRT but not the VC++ redistributable, and a dynamic build imports
+# vcruntime140.dll. A shell that needs a redistributable installed first cannot
+# be the shell.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
