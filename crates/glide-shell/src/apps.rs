@@ -61,16 +61,84 @@ pub fn installed() -> Vec<App> {
     out
 }
 
-/// Run an UninstallString. It is a full command line (quoted exe + switches, or
-/// `MsiExec.exe /X{guid}`), so cmd.exe parses it and the vendor uninstaller —
-/// with its own UAC prompt — takes over.
+/// Run an UninstallString. It is already a full command line (quoted exe +
+/// switches, or `MsiExec.exe /X{guid}`), so it goes to `CreateProcessW` as-is —
+/// the same thing appwiz.cpl does. The vendor uninstaller, with its own UAC
+/// prompt, takes over.
+///
+/// It must NOT be routed through `cmd.exe /C`: cmd strips the outer quotes of a
+/// `/C` argument and then re-parses the result, so a quoted image path holding
+/// `&` (e.g. `"…\Intel(R) Graphics Software & Drivers\Uninstaller.exe"
+/// --uninstaller`, present on real machines) splits into two broken commands.
+/// `%` in a path would likewise be eaten by variable expansion.
 pub fn uninstall(cmd: &str) {
+    use windows::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows::core::PWSTR;
+    // CreateProcessW may write to the command-line buffer, so it must be owned
+    // and writable — hence a Vec, not a literal.
+    let mut line: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
+        let started = CreateProcessW(
+            None,
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT,
+            None,
+            None,
+            &mut si,
+            &mut pi,
+        )
+        .is_ok();
+        if started {
+            let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+            let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+        } else {
+            // An uninstaller that needs elevation fails CreateProcess with
+            // ERROR_ELEVATION_REQUIRED; ShellExecute's "runas" path handles the
+            // UAC prompt. Quoting is safe here — no shell re-parse involved.
+            elevated_fallback(cmd);
+        }
+    }
+}
+
+/// Split a command line into image path + arguments so ShellExecuteW can run it
+/// with elevation. Honours a leading quoted path; otherwise splits at the first
+/// space, which is what the unquoted UninstallString convention implies.
+fn elevated_fallback(cmd: &str) {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use windows::core::{PCWSTR, w};
-    let arg = format!("/C {cmd}");
-    let wide: Vec<u16> = arg.encode_utf16().chain(std::iter::once(0)).collect();
+    use windows::core::PCWSTR;
+    let trimmed = cmd.trim();
+    let (exe, args) = if let Some(rest) = trimmed.strip_prefix('"') {
+        match rest.split_once('"') {
+            Some((exe, args)) => (exe, args.trim()),
+            None => (rest, ""),
+        }
+    } else {
+        match trimmed.split_once(' ') {
+            Some((exe, args)) => (exe, args.trim()),
+            None => (trimmed, ""),
+        }
+    };
+    let wexe: Vec<u16> = exe.encode_utf16().chain(std::iter::once(0)).collect();
+    let wargs: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        ShellExecuteW(None, w!("open"), w!("cmd.exe"), PCWSTR(wide.as_ptr()), None, SW_SHOWNORMAL);
+        ShellExecuteW(
+            None,
+            windows::core::w!("runas"),
+            PCWSTR(wexe.as_ptr()),
+            if args.is_empty() { PCWSTR::null() } else { PCWSTR(wargs.as_ptr()) },
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
