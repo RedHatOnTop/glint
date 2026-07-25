@@ -12,7 +12,9 @@ use std::cell::OnceCell;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -48,22 +50,41 @@ pub fn gpu() -> Result<Gpu> {
     })
 }
 
+fn d3d_device(kind: D3D_DRIVER_TYPE) -> Result<ID3D11Device> {
+    unsafe {
+        let mut d3d: Option<ID3D11Device> = None;
+        D3D11CreateDevice(
+            None,
+            kind,
+            Default::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut d3d),
+            None,
+            None,
+        )?;
+        Ok(d3d.unwrap())
+    }
+}
+
 impl Gpu {
     fn new() -> Result<Self> {
         unsafe {
-            let mut d3d: Option<ID3D11Device> = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                Default::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d),
-                None,
-                None,
-            )?;
-            let d3d = d3d.unwrap();
+            // A shell does not get to pick its machine. A Hyper-V synthetic
+            // adapter has no D3D11 hardware device at all, and a real box has
+            // none for the seconds its GPU driver is being replaced — without a
+            // fallback either one takes the whole desktop down at startup.
+            // WARP is software but complete: D2D and DirectComposition both
+            // run on it. Loud on the way down, because a silent WARP session
+            // just looks like a machine that got slow.
+            let d3d = match d3d_device(D3D_DRIVER_TYPE_HARDWARE) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("glide-shell: no D3D11 hardware device ({e}); falling back to WARP");
+                    d3d_device(D3D_DRIVER_TYPE_WARP)?
+                }
+            };
             let dxgi_device: IDXGIDevice = d3d.cast()?;
 
             let d2d_factory: ID2D1Factory1 =
