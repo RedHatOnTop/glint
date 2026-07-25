@@ -41,7 +41,7 @@ use windows_numerics::Vector2;
 
 use crate::icons;
 use crate::procs::{self, PRIORITIES, Proc};
-use crate::render::{Renderer, fill_round, rect};
+use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::services::{self, Svc};
 use crate::theme;
 
@@ -261,6 +261,9 @@ impl TaskManagerApp {
                     w!("ko-KR"),
                 )?;
                 f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                // Every cell here is one line in a fixed column — process names,
+                // product names and service descriptions all overrun it.
+                ellipsize(&renderer.dwrite, &f);
                 Ok(f)
             };
             let ui = w!("Segoe UI");
@@ -344,14 +347,6 @@ impl TaskManagerApp {
         // Draining here is what makes that harmless.
         self.drain();
         self.paint();
-    }
-
-    fn hide(&mut self) {
-        unsafe {
-            let _ = KillTimer(Some(self.hwnd), 1);
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
-        self.hover = None;
     }
 
     fn resized(&mut self) {
@@ -1230,13 +1225,21 @@ unsafe extern "system" fn taskmgr_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                         app.scroll = 0.0;
                         app.paint();
                     } else {
-                        app.hide();
+                        let _ = DestroyWindow(hwnd);
                     }
                 }
                 LRESULT(0)
             }
             WM_CLOSE => {
-                app.hide();
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            // The Task Manager is its own process (`glide-shell --taskmgr`), so
+            // closing the window has to end it. Hiding instead left an orphan
+            // spinning a message loop and a sampler thread, one per open.
+            WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), 1);
+                PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
