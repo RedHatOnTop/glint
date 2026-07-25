@@ -176,7 +176,9 @@ pub struct Bar {
     preview: crate::preview::Preview,
     flyout: crate::flyout::Flyout,
     /// One lightweight bar per non-primary monitor (M5); rebuilt wholesale
-    /// on WM_DISPLAYCHANGE.
+    /// on WM_DISPLAYCHANGE. Boxed individually on purpose — each Secondary
+    /// hands its own address to GWLP_USERDATA, so growing this vec must not
+    /// move them.
     secondaries: Vec<Box<crate::secondary::Secondary>>,
     start: crate::startmenu::StartMenu,
     start_hover: bool,
