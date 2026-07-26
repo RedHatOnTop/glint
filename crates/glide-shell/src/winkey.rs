@@ -47,7 +47,7 @@ pub fn install(bar: HWND) {
     BAR.set(bar.0 as isize);
     unsafe {
         if let Err(e) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) {
-            eprintln!("glide-shell: winkey hook failed: {e}");
+            crate::safety::note(&format!("winkey hook failed: {e}"));
         }
     }
 }
@@ -197,7 +197,7 @@ pub fn toggle_glint() {
                             SW_SHOWNORMAL,
                         );
                     }
-                    _ => eprintln!("glide-shell: glint.exe not found next to shell"),
+                    _ => crate::safety::note("glint.exe not found next to shell"),
                 }
             }
         }

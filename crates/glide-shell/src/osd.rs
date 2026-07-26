@@ -239,7 +239,7 @@ impl Osd {
                 self._endpoint = Some(ep);
                 self._callback = Some(cb);
             }
-            Err(e) => eprintln!("glide-shell: volume OSD subscription failed: {e:?}"),
+            Err(e) => crate::safety::note(&format!("volume OSD subscription failed: {e:?}")),
         }
     }
 
@@ -481,7 +481,7 @@ fn bright_worker(hwnd_raw: isize) {
             }
         })();
         if let Err(e) = r {
-            eprintln!("glide-shell: brightness OSD subscription failed: {e:?}");
+            crate::safety::note(&format!("brightness OSD subscription failed: {e:?}"));
         }
     }
 }

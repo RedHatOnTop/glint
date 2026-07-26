@@ -329,7 +329,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         SetTimer(Some(hwnd), TIMER_RESYNC, 2000, None);
 
         if let Err(e) = crate::desktop::spawn(dpi) {
-            eprintln!("glide-shell: desktop window failed: {e}");
+            crate::safety::note(&format!("desktop window failed: {e}"));
         }
         crate::winkey::install(hwnd);
         crate::clickaway::install(hwnd);
@@ -1407,7 +1407,7 @@ impl Bar {
             }
             match crate::secondary::Secondary::new(mon) {
                 Ok(sec) => self.secondaries.push(sec),
-                Err(e) => eprintln!("glide-shell: secondary bar failed: {e}"),
+                Err(e) => crate::safety::note(&format!("secondary bar failed: {e}")),
             }
         }
         self.sync_secondaries();

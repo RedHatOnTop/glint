@@ -500,7 +500,7 @@ fn open_glide() {
         .and_then(|p| p.parent().map(|d| d.join("glide.exe")))
         .filter(|p| p.exists())
     else {
-        eprintln!("glide-shell: glide.exe not found next to shell");
+        crate::safety::note("glide.exe not found next to shell");
         return;
     };
     unsafe {

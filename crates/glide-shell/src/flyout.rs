@@ -460,7 +460,7 @@ impl Flyout {
     /// watches the (old) default.
     fn set_default_device(&mut self, id: Vec<u16>) {
         if let Err(e) = crate::audiopolicy::set_default_endpoint(&id) {
-            eprintln!("glide-shell: SetDefaultEndpoint failed: {e:?}");
+            crate::safety::note(&format!("SetDefaultEndpoint failed: {e:?}"));
             return;
         }
         // The slider endpoint and the OSD's change subscription both point at

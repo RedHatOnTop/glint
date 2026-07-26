@@ -51,7 +51,7 @@ pub fn install(bar: HWND) {
     BAR.store(bar.0 as isize, Ordering::Relaxed);
     unsafe {
         if let Err(e) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook), None, 0) {
-            eprintln!("glide-shell: clickaway hook failed: {e}");
+            crate::safety::note(&format!("clickaway hook failed: {e}"));
         }
     }
 }

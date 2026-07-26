@@ -2118,16 +2118,29 @@ fn enum_apps() -> Vec<(String, String)> {
         let folder: IShellItem =
             match SHCreateItemFromParsingName(w!("shell:AppsFolder"), None) {
                 Ok(f) => f,
-                Err(_) => return out,
+                Err(e) => {
+                    crate::safety::note(&format!("start menu: no shell:AppsFolder: {e:?}"));
+                    return out;
+                }
             };
         let en: IEnumShellItems = match folder.BindToHandler(None, &BHID_EnumItems) {
             Ok(e) => e,
-            Err(_) => return out,
+            Err(e) => {
+                crate::safety::note(&format!("start menu: AppsFolder BindToHandler: {e:?}"));
+                return out;
+            }
         };
         loop {
             let mut batch: [Option<IShellItem>; 1] = [None];
             let mut got = 0u32;
-            if en.Next(&mut batch, Some(&mut got)).is_err() || got == 0 {
+            if let Err(e) = en.Next(&mut batch, Some(&mut got)) {
+                crate::safety::note(&format!(
+                    "start menu: AppsFolder enumeration stopped after {} items: {e:?}",
+                    out.len()
+                ));
+                break;
+            }
+            if got == 0 {
                 break;
             }
             let Some(item) = batch[0].take() else { break };
@@ -2140,6 +2153,11 @@ fn enum_apps() -> Vec<(String, String)> {
             };
             out.push((name, rel));
         }
+    }
+    if out.is_empty() {
+        // An empty Start is indistinguishable from a machine with no apps, and
+        // the calls above can all succeed and still yield nothing.
+        crate::safety::note("start menu: AppsFolder enumerated 0 apps");
     }
     out.sort_by_cached_key(|(name, _)| {
         let (class, ch) = section_of(name);
