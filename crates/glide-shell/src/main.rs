@@ -108,12 +108,29 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         None | Some("--tray-claim") => {
+            let system_shell = autostart::is_system_shell();
+            // Winlogon starts the shell with no console to inherit, so the
+            // loader allocates one and it sits on top of the desktop for the
+            // whole session. It cannot go away at link time — --register reads
+            // its confirmation off stdin — so drop it on this path only, and
+            // hide rather than free: the handle stays valid, so every print
+            // below still writes somewhere instead of failing.
+            if system_shell {
+                unsafe {
+                    let con = windows::Win32::System::Console::GetConsoleWindow();
+                    if !con.is_invalid() {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                            con,
+                            windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                        );
+                    }
+                }
+            }
             unsafe {
                 let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
                     windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
                 );
             }
-            let system_shell = autostart::is_system_shell();
             // Registering as Shell_TrayWnd is not optional once Winlogon starts
             // us: SHAppBarMessage is served by whichever window holds that
             // class, so with no explorer and no claim there is nobody to honour
