@@ -56,10 +56,22 @@ way back. Host-side screen capture is unavailable in this session —
 1024x768 RGB565 thumbnail, cropped and nearest-neighbour zoomed.
 
 Two new observations: Start search matches display names only, so `cmd` finds
-nothing while `명령 프롬프트` would; and every shell start re-runs the Run keys,
-so restarting the shell N times leaves N copies of `SecurityHealthSystray` in
-the tray. The first is a real gap. The second is an artifact of the lab loop,
-but worth deciding on before the swap goes to real hardware.
+nothing while `명령 프롬프트` would; and every shell start re-runs the Run keys.
+
+- `e03869a` **the duplicate tray icons were ours, not the lab's.** Six identical
+  Defender shields looked like an artifact of restarting the shell by hand until
+  `tasklist` answered: **seven live `SecurityHealthSystray.exe`**, one per shell
+  start. Autostart ran on every start, and Winlogon's AutoRestartShell respins
+  us after every crash — so on real hardware one crash loop is enough to
+  duplicate every startup app the user has. `run_all` is now keyed to the
+  token's AuthenticationId, which is one LUID per logon and survives a restart.
+  Verified in the guest: fresh start launches (`autostart: [HKLM Run]
+  SecurityHealth — launched`), second start logs `already ran this logon session
+  — skipped`, and the process count stays at 1.
+
+  Reaping, checked while chasing this, is fine: killing three systray processes
+  dropped exactly three icons — `taskbar.rs` already sweeps owners with
+  `IsWindow`.
 
 ## 2026-07-26 (morning)
 
