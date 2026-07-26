@@ -113,12 +113,24 @@ struct Entry {
 
 impl Entry {
     fn new(name: String, parsing: String) -> Self {
-        let launch = format!(r"shell:AppsFolder\{parsing}")
+        let launch = parse_target(&parsing)
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         let wname = name.encode_utf16().collect();
         Entry { name, wname, parsing, launch, wide: false, folder: None }
+    }
+}
+
+/// What `SHCreateItemFromParsingName` (and ShellExecute) should be handed for a
+/// stored parsing name. AppsFolder IDs are relative — `Microsoft.WindowsStore…`
+/// or `{GUID}\path\app.exe` — while the Start Menu fallback stores absolute
+/// `.lnk` paths, which parse on their own and must not be prefixed.
+fn parse_target(parsing: &str) -> String {
+    if std::path::Path::new(parsing).is_absolute() {
+        parsing.to_string()
+    } else {
+        format!(r"shell:AppsFolder\{parsing}")
     }
 }
 
@@ -435,6 +447,14 @@ impl StartMenu {
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, self as *mut StartMenu as isize);
         }
         crate::clickaway::set_start_open(true);
+        // The pointer above is the wndproc's only way back to us, and it cannot
+        // be installed in new() — StartMenu is returned by value, so its address
+        // is not final until it has been stored. Every WM_APP_REPLY posted
+        // before this line therefore hit a null userdata and was dropped, the
+        // prewarm reply included: the list sat in the channel with nothing left
+        // to wake the drain, and the menu stayed on "loading" for the life of
+        // the session. Drain here so the first open collects it.
+        self.on_replies();
         if !self.loading
             && self
                 .loaded_at
@@ -2092,10 +2112,11 @@ fn worker(jobs: Receiver<Job>, replies: Sender<Reply>, hwnd_raw: isize) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
+    crate::safety::note("start menu: worker up");
     let hwnd = HWND(hwnd_raw as *mut _);
     while let Ok(job) = jobs.recv() {
         let rep = match job {
-            Job::Apps { epoch } => Reply::Apps { epoch, list: enum_apps() },
+            Job::Apps { epoch } => Reply::Apps { epoch, list: apps_or_fallback() },
             Job::Icon { parsing } => {
                 let (w, h, pixels) = extract_icon(&parsing).unwrap_or((0, 0, Vec::new()));
                 Reply::Icon { parsing, w, h, pixels }
@@ -2108,6 +2129,97 @@ fn worker(jobs: Receiver<Job>, replies: Sender<Reply>, hwnd_raw: isize) {
             let _ = PostMessageW(Some(hwnd), WM_APP_REPLY, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// How long AppsFolder gets before the Start menu stops waiting for it.
+const APPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// AppsFolder, or the Start Menu shortcut trees when it does not answer.
+///
+/// On a Winlogon-started shell with no explorer, the AppsFolder enumeration
+/// does not fail — it never returns, and because it sits at the head of the one
+/// COM worker queue it takes every icon job down with it, so the menu stays on
+/// "loading" forever. The enumeration therefore runs on a thread of its own
+/// that we are willing to abandon: a hung COM call cannot be cancelled, so the
+/// thread is left blocked and the queue moves on.
+fn apps_or_fallback() -> Vec<(String, String)> {
+    let t0 = std::time::Instant::now();
+    crate::safety::note("start menu: enumerating apps");
+    let (tx, rx) = channel::<Vec<(String, String)>>();
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let _ = tx.send(enum_apps());
+    });
+    match rx.recv_timeout(APPS_TIMEOUT) {
+        Ok(list) if !list.is_empty() => {
+            crate::safety::note(&format!(
+                "start menu: {} apps from AppsFolder in {}ms",
+                list.len(),
+                t0.elapsed().as_millis()
+            ));
+            list
+        }
+        Ok(_) => {
+            let list = start_menu_apps();
+            crate::safety::note(&format!(
+                "start menu: AppsFolder empty, {} apps from the Start Menu trees",
+                list.len()
+            ));
+            list
+        }
+        Err(_) => {
+            let list = start_menu_apps();
+            crate::safety::note(&format!(
+                "start menu: AppsFolder did not answer in {}s, {} apps from the Start Menu trees",
+                APPS_TIMEOUT.as_secs(),
+                list.len()
+            ));
+            list
+        }
+    }
+}
+
+/// Every `.lnk` under the common and per-user Start Menu trees, which is where
+/// installers put shortcuts and what Start showed for the fifteen years before
+/// AppsFolder existed. Display name is the shortcut's own; the parsing name is
+/// its absolute path, which `parse_target` passes through untouched.
+fn start_menu_apps() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>, depth: u32) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out, depth + 1);
+            } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+                out.push((stem.to_string(), p.to_string_lossy().into_owned()));
+            }
+        }
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for var in ["ProgramData", "APPDATA"] {
+        let Ok(base) = std::env::var(var) else { continue };
+        walk(
+            &std::path::Path::new(&base).join(r"Microsoft\Windows\Start Menu\Programs"),
+            &mut out,
+            0,
+        );
+    }
+    // Same program installed for the machine and the user is one entry, as
+    // Start shows it.
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    out.sort_by_cached_key(|(name, _)| {
+        let (class, ch) = section_of(name);
+        (class, ch, name.to_lowercase())
+    });
+    out
 }
 
 /// (display name, parsing name) for everything the stock Start shows,
@@ -2154,11 +2266,6 @@ fn enum_apps() -> Vec<(String, String)> {
             out.push((name, rel));
         }
     }
-    if out.is_empty() {
-        // An empty Start is indistinguishable from a machine with no apps, and
-        // the calls above can all succeed and still yield nothing.
-        crate::safety::note("start menu: AppsFolder enumerated 0 apps");
-    }
     out.sort_by_cached_key(|(name, _)| {
         let (class, ch) = section_of(name);
         (class, ch, name.to_lowercase())
@@ -2171,7 +2278,7 @@ fn enum_apps() -> Vec<(String, String)> {
 /// buffer is what mangled the first cut of these icons.
 fn extract_icon(parsing: &str) -> Option<(i32, i32, Vec<u8>)> {
     unsafe {
-        let path: Vec<u16> = format!(r"shell:AppsFolder\{parsing}")
+        let path: Vec<u16> = parse_target(parsing)
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
