@@ -1202,9 +1202,11 @@ impl Bar {
         Some(((x - left) / STATUS_CELL_W) as usize)
     }
 
-    /// Logical x of the promoted tray icons' left edge.
+    /// Logical x of the promoted tray icons' left edge. The gap is wider than a
+    /// cell's own padding because the system capsule starts right after it, and
+    /// a colour app icon touching that capsule reads as being inside it.
     fn tray_left(&self) -> f32 {
-        self.status_left() - (self.tray_promoted().len() as f32 * TRAY_CELL_W) - 4.0
+        self.status_left() - (self.tray_promoted().len() as f32 * TRAY_CELL_W) - 11.0
     }
 
     /// Logical x of the `^` chevron cell's left edge (only meaningful when
@@ -2145,6 +2147,27 @@ impl Bar {
         let cells = self.status_cells();
         let left = self.status_left();
         unsafe {
+            // App tray icons are full-colour bitmaps we do not own; ours are
+            // monochrome line glyphs. Mixed side by side with nothing between
+            // them the strip reads as one row of inconsistent icons, so the
+            // system cells get a capsule of their own — the two languages then
+            // read as two groups, which is what they are.
+            if !cells.is_empty() {
+                let inset = 6.0;
+                let capsule = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: left - 3.0,
+                        top: inset,
+                        right: left + cells.len() as f32 * STATUS_CELL_W + 3.0,
+                        bottom: bar_h - inset,
+                    },
+                    radiusX: (bar_h - 2.0 * inset) / 2.0,
+                    radiusY: (bar_h - 2.0 * inset) / 2.0,
+                };
+                if let Ok(b) = r.brush(theme::rgba(255, 255, 255, 0.055)) {
+                    r.dc.FillRoundedRectangle(&capsule, &b);
+                }
+            }
             for (i, cell) in cells.iter().enumerate() {
                 let cx = left + i as f32 * STATUS_CELL_W;
                 let rect = D2D_RECT_F {
@@ -2163,8 +2186,8 @@ impl Bar {
                                     right: cx + STATUS_CELL_W,
                                     bottom: bar_h - 7.0,
                                 },
-                                radiusX: 4.0,
-                                radiusY: 4.0,
+                                radiusX: (bar_h - 14.0) / 2.0,
+                                radiusY: (bar_h - 14.0) / 2.0,
                             },
                             &b,
                         );
@@ -2190,12 +2213,33 @@ impl Bar {
                         } else {
                             ("A", theme::TEXT)
                         };
+                        // Key cap: a stroked box the same optical size as the
+                        // glyphs beside it, so the letter is an icon rather
+                        // than a word sitting in a row of icons.
+                        let cap = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: cx + (STATUS_CELL_W - 17.0) / 2.0,
+                                top: (bar_h - 15.0) / 2.0,
+                                right: cx + (STATUS_CELL_W + 17.0) / 2.0,
+                                bottom: (bar_h + 15.0) / 2.0,
+                            },
+                            radiusX: 4.5,
+                            radiusY: 4.5,
+                        };
+                        if hangul {
+                            if let Ok(b) = r.brush(theme::with_alpha(color, 0.22)) {
+                                r.dc.FillRoundedRectangle(&cap, &b);
+                            }
+                        }
+                        if let Ok(b) = r.brush(theme::with_alpha(color, 0.75)) {
+                            r.dc.DrawRoundedRectangle(&cap, &b, 1.0, None);
+                        }
                         let utf16: Vec<u16> = s.encode_utf16().collect();
                         if let Ok(b) = r.brush(color) {
                             r.dc.DrawText(
                                 &utf16,
-                                &r.fmt_status,
-                                &rect,
+                                &r.fmt_badge,
+                                &D2D_RECT_F { bottom: cap.rect.bottom + 0.5, ..cap.rect },
                                 &b,
                                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                                 DWRITE_MEASURING_MODE_NATURAL,

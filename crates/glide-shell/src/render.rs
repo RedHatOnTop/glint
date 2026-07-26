@@ -116,6 +116,7 @@ pub struct Renderer {
     pub fmt_date: IDWriteTextFormat,
     pub fmt_glyph: IDWriteTextFormat,
     pub fmt_status: IDWriteTextFormat,
+    pub fmt_badge: IDWriteTextFormat,
     pub dpi: f32,
 }
 
@@ -181,6 +182,13 @@ impl Renderer {
                 .or_else(|_| mk(w!("Segoe UI"), 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
             fmt_status.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
             fmt_status.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            // 한/A rides inside a drawn key cap so it reads as an icon next to
+            // the Fluent line glyphs instead of as loose text; it has to be a
+            // size smaller than fmt_status to sit inside one.
+            let fmt_badge = mk(family, 9.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)
+                .or_else(|_| mk(w!("Segoe UI"), 9.5, DWRITE_FONT_WEIGHT_SEMI_BOLD))?;
+            fmt_badge.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            fmt_badge.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             let mut r = Renderer {
                 _gpu: gpu,
@@ -193,6 +201,7 @@ impl Renderer {
                 fmt_date,
                 fmt_glyph,
                 fmt_status,
+                fmt_badge,
                 dpi,
             };
             r.bind_backbuffer()?;

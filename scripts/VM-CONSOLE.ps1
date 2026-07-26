@@ -14,7 +14,7 @@
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('shot', 'type', 'key', 'keys')]
+    [ValidateSet('shot', 'type', 'key', 'keys', 'chord')]
     [string]$Action,
     [string]$Name = 'glint-lab',
     [string]$Out = 'vm-console.png',
@@ -101,5 +101,31 @@ switch ($Action) {
             Start-Sleep -Milliseconds 80
         }
         Write-Host "sent $($KeyCode.Count) key(s)"
+    }
+
+    'chord' {
+        # TypeKey is a tap, so it cannot express Alt+Tab — and Alt+Tab is the
+        # only way back to a window once a shell restart has left the guest with
+        # nothing focused and no mouse to click with. Hold the modifiers down,
+        # tap the last key, let go in reverse. 18 = Alt, 17 = Ctrl, 16 = Shift.
+        if (-not $KeyCode -or $KeyCode.Count -lt 2) { throw '-KeyCode needs at least two codes for "chord" (e.g. 18,9 for Alt+Tab).' }
+        $kbd = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard
+        $held = $KeyCode[0..($KeyCode.Count - 2)]
+        foreach ($k in $held) {
+            $r = Invoke-CimMethod -InputObject $kbd -MethodName PressKey -Arguments @{ keyCode = [uint16]$k }
+            if ($r.ReturnValue -ne 0) { throw "PressKey $k failed: $($r.ReturnValue)" }
+        }
+        $last = $KeyCode[-1]
+        $r = Invoke-CimMethod -InputObject $kbd -MethodName TypeKey -Arguments @{ keyCode = [uint16]$last }
+        if ($r.ReturnValue -ne 0) { throw "TypeKey $last failed: $($r.ReturnValue)" }
+        Start-Sleep -Milliseconds 120
+        # Release even if the tap failed, or the guest is left with Alt stuck
+        # down and every later keystroke becomes a menu accelerator.
+        [array]::Reverse($held)
+        foreach ($k in $held) {
+            $r = Invoke-CimMethod -InputObject $kbd -MethodName ReleaseKey -Arguments @{ keyCode = [uint16]$k }
+            if ($r.ReturnValue -ne 0) { throw "ReleaseKey $k failed: $($r.ReturnValue)" }
+        }
+        Write-Host "chord $($KeyCode -join '+')"
     }
 }
