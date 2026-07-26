@@ -75,7 +75,10 @@ switch ($Action) {
         }
         finally { $bmp.UnlockBits($data) }
 
-        $Out = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Out))
+        # Join-Path happily concatenates an already-rooted second element into
+        # nonsense like C:\repo\C:/tmp/shot.png, which GetFullPath then rejects.
+        if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path (Get-Location) $Out }
+        $Out = [System.IO.Path]::GetFullPath($Out)
         $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
         $bmp.Dispose()
         Write-Host "shot $Name ${Width}x${Height} -> $Out"
