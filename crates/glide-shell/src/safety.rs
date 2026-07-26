@@ -98,7 +98,7 @@ pub fn unregister() -> anyhow::Result<()> {
 
 // ---- crash counter ------------------------------------------------------------
 
-fn state_dir() -> std::path::PathBuf {
+pub fn state_dir() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("GLIDE_SHELL_STATE_DIR") {
         return p.into();
     }

@@ -218,9 +218,59 @@ pub fn execute(e: &Entry) -> bool {
     }
 }
 
+/// Identity of the logon session this process belongs to. The token's
+/// AuthenticationId is a new LUID per logon, so it survives a shell restart and
+/// changes on log off — exactly the lifetime autostart should key on.
+fn logon_session_id() -> Option<String> {
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut stats = TOKEN_STATISTICS::default();
+        let mut len = 0u32;
+        let r = GetTokenInformation(
+            token,
+            TokenStatistics,
+            Some(&mut stats as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        r.ok()?;
+        let luid = stats.AuthenticationId;
+        Some(format!("{:x}:{:x}", luid.HighPart, luid.LowPart))
+    }
+}
+
 /// The real shell duty: run everything enabled. RunOnce values are deleted
 /// before launching, matching Windows' contract for names without '!'.
+///
+/// Once per logon session, not once per start. Winlogon's AutoRestartShell
+/// respins us after a crash and our own restart path re-execs, and both used to
+/// launch every startup app again — a lab session that restarted the shell
+/// seven times ended up with seven live SecurityHealthSystray processes and
+/// seven identical tray icons. The apps from the first start are still running;
+/// the second start has nothing to do.
 pub fn run_all() {
+    let marker = crate::safety::state_dir().join("autostart.session");
+    let session = logon_session_id();
+    if let Some(id) = &session {
+        if std::fs::read_to_string(&marker).is_ok_and(|s| s.trim() == id) {
+            crate::safety::note("autostart: already ran this logon session — skipped");
+            return;
+        }
+        // Written before the first launch: a crash halfway through must not
+        // hand the next start a licence to run everything a second time.
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, id);
+    }
+    // No session id means no way to tell a restart from a fresh logon. Running
+    // is the recoverable mistake; skipping forever is not.
     for e in enumerate() {
         if !e.enabled {
             continue;
@@ -231,12 +281,12 @@ pub fn run_all() {
             _ => {}
         }
         let ok = execute(&e);
-        eprintln!(
+        crate::safety::note(&format!(
             "autostart: [{}] {} — {}",
             e.source.label(),
             e.name,
             if ok { "launched" } else { "FAILED" }
-        );
+        ));
     }
 }
 
