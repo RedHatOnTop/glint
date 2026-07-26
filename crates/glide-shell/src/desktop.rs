@@ -421,11 +421,26 @@ impl Desktop {
                     );
                 }
 
-                // Label: dark offset pass first so text survives any wallpaper.
+                // Label: a single drop shadow only darkens one side, and a
+                // bright busy wallpaper eats white text on the other three.
+                // Ring the glyphs instead — eight offsets at low alpha build a
+                // halo that reads as a soft shadow but works against any
+                // background, without a scrim box behind every icon.
                 let lr = rect(item.x + 2.0, iy + ICON + 4.0, item.x + CELL_W - 2.0, item.y + CELL_H - 2.0);
-                let shadow = rect(lr.left, lr.top + 1.2, lr.right, lr.bottom + 1.2);
-                self.label(&item.label, shadow, theme::rgba(0, 0, 0, 0.75));
-                self.label(&item.label, lr, theme::rgba(240, 242, 246, 1.0));
+                const HALO: [(f32, f32); 8] = [
+                    (-1.0, -1.0), (0.0, -1.0), (1.0, -1.0),
+                    (-1.0, 0.0), (1.0, 0.0),
+                    (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0),
+                ];
+                for (dx, dy) in HALO {
+                    let o = rect(lr.left + dx, lr.top + dy, lr.right + dx, lr.bottom + dy);
+                    self.label(&item.label, o, theme::rgba(0, 0, 0, 0.34));
+                }
+                // Weight under the text so it sits on the wallpaper rather than
+                // floating in a uniform outline.
+                let drop = rect(lr.left, lr.top + 2.0, lr.right, lr.bottom + 2.0);
+                self.label(&item.label, drop, theme::rgba(0, 0, 0, 0.35));
+                self.label(&item.label, lr, theme::rgba(244, 246, 250, 1.0));
             }
 
             if let Some(m) = &self.marquee {
