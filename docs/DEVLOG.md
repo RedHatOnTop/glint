@@ -10,6 +10,62 @@ build is not evidence that anything rendered).
 
 ---
 
+## 2026-07-26
+
+**The swap actually ran.** `Winlogon\Shell` pointed at `glide-shell.exe` in the
+lab VM, explorer never started, and Glide came up as the session's only shell —
+bar, tray, clock, wallpaper and desktop icons all drawn by us. Three defects
+fell out of the first two boots, none of which any run on this box could have
+produced.
+
+Getting there took repairing the rig, which had drifted since it was written:
+the VM's Guest Service Interface was off, so `Copy-VMFile` failed with
+`0x80070015`, and `Enable-VMIntegrationService -Name 'Guest Service Interface'`
+does not work on a ko-KR host — the service names come back localized, so it
+matches by GUID (`6C09BB55`) now. `lab-cred.xml` was never created, so
+PowerShell Direct is still unavailable; everything below was driven through
+`VM-CONSOLE.ps1`'s `Msvm_Keyboard` instead, which needs no guest account.
+
+- `5974ff7` **VM-CONSOLE `-Out` with an absolute path.** `Join-Path` concatenates
+  a rooted second element rather than replacing the base, so
+  `C:\tmp\shot.png` became `C:\repo\C:\tmp\shot.png` and `GetFullPath` threw
+  before anything was captured.
+- `a62657f` **the console Winlogon allocates.** A console-subsystem binary
+  started with no console to inherit gets one, and it sat on top of the desktop
+  for the whole session, titled `C:\glint\glide-shell.exe`. Every dev run
+  inherits the terminal's console, so this could only appear here. Linking as a
+  windows-subsystem binary would take `--register`'s stdin confirmation with
+  it, so the console stays and the resident-shell path hides its window;
+  hiding rather than freeing keeps the handle valid so the diagnostics still
+  write somewhere. Verified: second boot, same swap, no console.
+- `ff00bc2` **diagnostics that went nowhere.** Nine one-shot failures reported
+  through `eprintln!` — now `safety::note()`. Confirmed by reading `shell.log`
+  off the guest screen: `volume OSD subscription failed: HRESULT(0x80070490)`,
+  which is a Hyper-V guest having no audio endpoint at all.
+
+**Open, and the reason to keep the lab: the Start menu never fills in.**
+`shell:AppsFolder` enumeration does not fail — it does not return. The pane sits
+on "앱 목록 불러오는 중..." indefinitely and a search reports 0 matches, and
+after the same commit taught `enum_apps` to report all three of its failure
+paths *and* a successful-but-empty enumeration, `shell.log` still holds nothing
+but the audio line. That rules out a swallowed HRESULT and leaves a hang, which
+also explains the icon jobs never arriving: they queue behind it on the one COM
+worker. Suspected cause is that the AppsFolder namespace extension wants a
+running explorer; the fix is a time-boxed enumeration with the Start Menu
+`.lnk` trees as the fallback source, which a shell wants regardless.
+
+Two smaller things seen and not yet chased: with focus on a console window the
+Win key reached that window instead of opening our Start menu, so the low-level
+hook is not always winning; and Glide's desktop draws the Edge shortcut but not
+the Recycle Bin, which is a namespace item rather than a file.
+
+Reading the guest without credentials, for the next session: `Copy-VMFile`
+without `-Force` is an existence probe (it fails if the target is there, and a
+known-absent control proves the method), and an unelevated
+`schtasks /create /sc once /st HH:MM /tr "cmd /k type …\shell.log"` puts a log
+on screen where the thumbnail can read it. `/sc onlogon` is refused without
+elevation.
+
 ## 2026-07-25
 
 **Public-repo setup.** Added this devlog, a `README.md` landing page describing
