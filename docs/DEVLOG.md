@@ -10,7 +10,58 @@ build is not evidence that anything rendered).
 
 ---
 
-## 2026-07-26
+## 2026-07-26 (evening)
+
+**The Start menu fills in, and the tray strip reads as a design.** Three defects
+from the morning's first swap are fixed and verified in the guest, and the
+safety ladder fired for real — by accident, which is the best way to learn it
+works.
+
+- `4a317a2` **the Start menu was never hanging.** Instrumenting the worker
+  settled it in one boot: `49 apps from AppsFolder in 349ms`. The reply was
+  dropped on delivery, not produced late. `WM_APP_REPLY` finds the menu through
+  `GWLP_USERDATA`, and that pointer cannot be installed in `new()` because
+  `StartMenu` is returned by value — so it is installed in `show()`, and every
+  reply posted before the first open hit a null userdata and was discarded by
+  the wndproc prologue. The prewarmed list then sat in the channel with nothing
+  left to wake the drain, and `show()` only re-requests when `!loading`, which
+  never came back: stuck for the life of the session. `show()` now drains right
+  after the pointer lands. The time-boxed Start Menu `.lnk` fallback went in as
+  well, since a shell wants it regardless. Verified: 49 apps, icons and Hangul
+  section headers, on the first Win-key press after a boot.
+- `7182dc6` **one visual language per group in the tray.** Colour app bitmaps,
+  our monochrome line glyphs and 한/A as loose text sat in one undifferentiated
+  row. The system cells now share a faint capsule with a real gap before the app
+  icons, and 한/A got a stroked key cap sized to the glyphs beside it.
+- `5d978ca` **desktop labels survive the wallpaper.** A single drop shadow only
+  darkens one side; eight one-pixel offsets at low alpha ring the glyphs
+  instead. The bamboo wallpaper that made "Microsoft Edge" illegible was the
+  test.
+
+**The crash-loop self-destruct works.** Swapping the binary by
+`taskkill /f /im glide-shell.exe` counts as a crash — the sentinel is left at
+`running` — so three iterations of the edit-build-push loop tripped the ladder:
+`Shell=` deleted, explorer respawned, and a dialog explaining both. Exactly the
+designed behaviour, reached without meaning to. The lab loop now writes `clean`
+to `session.state` and truncates `crash_stamps.txt` as part of the swap.
+
+Rig, for the next session: `taskkill` releases the image lock asynchronously, so
+a `move` onto the running exe needs a `timeout /t 5` before it or it fails with
+`액세스가 거부되었습니다` and silently restarts the *old* binary — twice mistaken
+for a change not landing. After a shell restart the guest has nothing focused
+and `Msvm_Keyboard` types into the void; `VM-CONSOLE.ps1 -Action chord`
+(`PressKey`/`ReleaseKey`, added in `7182dc6`) sends Alt+Tab, which is the only
+way back. Host-side screen capture is unavailable in this session —
+`CopyFromScreen` throws `The handle is invalid` — so verification ran off the
+1024x768 RGB565 thumbnail, cropped and nearest-neighbour zoomed.
+
+Two new observations: Start search matches display names only, so `cmd` finds
+nothing while `명령 프롬프트` would; and every shell start re-runs the Run keys,
+so restarting the shell N times leaves N copies of `SecurityHealthSystray` in
+the tray. The first is a real gap. The second is an artifact of the lab loop,
+but worth deciding on before the swap goes to real hardware.
+
+## 2026-07-26 (morning)
 
 **The swap actually ran.** `Winlogon\Shell` pointed at `glide-shell.exe` in the
 lab VM, explorer never started, and Glide came up as the session's only shell —
