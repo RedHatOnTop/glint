@@ -10,6 +10,31 @@ build is not evidence that anything rendered).
 
 ---
 
+## 2026-07-27 (evening)
+
+Desktop gap 1 of 4: **the desktop had no namespace items.** It enumerated two
+folders and nothing else, so 휴지통 — the one desktop icon a fresh Windows
+profile actually ships — was missing, and with explorer gone there was no other
+way to reach it.
+
+- Items now carry a shell *parsing name* (`::{CLSID}` or a filesystem path)
+  next to their optional `PathBuf`; label, icon, context menu and opening all
+  key off it. The five desktop roots are read from `HideDesktopIcons\NewStartPanel`
+  with explorer's own defaults for the values it has never written. Labels come
+  from `IShellItem::GetDisplayName`, so they are localized; opening goes through
+  `shell:::{CLSID}`, which is not a path and would not survive `ShellExecute`
+  otherwise.
+- Multi-selection menus now group by "shares one IShellFolder" rather than by
+  parent directory, since namespace items have no parent directory.
+- **rig: `GUEST-MOUSE.ps1`.** Hyper-V exposes a synthetic keyboard over WMI and
+  nothing for the pointer, but the desktop is a mouse surface. The click is made
+  inside the guest instead, driven from the console.
+
+Verified in the lab: 휴지통 renders first with the real shell icon and its
+Korean label, right-click brings up the genuine shell menu (열기 / 즐겨찾기에
+고정 / 휴지통 비우기 grayed because it is empty / 시작 화면에 고정 / 바로 가기
+만들기 / 속성), and double-click opens it.
+
 ## 2026-07-27
 
 Two more shell-only defects closed, both found by using the guest rather than

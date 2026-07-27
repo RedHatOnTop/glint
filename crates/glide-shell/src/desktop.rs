@@ -9,7 +9,7 @@
 //! Not yet: explorer's saved icon positions (undocumented ItemPos blobs — we
 //! auto-arrange), drag, keyboard. Recorded in §6.3.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -37,8 +37,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState,
 };
 use windows::Win32::UI::Shell::{
-    IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
-    SIIGBF_RESIZETOFIT, ShellExecuteW,
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY,
+    SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -67,14 +67,44 @@ const CELL_GAP: f32 = 6.0;
 const ICON: f32 = 48.0;
 const MARGIN: f32 = 18.0;
 
+/// The desktop's namespace roots, in the order explorer lists them, with the
+/// visibility each has on a fresh profile. They are not files — they live in
+/// the shell namespace directly under the desktop, so everything about them
+/// (label, icon, menu, opening) goes through their `::{CLSID}` parsing name.
+const NAMESPACE_ITEMS: [(&str, bool); 5] = [
+    ("{20D04FE0-3AEA-1069-A2D8-08002B30309D}", false), // 내 PC
+    ("{59031A47-3F72-44A7-89C5-5595FE6B30EE}", false), // 사용자 파일
+    ("{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", false), // 네트워크
+    ("{645FF040-5081-101B-9F08-00AA002F954E}", true),  // 휴지통
+    ("{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}", false), // 제어판
+];
+
+/// Which of the above the user has turned on (개인 설정 → 테마 → 바탕 화면 아이콘
+/// 설정 writes here). A DWORD of 1 hides; absent means "leave the default".
+const HIDE_ICONS: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
+
 struct Item {
-    path: PathBuf,
+    /// Shell parsing name: a filesystem path, or `::{CLSID}`. This is the
+    /// identity the shell answers to — menus and icons are built from it.
+    parsing: String,
+    /// Filesystem path, for the items that have one.
+    path: Option<PathBuf>,
     label: Vec<u16>,
     bitmap: Option<ID2D1Bitmap1>,
     /// Cell top-left, logical.
     x: f32,
     y: f32,
     selected: bool,
+}
+
+impl Item {
+    /// Items with equal keys share one IShellFolder, which is what a
+    /// multi-selection context menu is built against. Namespace items all
+    /// answer to the desktop root, so they group together as `None`.
+    fn menu_group(&self) -> Option<PathBuf> {
+        self.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    }
 }
 
 struct Marquee {
@@ -94,7 +124,7 @@ pub struct Desktop {
     /// What the items were built from; WM_SETTINGCHANGE is broadcast for
     /// unrelated settings (ScreenXpert is chatty), so skip the shell-icon
     /// re-extraction unless the folder contents or work area changed.
-    items_sig: (Vec<PathBuf>, (i32, i32, i32, i32)),
+    items_sig: (Vec<String>, (i32, i32, i32, i32)),
     hover: Option<usize>,
     marquee: Option<Marquee>,
     tracking: bool,
@@ -257,10 +287,17 @@ impl Desktop {
         }
     }
 
-    /// Merge the user and public Desktop folders, dirs first then by name,
-    /// laid out in explorer-style columns inside the work area.
+    /// The enabled namespace roots, then the user and public Desktop folders
+    /// merged with dirs first and then by name, laid out in explorer-style
+    /// columns inside the work area.
     fn load_items(&mut self) {
-        let mut found: Vec<(PathBuf, bool)> = Vec::new();
+        let mut found: Vec<(String, Option<PathBuf>)> = NAMESPACE_ITEMS
+            .iter()
+            .filter(|(clsid, default_on)| namespace_visible(clsid, *default_on))
+            .map(|(clsid, _)| (format!("::{clsid}"), None))
+            .collect();
+
+        let mut files: Vec<(PathBuf, bool)> = Vec::new();
         let roots = [
             std::env::var("USERPROFILE").ok().map(|p| PathBuf::from(p).join("Desktop")),
             std::env::var("PUBLIC").ok().map(|p| PathBuf::from(p).join("Desktop")),
@@ -278,16 +315,21 @@ impl Desktop {
                 if meta.file_attributes() & 0x2 != 0 {
                     continue; // FILE_ATTRIBUTE_HIDDEN
                 }
-                found.push((path, meta.is_dir()));
+                files.push((path, meta.is_dir()));
             }
         }
-        found.sort_by(|a, b| {
+        files.sort_by(|a, b| {
             b.1.cmp(&a.1).then_with(|| {
                 let an = a.0.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
                 let bn = b.0.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
                 an.cmp(&bn)
             })
         });
+        found.extend(
+            files
+                .into_iter()
+                .map(|(p, _)| (p.as_os_str().to_string_lossy().into_owned(), Some(p))),
+        );
 
         // Work area (explorer's bar + ours both reserve; icons stay above).
         let mut work = windows::Win32::Foundation::RECT::default();
@@ -300,7 +342,7 @@ impl Desktop {
             );
         }
         let sig = (
-            found.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            found.iter().map(|(p, _)| p.clone()).collect::<Vec<String>>(),
             (work.left, work.top, work.right, work.bottom),
         );
         if sig == self.items_sig && !self.items.is_empty() {
@@ -316,20 +358,27 @@ impl Desktop {
         self.items = found
             .into_iter()
             .enumerate()
-            .map(|(i, (path, _))| {
+            .map(|(i, (parsing, path))| {
                 let (col, row) = (i / rows, i % rows);
-                let stem_only = matches!(
-                    path.extension().and_then(|e| e.to_str()),
-                    Some("lnk") | Some("url")
-                );
-                let label: String = if stem_only {
-                    path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
-                } else {
-                    path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+                let label: String = match &path {
+                    Some(p) => {
+                        let stem_only = matches!(
+                            p.extension().and_then(|e| e.to_str()),
+                            Some("lnk") | Some("url")
+                        );
+                        if stem_only {
+                            p.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+                        } else {
+                            p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+                        }
+                    }
+                    // The shell owns the name, and it is localized.
+                    None => display_name(&parsing).unwrap_or_else(|| parsing.clone()),
                 };
                 Item {
-                    bitmap: shell_image(&self.renderer, &path, px),
+                    bitmap: shell_image(&self.renderer, &parsing, px),
                     label: label.encode_utf16().collect(),
+                    parsing,
                     path,
                     x: MARGIN + col as f32 * (CELL_W + CELL_GAP),
                     y: top + row as f32 * (CELL_H + CELL_GAP),
@@ -347,15 +396,11 @@ impl Desktop {
 
     fn open(&self, idx: usize) {
         let Some(item) = self.items.get(idx) else { return };
-        unsafe {
-            let wide: Vec<u16> = item
-                .path
-                .as_os_str()
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), None, None, SW_SHOWNORMAL);
+        match &item.path {
+            Some(p) => open_uri(&p.as_os_str().to_string_lossy()),
+            // A parsing name is not something ShellExecute takes; the shell:
+            // scheme is how it reaches the namespace.
+            None => open_uri(&format!("shell:{}", item.parsing)),
         }
     }
 
@@ -540,19 +585,37 @@ fn open_glide() {
     }
 }
 
-/// Shell-quality image for a path: real thumbnails for pictures, themed
-/// icons for everything else, via IShellItemImageFactory.
-fn shell_image(renderer: &Renderer, path: &Path, px: i32) -> Option<ID2D1Bitmap1> {
+/// Is this namespace root on the desktop? `default_on` stands in for the
+/// value explorer has never written.
+fn namespace_visible(clsid: &str, default_on: bool) -> bool {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(HIDE_ICONS, KEY_READ)
+        .and_then(|k| k.get_value::<u32, _>(clsid))
+        .map_or(default_on, |hidden| hidden == 0)
+}
+
+/// The shell's own localized name for a parsing name ("휴지통").
+fn display_name(parsing: &str) -> Option<String> {
+    unsafe {
+        let wide: Vec<u16> = parsing.encode_utf16().chain(std::iter::once(0)).collect();
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+        let s = name.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(name.0 as *const _));
+        s
+    }
+}
+
+/// Shell-quality image for a parsing name: real thumbnails for pictures,
+/// themed icons for everything else, via IShellItemImageFactory.
+fn shell_image(renderer: &Renderer, parsing: &str, px: i32) -> Option<ID2D1Bitmap1> {
     if std::env::var_os("GLIDE_DESK_BARE").is_some() {
         return None;
     }
     unsafe {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide: Vec<u16> = parsing.encode_utf16().chain(std::iter::once(0)).collect();
         let factory: IShellItemImageFactory =
             SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
         let hbmp = factory
@@ -768,22 +831,19 @@ extern "system" fn desktop_wndproc(
             WM_RBUTTONUP => {
                 let (x, y) = (lx(desk), ly(desk));
                 let hit = desk.hit(x, y);
-                let paths: Vec<PathBuf> = match hit {
+                let paths: Vec<String> = match hit {
                     Some(i) => {
                         // Whole selection, but only siblings of the clicked
                         // item — one IShellFolder serves the menu.
-                        let parent = desk.items[i].path.parent().map(Path::to_path_buf);
-                        let mut sel: Vec<PathBuf> = desk
+                        let group = desk.items[i].menu_group();
+                        let mut sel: Vec<String> = desk
                             .items
                             .iter()
-                            .filter(|it| {
-                                it.selected
-                                    && it.path.parent().map(Path::to_path_buf) == parent
-                            })
-                            .map(|it| it.path.clone())
+                            .filter(|it| it.selected && it.menu_group() == group)
+                            .map(|it| it.parsing.clone())
                             .collect();
                         if sel.is_empty() {
-                            sel.push(desk.items[i].path.clone());
+                            sel.push(desk.items[i].parsing.clone());
                         }
                         sel
                     }

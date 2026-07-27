@@ -6,7 +6,7 @@
 //! message forwarding through a temporary subclass.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
@@ -108,16 +108,17 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// IContextMenu over one or more items. All paths must share a directory —
-/// the folder object comes from the first path, the child pidls from each.
-unsafe fn item_menu(paths: &[PathBuf]) -> windows::core::Result<IContextMenu> {
+/// IContextMenu over one or more items, named the way the shell names them:
+/// a filesystem path, or `::{CLSID}` for a namespace item like the recycle
+/// bin. All must share a parent — the folder object comes from the first.
+unsafe fn item_menu(paths: &[String]) -> windows::core::Result<IContextMenu> {
     unsafe {
         let mut full: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
         let mut children: Vec<*const ITEMIDLIST> = Vec::with_capacity(paths.len());
         let mut folder: Option<IShellFolder> = None;
         let mut err = None;
         for path in paths {
-            let w = wide(&path.display().to_string());
+            let w = wide(path);
             let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
             if let Err(e) = SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None) {
                 err = Some(e);
@@ -309,9 +310,9 @@ unsafe fn run(
     }
 }
 
-/// Full shell menu for `paths` (same directory). COM is already up on the
-/// taskbar thread.
-pub fn show_item_menu(hwnd: HWND, paths: &[PathBuf]) -> MenuOutcome {
+/// Full shell menu for `paths` — shell parsing names sharing one parent. COM
+/// is already up on the taskbar thread.
+pub fn show_item_menu(hwnd: HWND, paths: &[String]) -> MenuOutcome {
     unsafe {
         match item_menu(paths) {
             Ok(cm) => run(hwnd, cm, &[], &[]),
