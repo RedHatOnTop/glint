@@ -28,6 +28,7 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetDIBits, ValidateRect,
 };
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::Graphics::Imaging::{
     GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
@@ -36,9 +37,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
     GetKeyState,
 };
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY,
-    SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT, ShellExecuteW,
+    IShellItem, IShellItemImageFactory, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel,
+    SHCNRF_NewDelivery, SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock,
+    SHChangeNotifyEntry, SHChangeNotifyRegister, SHCreateItemFromParsingName, SHParseDisplayName,
+    SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -47,6 +51,10 @@ use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// SHChangeNotify delivery — something under the desktop moved.
+const WM_SHELLCHANGE: u32 = WM_APP + 1;
+/// Reload debounce: one user action arrives as a burst of notifications.
+const TIMER_RELOAD: usize = 1;
 
 // Background context menu, our own entries (SHELL_DESIGN §6.3).
 const ID_REFRESH: u32 = 1;
@@ -203,6 +211,10 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
         desk.load_items();
         crate::shellmenu::enable_dark_menus();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::leak(desk) as *mut Desktop as isize);
+        // Only after the pointer is installed: the shell can deliver the first
+        // notification before this function returns, and a WM_SHELLCHANGE that
+        // lands on a null userdata is a leaked delivery handle.
+        watch(hwnd);
 
         let _ = SetWindowPos(
             hwnd,
@@ -585,6 +597,52 @@ fn open_glide() {
     }
 }
 
+/// Ask the shell to report changes to everything the desktop shows.
+///
+/// This is explorer's own mechanism rather than a directory watch, because
+/// half of what the desktop shows is not a directory: a file going into the
+/// recycle bin changes that icon, and no filesystem event says so.
+unsafe fn watch(hwnd: HWND) {
+    unsafe {
+        let mut names: Vec<String> =
+            NAMESPACE_ITEMS.iter().map(|(clsid, _)| format!("::{clsid}")).collect();
+        for var in ["USERPROFILE", "PUBLIC"] {
+            if let Some(p) = std::env::var_os(var) {
+                let dir = PathBuf::from(p).join("Desktop");
+                names.push(dir.as_os_str().to_string_lossy().into_owned());
+            }
+        }
+
+        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
+        let mut entries: Vec<SHChangeNotifyEntry> = Vec::new();
+        for name in &names {
+            let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            if SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).is_err() {
+                continue;
+            }
+            pidls.push(pidl);
+            entries.push(SHChangeNotifyEntry { pidl, fRecursive: false.into() });
+        }
+
+        let id = SHChangeNotifyRegister(
+            hwnd,
+            SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+            SHCNE_ALLEVENTS.0 as i32,
+            WM_SHELLCHANGE,
+            entries.len() as i32,
+            entries.as_ptr(),
+        );
+        if id == 0 {
+            crate::safety::note("desktop: SHChangeNotifyRegister failed — no live refresh");
+        }
+        // The register copies the entries; these were ours.
+        for pidl in pidls {
+            CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+        }
+    }
+}
+
 /// Is this namespace root on the desktop? `default_on` stands in for the
 /// value explorer has never written.
 fn namespace_visible(clsid: &str, default_on: bool) -> bool {
@@ -603,7 +661,7 @@ fn display_name(parsing: &str) -> Option<String> {
         let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
         let name = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
         let s = name.to_string().ok();
-        windows::Win32::System::Com::CoTaskMemFree(Some(name.0 as *const _));
+        CoTaskMemFree(Some(name.0 as *const core::ffi::c_void));
         s
     }
 }
@@ -875,6 +933,30 @@ extern "system" fn desktop_wndproc(
                     MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
                     _ => {}
                 }
+                LRESULT(0)
+            }
+            WM_SHELLCHANGE => {
+                // The delivery is shared memory the shell allocated for us;
+                // it has to be released whether or not we read it. What
+                // changed does not matter — one user action arrives as a
+                // burst, so coalesce and re-read the folder once.
+                let mut pidls: *mut *mut ITEMIDLIST = std::ptr::null_mut();
+                let mut event = 0i32;
+                let lock = SHChangeNotification_Lock(
+                    windows::Win32::Foundation::HANDLE(wparam.0 as *mut _),
+                    lparam.0 as u32,
+                    Some(&mut pidls),
+                    Some(&mut event),
+                );
+                if !lock.is_invalid() {
+                    let _ = SHChangeNotification_Unlock(lock);
+                }
+                let _ = SetTimer(Some(hwnd), TIMER_RELOAD, 250, None);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RELOAD => {
+                let _ = KillTimer(Some(hwnd), TIMER_RELOAD);
+                desk.refresh_all();
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {

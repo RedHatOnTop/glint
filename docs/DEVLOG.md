@@ -35,6 +35,23 @@ Korean label, right-click brings up the genuine shell menu (열기 / 즐겨찾�
 고정 / 휴지통 비우기 grayed because it is empty / 시작 화면에 고정 / 바로 가기
 만들기 / 속성), and double-click opens it.
 
+Desktop gap 2 of 4: **the desktop only noticed changes when something else
+poked it.** A file saved to the desktop stayed invisible until a
+WM_SETTINGCHANGE happened by.
+
+- `SHChangeNotifyRegister` on the two desktop folders and the five namespace
+  roots, with a 250ms debounce timer because one user action arrives as a burst
+  of notifications. Explorer's mechanism rather than `ReadDirectoryChangesW`,
+  because half of what the desktop shows is not a directory — a file going into
+  the recycle bin changes that icon and no filesystem event says so.
+- The registration goes in after `GWLP_USERDATA` is installed, since a delivery
+  that lands on a null userdata is a leaked shared-memory handle.
+
+Verified in the lab, both halves: `echo watch> %USERPROFILE%\Desktop\watch-test.txt`
+from the console and the file appeared with no refresh; recycling it through
+`Shell.Application.InvokeVerb('delete')` — a path that touches none of our own
+code — removed the icon *and* switched 휴지통 from the empty bin to the full one.
+
 ## 2026-07-27
 
 Two more shell-only defects closed, both found by using the guest rather than
