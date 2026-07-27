@@ -104,6 +104,9 @@ struct Entry {
     parsing: String,
     /// "shell:AppsFolder\{parsing}", NUL-terminated.
     launch: Vec<u16>,
+    /// Lowercased executable/package stem behind the display name, so a search
+    /// for what the user types at a prompt finds the app. Not persisted.
+    target: String,
     /// 2×1 Metro tile instead of 1×1; only pins persist this.
     wide: bool,
     /// Tile group (Win10 tile folder); pins sharing a name collapse into one
@@ -118,8 +121,27 @@ impl Entry {
             .chain(std::iter::once(0))
             .collect();
         let wname = name.encode_utf16().collect();
-        Entry { name, wname, parsing, launch, wide: false, folder: None }
+        let target = search_target(&parsing);
+        Entry { name, wname, parsing, launch, target, wide: false, folder: None }
     }
+}
+
+/// The name the user knows the app by when it is not the display name: what
+/// they would type at a prompt. On a Korean install "명령 프롬프트" parses to
+/// `{GUID}\cmd.exe`, so searching `cmd` — the obvious thing to type — matched
+/// nothing at all, and with no explorer there is no other way to launch it.
+fn search_target(parsing: &str) -> String {
+    let tail = parsing.rsplit(['\\', '/']).next().unwrap_or(parsing);
+    // Packaged apps arrive as Family_publisherhash!AppId. Strip the hash only
+    // there: a bare filename may legitimately contain '_' (PowerShell_ISE.exe).
+    let stem = match tail.split_once('!') {
+        Some((family, _)) => family.rsplit_once('_').map_or(family, |(f, _)| f),
+        None => std::path::Path::new(tail)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tail),
+    };
+    stem.to_lowercase()
 }
 
 /// What `SHCreateItemFromParsingName` (and ShellExecute) should be handed for a
@@ -729,16 +751,25 @@ impl StartMenu {
         }
         let q = self.query.to_lowercase();
         let jamo_mode = q.chars().all(|c| ('ㄱ'..='ㅎ').contains(&c));
-        let mut scored: Vec<(usize, u32, usize)> = Vec::new();
+        // (tier, position, frequency, index): a display-name hit always
+        // outranks an executable-name hit, so typing 메모 keeps 메모장 on top
+        // even though several packages carry "notepad" in their id.
+        let mut scored: Vec<(u8, usize, u32, usize)> = Vec::new();
         for (i, a) in self.apps.iter().enumerate() {
             let hay = if jamo_mode { name_cho(&a.name) } else { a.name.to_lowercase() };
-            if let Some(pos) = hay.find(&q) {
+            let hit = match hay.find(&q) {
+                Some(pos) => Some((0u8, pos)),
+                // Jamo queries are Hangul initials; targets are ASCII paths.
+                None if jamo_mode => None,
+                None => a.target.find(&q).map(|pos| (1u8, pos)),
+            };
+            if let Some((tier, pos)) = hit {
                 let count = self.counts.get(&a.parsing).map(|c| c.0).unwrap_or(0);
-                scored.push((pos, u32::MAX - count, i));
+                scored.push((tier, pos, u32::MAX - count, i));
             }
         }
         scored.sort();
-        self.results = scored.into_iter().map(|(_, _, i)| i).collect();
+        self.results = scored.into_iter().map(|(_, _, _, i)| i).collect();
     }
 
     /// Keep the keyboard selection inside the search viewport.
