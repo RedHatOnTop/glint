@@ -14,7 +14,7 @@
 
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('shot', 'type', 'key', 'keys', 'chord')]
+    [ValidateSet('shot', 'type', 'keytext', 'key', 'keys', 'chord')]
     [string]$Action,
     [string]$Name = 'glint-lab',
     [string]$Out = 'vm-console.png',
@@ -90,6 +90,56 @@ switch ($Action) {
         $r = Invoke-CimMethod -InputObject $kbd -MethodName TypeText -Arguments @{ asciiText = $Text }
         if ($r.ReturnValue -ne 0) { throw "TypeText failed: $($r.ReturnValue)" }
         Write-Host "typed $($Text.Length) chars"
+    }
+
+    'keytext' {
+        # TypeText hands the string to the guest's input stack, which after a
+        # reboot on this VM silently swallows every character while TypeKey
+        # still lands — so type the string as virtual keys instead. US layout,
+        # which is what the guest reports even with a Korean IME installed.
+        if (-not $Text) { throw '-Text is required for "keytext".' }
+        # Keys are strings throughout: a PowerShell hashtable literal indexed
+        # with ' ' stores a [string], and a lookup with a [char] then misses.
+        $plain = @{}
+        foreach ($c in 'abcdefghijklmnopqrstuvwxyz'.ToCharArray()) { $plain["$c"] = [uint16][char]"$c".ToUpper() }
+        foreach ($c in '0123456789'.ToCharArray()) { $plain["$c"] = [uint16][char]$c }
+        $plain[' ']  = 32
+        $plain[';']  = 0xBA; $plain['='] = 0xBB; $plain[','] = 0xBC; $plain['-'] = 0xBD
+        $plain['.']  = 0xBE; $plain['/'] = 0xBF; $plain['`'] = 0xC0; $plain['['] = 0xDB
+        $plain['\']  = 0xDC; $plain[']'] = 0xDD; $plain["'"] = 0xDE
+        $shifted = @{
+            ':' = 0xBA; '+' = 0xBB; '<' = 0xBC; '_' = 0xBD; '>' = 0xBE; '?' = 0xBF
+            '~' = 0xC0; '{' = 0xDB; '|' = 0xDC; '}' = 0xDD; '"' = 0xDE
+            '!' = 0x31; '@' = 0x32; '#' = 0x33; '$' = 0x34; '%' = 0x35
+            '^' = 0x36; '&' = 0x37; '*' = 0x38; '(' = 0x39; ')' = 0x30
+        }
+        $kbd = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard
+        $sent = 0
+        foreach ($ch in $Text.ToCharArray()) {
+            $c = [string]$ch
+            $needShift = $false
+            if ($plain.ContainsKey($c))          { $vk = $plain[$c] }
+            elseif ($shifted.ContainsKey($c))    { $vk = $shifted[$c]; $needShift = $true }
+            elseif ($c -cmatch '[A-Z]')          { $vk = [uint16][char]$c; $needShift = $true }
+            else { throw "keytext cannot type '$c' — extend the table." }
+            # TypeKey inside a held shift arrives out of order on this VM and
+            # duplicates the run typed before it, so shifted characters go as an
+            # explicit press/key/release with the guest given time between each.
+            if ($needShift) {
+                $null = Invoke-CimMethod -InputObject $kbd -MethodName PressKey -Arguments @{ keyCode = [uint16]16 }
+                Start-Sleep -Milliseconds 60
+            }
+            $r = Invoke-CimMethod -InputObject $kbd -MethodName TypeKey -Arguments @{ keyCode = [uint16]$vk }
+            if ($needShift) {
+                Start-Sleep -Milliseconds 60
+                $null = Invoke-CimMethod -InputObject $kbd -MethodName ReleaseKey -Arguments @{ keyCode = [uint16]16 }
+                Start-Sleep -Milliseconds 60
+            }
+            if ($r.ReturnValue -ne 0) { throw "TypeKey for '$c' failed: $($r.ReturnValue)" }
+            $sent++
+            Start-Sleep -Milliseconds 30
+        }
+        Write-Host "keytyped $sent chars"
     }
 
     { $_ -in 'key', 'keys' } {
