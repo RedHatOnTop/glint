@@ -10,6 +10,33 @@ build is not evidence that anything rendered).
 
 ---
 
+## 2026-07-27
+
+Two more shell-only defects closed, both found by using the guest rather than
+reading the code.
+
+- `c0af7b1` **Start search only knew display names.** 명령 프롬프트 parses to
+  `{GUID}\cmd.exe`, so `cmd` matched nothing — and with no explorer the Start
+  menu is the only launcher the session has. Entries now carry the stem behind
+  their parsing name and search falls back to it, display-name hits ranked
+  first. Verified: `cmd` finds 명령 프롬프트 and launches it.
+- `9c2e09c` **a missed Win release ate every later S.** `WIN_DOWN` is a latch;
+  miss one keyup and the hook believes Win is held forever, so every `s` after
+  that disappears into the Win+S chord and nothing else misbehaves. Found by
+  watching `stop-process` arrive in the guest as `top-proce`. The latch is now
+  confirmed against `GetAsyncKeyState`.
+- `a44289b` **rig: `keytext`.** After the guest rebooted, `Msvm_Keyboard`
+  `TypeText` began swallowing every character while `TypeKey` still landed —
+  the rig could press Enter but not write the command it was confirming.
+  `keytext` sends a string as virtual keys instead. Shift needs an explicit
+  press/key/release with delays; sent back to back the events arrive out of
+  order and duplicate the run before them (`Stop-Process` → `Stopstop-process`).
+
+The host slept for ~20 hours mid-session and the guest rebooted on resume,
+which accidentally produced the best evidence of the day: a **cold boot with
+`e03869a` in place came up with exactly one tray shield**, so the autostart
+guard holds through a real Winlogon start, not just a hand restart.
+
 ## 2026-07-26 (evening)
 
 **The Start menu fills in, and the tray strip reads as a design.** Three defects
