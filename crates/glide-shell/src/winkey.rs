@@ -68,6 +68,14 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                         }
                     }
                     WM_KEYDOWN | WM_SYSKEYDOWN => {
+                        // A Win release we never saw — the guest lab produced
+                        // one by injecting a synthetic press — would otherwise
+                        // leave WIN_DOWN set for the rest of the session, and
+                        // every later S would disappear into the search chord.
+                        // The flag is a latch, so confirm it against the key.
+                        if WIN_DOWN.get() && !win_physically_down() {
+                            WIN_DOWN.set(false);
+                        }
                         // Win+S: ours (glint search), never the stock search
                         // pane. Swallow every S repeat while Win is held and
                         // mask once with the dummy so the Win release that
@@ -123,6 +131,12 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         }
         CallNextHookEx(None, code, wparam, lparam)
     }
+}
+
+fn win_physically_down() -> bool {
+    [VK_LWIN, VK_RWIN]
+        .iter()
+        .any(|&vk| unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 })
 }
 
 fn modifier_down() -> bool {
