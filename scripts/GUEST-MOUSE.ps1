@@ -14,7 +14,10 @@
 param(
     [Parameter(Mandatory)][int]$X,
     [Parameter(Mandatory)][int]$Y,
-    [ValidateSet('move', 'left', 'right', 'double')][string]$Click = 'move',
+    [ValidateSet('move', 'left', 'right', 'double', 'drag')][string]$Click = 'move',
+    # drag: where to let go.
+    [int]$ToX,
+    [int]$ToY,
     # Held before the click and released after: 17 Ctrl, 16 Shift.
     [int[]]$Hold
 )
@@ -54,6 +57,23 @@ try {
             Start-Sleep -Milliseconds 90
             Tap $LDOWN $LUP
         }
+        'drag' {
+            # DoDragDrop runs its own modal loop on the source thread and reads
+            # the real cursor, so the move has to arrive as many small steps
+            # with time between them. One jump lands as a click on the source.
+            [GuestMouse]::mouse_event($LDOWN, 0, 0, 0, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 200
+            $steps = 25
+            for ($i = 1; $i -le $steps; $i++) {
+                $ix = [int]($X + ($ToX - $X) * $i / $steps)
+                $iy = [int]($Y + ($ToY - $Y) * $i / $steps)
+                [GuestMouse]::SetCursorPos($ix, $iy) | Out-Null
+                Start-Sleep -Milliseconds 60
+            }
+            # Let the target settle on a drop effect before letting go.
+            Start-Sleep -Milliseconds 600
+            [GuestMouse]::mouse_event($LUP, 0, 0, 0, [IntPtr]::Zero)
+        }
     }
 }
 finally {
@@ -62,4 +82,4 @@ finally {
     foreach ($vk in $Hold) { [GuestMouse]::keybd_event([byte]$vk, 0, $KEYUP, [IntPtr]::Zero) }
 }
 
-Write-Host "$Click at $X,$Y"
+if ($Click -eq 'drag') { Write-Host "drag $X,$Y -> $ToX,$ToY" } else { Write-Host "$Click at $X,$Y" }

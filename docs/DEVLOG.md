@@ -74,6 +74,27 @@ renamed the file and the list re-sorted itself through the watcher, Delete
 removed it, ↑ then Enter opened 휴지통 — which listed `renamed` and `watch-test`
 with 원래 위치 `C:\Users\Person\Desktop`, so Delete recycles rather than erases.
 
+Desktop gap 4 of 4: **nothing could be dropped on the desktop.** The window was
+never registered as a target, so a drag from any explorer window bounced.
+
+- `RegisterDragDrop` with the Desktop folder's *own* `IDropTarget`, obtained
+  through `BindToHandler(BHID_SFUIObject)`. Not a hand-written implementation:
+  the shell's already knows copy against move against link, what the modifier
+  keys mean, what to do with a `.lnk` and what to do with a dragged URL. Ours
+  would only be a worse version of it. `OleInitialize` first — the thread had
+  only been `CoInitializeEx`'d, and `RegisterDragDrop` wants OLE.
+- **rig: `GUEST-MOUSE.ps1 -Click drag`.** `DoDragDrop` runs a modal loop on the
+  source thread reading the real cursor, so the move has to arrive as ~25 small
+  steps with time between them; one jump lands as a click on the source and
+  nothing is ever dragged.
+
+Verified in the lab: `drag-me.txt` dragged out of a `C:\dragsrc` explorer window
+onto bare desktop. The folder went to 0개 항목 and the file appeared in the icon
+column — a same-volume drag, so a move, which is what explorer would have done.
+
+That closes the four desktop gaps. Still open there: icon drag and saved
+positions, multi-monitor, view options.
+
 ## 2026-07-27
 
 Two more shell-only defects closed, both found by using the guest rather than

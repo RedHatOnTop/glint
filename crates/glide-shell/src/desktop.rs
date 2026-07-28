@@ -30,6 +30,7 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, FF_DONTCARE, FW_NORMAL, GetDIBits, HFONT, OUT_DEFAULT_PRECIS, ValidateRect,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Ole::{IDropTarget, OleInitialize, RegisterDragDrop};
 use windows::Win32::Graphics::Imaging::{
     GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
@@ -41,7 +42,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, FO_DELETE, FOF_ALLOWUNDO, IShellItem, IShellItemImageFactory,
+    BHID_SFUIObject, DefSubclassProc, FO_DELETE, FOF_ALLOWUNDO, IShellItem, IShellItemImageFactory,
     RemoveWindowSubclass, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel, SHCNRF_NewDelivery,
     SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock, SHChangeNotifyEntry,
     SHChangeNotifyRegister, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW,
@@ -250,6 +251,7 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
         // notification before this function returns, and a WM_SHELLCHANGE that
         // lands on a null userdata is a leaked delivery handle.
         watch(hwnd);
+        register_drop(hwnd);
 
         let _ = SetWindowPos(
             hwnd,
@@ -872,6 +874,38 @@ unsafe fn watch(hwnd: HWND) {
         // The register copies the entries; these were ours.
         for pidl in pidls {
             CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+        }
+    }
+}
+
+/// Make the desktop accept drops, by handing the job to the shell rather than
+/// implementing IDropTarget here. The Desktop folder's own drop target already
+/// knows copy against move against link, what the modifier keys mean, what to
+/// do with a .lnk and what to do with a URL; anything written here would be a
+/// worse version of it.
+unsafe fn register_drop(hwnd: HWND) {
+    unsafe {
+        let Some(dir) = std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Desktop"))
+        else {
+            return;
+        };
+        let w: Vec<u16> = dir
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let result = (|| -> windows::core::Result<()> {
+            // RegisterDragDrop wants OLE, and the thread has only had
+            // CoInitializeEx. Already-STA makes this the cheap half of
+            // OleInitialize rather than a second apartment.
+            OleInitialize(None)?;
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None)?;
+            let target: IDropTarget = item.BindToHandler(None, &BHID_SFUIObject)?;
+            RegisterDragDrop(hwnd, &target)
+        })();
+        if let Err(e) = result {
+            crate::safety::note(&format!("desktop: no drop target ({e})"));
         }
     }
 }
