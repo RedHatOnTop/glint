@@ -79,18 +79,23 @@ const ID_REFRESH: u32 = 1;
 const ID_GLIDE: u32 = 2;
 const ID_DISPLAY: u32 = 3;
 const ID_PERSONAL: u32 = 4;
-const BG_CUSTOM: [crate::shellmenu::CustomItem; 5] = [
-    (ID_REFRESH, "새로 고침", true),
-    (ID_GLIDE, "glide로 열기", true),
-    (0, "", true),
-    (ID_DISPLAY, "디스플레이 설정", true),
-    (ID_PERSONAL, "개인 설정", true),
+const ID_AUTO_ARRANGE: u32 = 5;
+const ID_SHOW_ICONS: u32 = 6;
+/// Icon edge in logical px, in the order explorer lists the sizes. The cell
+/// and the label box follow from it, so this one number is the whole setting.
+const ICON_SIZES: [(u32, &str, f32); 3] =
+    [(10, "큰 아이콘", 96.0), (11, "보통 아이콘", 48.0), (12, "작은 아이콘", 32.0)];
+const SORTS: [(u32, &str, Sort); 4] = [
+    (20, "이름", Sort::Name),
+    (21, "크기", Sort::Size),
+    (22, "항목 유형", Sort::Kind),
+    (23, "수정한 날짜", Sort::Modified),
 ];
 
-const CELL_W: f32 = 84.0;
-const CELL_H: f32 = 98.0;
 const CELL_GAP: f32 = 6.0;
-const ICON: f32 = 48.0;
+/// Cell padding around the icon: sides, and below it for two lines of label.
+const CELL_PAD_X: f32 = 36.0;
+const CELL_PAD_Y: f32 = 50.0;
 const MARGIN: f32 = 18.0;
 
 /// The desktop's namespace roots, in the order explorer lists them, with the
@@ -164,6 +169,88 @@ struct Drag {
     /// Past the system drag threshold. Below it this is still a plain click,
     /// and letting go must not move anything.
     moved: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sort {
+    Name,
+    Size,
+    Kind,
+    Modified,
+}
+
+/// What the 보기 and 정렬 기준 menus set. Explorer keeps the equivalent in its
+/// own shell bag; ours is a text file beside the icon positions.
+#[derive(Clone, Copy, PartialEq)]
+struct View {
+    icon: f32,
+    sort: Sort,
+    /// Icons pack in sort order and stay packed — a dragged icon comes back.
+    auto_arrange: bool,
+    show_icons: bool,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self { icon: 48.0, sort: Sort::Name, auto_arrange: false, show_icons: true }
+    }
+}
+
+impl View {
+    fn load() -> Self {
+        let mut v = Self::default();
+        let Ok(txt) = std::fs::read_to_string(view_path()) else { return v };
+        for line in txt.lines() {
+            let Some((k, val)) = line.split_once('=') else { continue };
+            match k.trim() {
+                "icon" => {
+                    // Only the three the menu offers; anything else is a hand
+                    // edit and the default is safer than an unreachable size.
+                    if let Ok(px) = val.trim().parse::<f32>()
+                        && ICON_SIZES.iter().any(|(_, _, s)| *s == px)
+                    {
+                        v.icon = px;
+                    }
+                }
+                "sort" => {
+                    v.sort = match val.trim() {
+                        "size" => Sort::Size,
+                        "kind" => Sort::Kind,
+                        "modified" => Sort::Modified,
+                        _ => Sort::Name,
+                    }
+                }
+                "auto_arrange" => v.auto_arrange = val.trim() == "1",
+                "show_icons" => v.show_icons = val.trim() == "1",
+                _ => {}
+            }
+        }
+        v
+    }
+
+    fn save(&self) {
+        let p = view_path();
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let sort = match self.sort {
+            Sort::Name => "name",
+            Sort::Size => "size",
+            Sort::Kind => "kind",
+            Sort::Modified => "modified",
+        };
+        let b = |v: bool| if v { "1" } else { "0" };
+        let _ = std::fs::write(
+            p,
+            format!(
+                "icon={}\nsort={}\nauto_arrange={}\nshow_icons={}\n",
+                self.icon,
+                sort,
+                b(self.auto_arrange),
+                b(self.show_icons)
+            ),
+        );
+    }
 }
 
 /// A monitor, as the desktop needs it. The device name is the identity that
@@ -265,6 +352,7 @@ pub struct Desktop {
     /// what the user expects.
     cursor: usize,
     rename: Option<Rename>,
+    view: View,
     w: f32,
     h: f32,
     scale: f32,
@@ -370,6 +458,7 @@ unsafe fn create(s: &Screen) -> anyhow::Result<()> {
             origin_y: 0.0,
             cursor: 0,
             rename: None,
+            view: View::load(),
             w: sw as f32 / scale,
             h: sh as f32 / scale,
             scale,
@@ -449,6 +538,17 @@ fn rescan() {
 }
 
 impl Desktop {
+    /// Cell size, which is the icon plus room for two lines of label. Every
+    /// layout and hit test goes through these rather than a constant, since
+    /// the icon size is a menu option.
+    fn cell_w(&self) -> f32 {
+        self.view.icon + CELL_PAD_X
+    }
+
+    fn cell_h(&self) -> f32 {
+        self.view.icon + CELL_PAD_Y
+    }
+
     /// Take the geometry of the monitor this window is on, and answer with its
     /// work area. Both move under us — a bar docking, a resolution change, the
     /// monitor itself being rearranged — so nothing about them is cached past
@@ -566,7 +666,7 @@ impl Desktop {
     /// merged with dirs first and then by name, laid out in explorer-style
     /// columns inside the work area. Only the primary monitor has them.
     fn load_items(&mut self) {
-        if !self.primary {
+        if !self.primary || !self.view.show_icons {
             self.items.clear();
             self.items_sig = (Vec::new(), (0, 0, 0, 0));
             return;
@@ -577,7 +677,13 @@ impl Desktop {
             .map(|(clsid, _)| (format!("::{clsid}"), None))
             .collect();
 
-        let mut files: Vec<(PathBuf, bool)> = Vec::new();
+        struct Entry {
+            path: PathBuf,
+            dir: bool,
+            size: u64,
+            modified: std::time::SystemTime,
+        }
+        let mut files: Vec<Entry> = Vec::new();
         let roots = [
             std::env::var("USERPROFILE").ok().map(|p| PathBuf::from(p).join("Desktop")),
             std::env::var("PUBLIC").ok().map(|p| PathBuf::from(p).join("Desktop")),
@@ -595,20 +701,46 @@ impl Desktop {
                 if meta.file_attributes() & 0x2 != 0 {
                     continue; // FILE_ATTRIBUTE_HIDDEN
                 }
-                files.push((path, meta.is_dir()));
+                files.push(Entry {
+                    path,
+                    dir: meta.is_dir(),
+                    size: meta.len(),
+                    modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                });
             }
         }
+        let name_of = |e: &Entry| {
+            e.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase()
+        };
+        let sort = self.view.sort;
+        // Folders lead in every order, the way explorer groups them, and the
+        // name breaks every tie so the layout is stable between reads.
         files.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| {
-                let an = a.0.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                let bn = b.0.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                an.cmp(&bn)
+            b.dir.cmp(&a.dir).then_with(|| {
+                let by_key = match sort {
+                    Sort::Name => std::cmp::Ordering::Equal,
+                    Sort::Size => a.size.cmp(&b.size),
+                    Sort::Kind => {
+                        let ext = |e: &Entry| {
+                            e.path
+                                .extension()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase()
+                        };
+                        ext(a).cmp(&ext(b))
+                    }
+                    // Newest first: on a desktop the recent file is the one
+                    // being looked for.
+                    Sort::Modified => b.modified.cmp(&a.modified),
+                };
+                by_key.then_with(|| name_of(a).cmp(&name_of(b)))
             })
         });
         found.extend(
             files
                 .into_iter()
-                .map(|(p, _)| (p.as_os_str().to_string_lossy().into_owned(), Some(p))),
+                .map(|e| (e.path.as_os_str().to_string_lossy().into_owned(), Some(e.path))),
         );
 
         // Work area of this window's monitor (explorer's bar + ours both
@@ -628,11 +760,12 @@ impl Desktop {
         // window starts at its monitor's top-left, not the desktop's.
         let top = (work.top - self.mon.top) as f32 / self.scale + MARGIN;
         let bottom = (work.bottom - self.mon.top) as f32 / self.scale - MARGIN;
-        self.rows = (((bottom - top) / (CELL_H + CELL_GAP)).floor() as usize).max(1);
+        self.rows = (((bottom - top) / (self.cell_h() + CELL_GAP)).floor() as usize).max(1);
         self.origin_x = (work.left - self.mon.left) as f32 / self.scale + MARGIN;
         self.origin_y = top;
 
-        let px = (ICON * self.scale * 2.0) as i32; // downscale-only quality
+        // Downscale-only quality.
+        let px = (self.view.icon * self.scale * 2.0) as i32;
         self.items = found
             .into_iter()
             .map(|(parsing, path)| {
@@ -670,9 +803,10 @@ impl Desktop {
     /// Give every item a cell: the one the user dragged it to if there is a
     /// saved position for it, otherwise the first free cell in reading order.
     /// Explorer keeps this in an undocumented ItemPos blob; ours is a text
-    /// file next to the settings.
+    /// file next to the settings. Auto-arrange throws the saved ones away and
+    /// packs the sorted order instead.
     fn place_items(&mut self) {
-        let saved = load_positions();
+        let saved = if self.view.auto_arrange { Default::default() } else { load_positions() };
         let rows = self.rows as u32;
         let mut taken: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         let mut homeless: Vec<usize> = Vec::new();
@@ -704,26 +838,26 @@ impl Desktop {
     /// Pixel positions follow from the grid cells, never the other way round.
     fn sync_cells(&mut self) {
         let (origin_x, origin_y) = (self.origin_x, self.origin_y);
+        let (step_x, step_y) = (self.cell_w() + CELL_GAP, self.cell_h() + CELL_GAP);
         for it in &mut self.items {
-            it.x = origin_x + it.col as f32 * (CELL_W + CELL_GAP);
-            it.y = origin_y + it.row as f32 * (CELL_H + CELL_GAP);
+            it.x = origin_x + it.col as f32 * step_x;
+            it.y = origin_y + it.row as f32 * step_y;
         }
     }
 
     /// The cell a point falls in, rounded to whichever cell the icon's
     /// top-left is nearest — dragging aims with the icon, not the cursor.
     fn cell_at(&self, x: f32, y: f32) -> (u32, u32) {
-        let col = ((x - self.origin_x) / (CELL_W + CELL_GAP)).round().max(0.0) as u32;
-        let row = ((y - self.origin_y) / (CELL_H + CELL_GAP))
+        let col = ((x - self.origin_x) / (self.cell_w() + CELL_GAP)).round().max(0.0) as u32;
+        let row = ((y - self.origin_y) / (self.cell_h() + CELL_GAP))
             .round()
             .clamp(0.0, self.rows.saturating_sub(1) as f32) as u32;
         (col, row)
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        self.items
-            .iter()
-            .position(|i| x >= i.x && x < i.x + CELL_W && y >= i.y && y < i.y + CELL_H)
+        let (cw, ch) = (self.cell_w(), self.cell_h());
+        self.items.iter().position(|i| x >= i.x && x < i.x + cw && y >= i.y && y < i.y + ch)
     }
 
     fn open(&self, idx: usize) {
@@ -766,11 +900,12 @@ impl Desktop {
                 Some(d) if d.moved => (d.x - d.ox, d.y - d.oy),
                 _ => (0.0, 0.0),
             };
+            let (cw, ch, icon) = (self.cell_w(), self.cell_h(), self.view.icon);
             for (i, item) in self.items.iter().enumerate() {
                 let (lx, ly) = if item.selected { lift } else { (0.0, 0.0) };
                 let alpha = if (lx, ly) == (0.0, 0.0) { 1.0 } else { 0.72 };
                 let (itx, ity) = (item.x + lx, item.y + ly);
-                let cell = rect(itx, ity, itx + CELL_W, ity + CELL_H);
+                let cell = rect(itx, ity, itx + cw, ity + ch);
                 if item.selected {
                     fill_round(r, cell, 6.0, theme::with_alpha(theme::accent(), 0.22));
                     if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.7)) {
@@ -785,12 +920,12 @@ impl Desktop {
                     fill_round(r, cell, 6.0, theme::rgba(255, 255, 255, 0.10));
                 }
 
-                let ix = itx + (CELL_W - ICON) / 2.0;
+                let ix = itx + (cw - icon) / 2.0;
                 let iy = ity + 8.0;
                 if let Some(bmp) = &item.bitmap {
                     r.dc.DrawBitmap(
                         bmp,
-                        Some(&rect(ix, iy, ix + ICON, iy + ICON)),
+                        Some(&rect(ix, iy, ix + icon, iy + icon)),
                         alpha,
                         D2D1_INTERPOLATION_MODE_LINEAR,
                         None,
@@ -799,7 +934,7 @@ impl Desktop {
                 } else if let Ok(b) = r.brush(theme::rgba(255, 255, 255, 0.12)) {
                     r.dc.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
-                            rect: rect(ix, iy, ix + ICON, iy + ICON),
+                            rect: rect(ix, iy, ix + icon, iy + icon),
                             radiusX: 8.0,
                             radiusY: 8.0,
                         },
@@ -812,7 +947,7 @@ impl Desktop {
                 // Ring the glyphs instead — eight offsets at low alpha build a
                 // halo that reads as a soft shadow but works against any
                 // background, without a scrim box behind every icon.
-                let lr = rect(itx + 2.0, iy + ICON + 4.0, itx + CELL_W - 2.0, ity + CELL_H - 2.0);
+                let lr = rect(itx + 2.0, iy + icon + 4.0, itx + cw - 2.0, ity + ch - 2.0);
                 const HALO: [(f32, f32); 8] = [
                     (-1.0, -1.0), (0.0, -1.0), (1.0, -1.0),
                     (-1.0, 0.0), (1.0, 0.0),
@@ -860,6 +995,64 @@ impl Desktop {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             }
+        }
+    }
+
+    /// Our half of the background menu: what explorer puts above the shell's
+    /// own entries, with the current view reflected in the checks.
+    fn bg_menu(&self) -> Vec<crate::shellmenu::CustomItem> {
+        use crate::shellmenu::CustomItem as Item;
+        let mut view: Vec<Item> = ICON_SIZES
+            .iter()
+            .map(|(id, label, px)| Item::radio(*id, label, self.view.icon == *px))
+            .collect();
+        view.push(Item::sep());
+        view.push(Item::check(ID_AUTO_ARRANGE, "아이콘 자동 정렬", self.view.auto_arrange));
+        view.push(Item::check(ID_SHOW_ICONS, "바탕 화면 아이콘 표시", self.view.show_icons));
+
+        let sort: Vec<Item> = SORTS
+            .iter()
+            .map(|(id, label, s)| Item::radio(*id, label, self.view.sort == *s))
+            .collect();
+
+        vec![
+            Item::submenu("보기", view),
+            Item::submenu("정렬 기준", sort),
+            Item::sep(),
+            Item::new(ID_REFRESH, "새로 고침"),
+            Item::new(ID_GLIDE, "glide로 열기"),
+            Item::sep(),
+            Item::new(ID_DISPLAY, "디스플레이 설정"),
+            Item::new(ID_PERSONAL, "개인 설정"),
+        ]
+    }
+
+    /// A view option changed: the icons have to be extracted again at the new
+    /// size and the grid rebuilt, which is what clearing the signature buys.
+    fn apply_view(&mut self, repack: bool) {
+        self.view.save();
+        self.items_sig.0.clear();
+        self.load_items();
+        if repack {
+            // Sorting, or switching auto-arrange on, overrides where things
+            // were dragged to — the same thing explorer does.
+            self.pack_all();
+        }
+        self.paint();
+    }
+
+    /// Lay every item out in sort order from the first cell, and make that the
+    /// saved arrangement.
+    fn pack_all(&mut self) {
+        let rows = self.rows.max(1) as u32;
+        for (i, it) in self.items.iter_mut().enumerate() {
+            let i = i as u32;
+            it.col = i / rows;
+            it.row = i % rows;
+        }
+        self.sync_cells();
+        if !self.view.auto_arrange {
+            save_positions(&self.items);
         }
     }
 
@@ -915,7 +1108,9 @@ impl Desktop {
     /// next free one rather than stacking.
     fn drop_icons(&mut self) {
         let Some(d) = self.drag.take() else { return };
-        if !d.moved {
+        // Auto-arrange owns the layout: the icon snaps back to the cell the
+        // packing gave it, which is where the cells still say it is.
+        if !d.moved || self.view.auto_arrange {
             return;
         }
         let (dx, dy) = (d.x - d.ox, d.y - d.oy);
@@ -987,7 +1182,7 @@ impl Desktop {
         // Namespace items rename through the shell, not the filesystem; not
         // worth the machinery for "휴지통" → something else.
         let Some(path) = item.path.clone() else { return };
-        let (x, y) = (item.x, item.y + ICON + 14.0);
+        let (x, y) = (item.x, item.y + self.view.icon + 14.0);
         self.end_rename(false);
 
         let name: Vec<u16> = path
@@ -998,7 +1193,7 @@ impl Desktop {
             .chain(std::iter::once(0))
             .collect();
         let (px, py) = ((x * self.scale) as i32, (y * self.scale) as i32);
-        let (pw, ph) = ((CELL_W * self.scale) as i32, (22.0 * self.scale) as i32);
+        let (pw, ph) = ((self.cell_w() * self.scale) as i32, (22.0 * self.scale) as i32);
 
         let edit = unsafe {
             let Ok(edit) = CreateWindowExW(
@@ -1057,9 +1252,9 @@ impl Desktop {
         let Some(m) = &self.marquee else { return };
         let (l, t) = (m.x0.min(m.x1), m.y0.min(m.y1));
         let (r, b) = (m.x0.max(m.x1), m.y0.max(m.y1));
+        let (cw, ch) = (self.cell_w(), self.cell_h());
         for item in &mut self.items {
-            item.selected =
-                item.x < r && item.x + CELL_W > l && item.y < b && item.y + CELL_H > t;
+            item.selected = item.x < r && item.x + cw > l && item.y < b && item.y + ch > t;
         }
     }
 }
@@ -1215,6 +1410,10 @@ unsafe fn watch(hwnd: HWND) {
 /// Reading order down a column, then on to the next.
 fn next_cell((col, row): (u32, u32), rows: u32) -> (u32, u32) {
     if row + 1 < rows { (col, row + 1) } else { (col + 1, 0) }
+}
+
+fn view_path() -> PathBuf {
+    positions_path().with_file_name("desktop-view.txt")
 }
 
 fn positions_path() -> PathBuf {
@@ -1614,11 +1813,12 @@ extern "system" fn desktop_wndproc(
                 let outcome = if hit.is_some() {
                     crate::shellmenu::show_item_menu(hwnd, &paths)
                 } else {
+                    let custom = desk.bg_menu();
                     match std::env::var("USERPROFILE") {
                         Ok(p) => crate::shellmenu::show_background_menu(
                             hwnd,
                             &PathBuf::from(p).join("Desktop"),
-                            &BG_CUSTOM,
+                            &custom,
                         ),
                         Err(_) => return LRESULT(0),
                     }
@@ -1630,6 +1830,27 @@ extern "system" fn desktop_wndproc(
                     MenuOutcome::Custom(ID_GLIDE) => open_glide(),
                     MenuOutcome::Custom(ID_DISPLAY) => open_uri("ms-settings:display"),
                     MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
+                    MenuOutcome::Custom(ID_AUTO_ARRANGE) => {
+                        desk.view.auto_arrange = !desk.view.auto_arrange;
+                        let repack = desk.view.auto_arrange;
+                        desk.apply_view(repack);
+                    }
+                    MenuOutcome::Custom(ID_SHOW_ICONS) => {
+                        desk.view.show_icons = !desk.view.show_icons;
+                        desk.apply_view(false);
+                    }
+                    MenuOutcome::Custom(id) => {
+                        if let Some((_, _, px)) = ICON_SIZES.iter().find(|(i, _, _)| *i == id) {
+                            desk.view.icon = *px;
+                            // The grid changes shape under them, but the cells
+                            // an icon was dragged to still mean the same thing,
+                            // so a size change is not a rearrangement.
+                            desk.apply_view(false);
+                        } else if let Some((_, _, s)) = SORTS.iter().find(|(i, _, _)| *i == id) {
+                            desk.view.sort = *s;
+                            desk.apply_view(true);
+                        }
+                    }
                     _ => {}
                 }
                 LRESULT(0)

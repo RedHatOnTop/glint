@@ -19,11 +19,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetCursorPos, GetMenuItemCount,
-    GetMenuItemID, GetMenuItemInfoW, MENUITEMINFOW, MF_BYPOSITION, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MFT_SEPARATOR, MIIM_FTYPE, PostMessageW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
+    GetMenuItemID, GetMenuItemInfoW, HMENU, InsertMenuItemW, MENU_ITEM_STATE, MENU_ITEM_TYPE,
+    MENUITEMINFOW, MF_BYPOSITION, MF_SEPARATOR, MFS_CHECKED, MFS_GRAYED, MFT_RADIOCHECK,
+    MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, PostMessageW,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP,
+    WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
 };
-use windows::core::{Interface, PCSTR, PCWSTR, PSTR, w};
+use windows::core::{Interface, PCSTR, PCWSTR, PSTR, PWSTR, w};
 
 pub enum MenuOutcome {
     /// One of the caller's prepended items was picked (its id).
@@ -33,8 +35,46 @@ pub enum MenuOutcome {
     Dismissed,
 }
 
-/// Caller-supplied menu entry: (id, label, enabled). Empty label = separator.
-pub type CustomItem = (u32, &'static str, bool);
+/// Caller-supplied menu entry, prepended above the shell's own items. An empty
+/// label is a separator; children make it a submenu and its id goes unused.
+pub struct CustomItem {
+    pub id: u32,
+    pub label: String,
+    pub enabled: bool,
+    pub checked: bool,
+    /// Show the check as a radio bullet — one of a set rather than a toggle.
+    pub radio: bool,
+    pub children: Vec<CustomItem>,
+}
+
+impl CustomItem {
+    pub fn new(id: u32, label: &str) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            enabled: true,
+            checked: false,
+            radio: false,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn sep() -> Self {
+        Self::new(0, "")
+    }
+
+    pub fn submenu(label: &str, children: Vec<CustomItem>) -> Self {
+        Self { children, ..Self::new(0, label) }
+    }
+
+    pub fn check(id: u32, label: &str, on: bool) -> Self {
+        Self { checked: on, ..Self::new(id, label) }
+    }
+
+    pub fn radio(id: u32, label: &str, on: bool) -> Self {
+        Self { checked: on, radio: true, ..Self::new(id, label) }
+    }
+}
 
 const ID_SHELL_FIRST: u32 = 0x1000;
 const ID_SHELL_LAST: u32 = 0x7FFF;
@@ -233,6 +273,45 @@ unsafe fn filter_verbs(
     }
 }
 
+/// Our own entries, in order, submenus and all. The shell's items are queried
+/// in after these, from `ID_SHELL_FIRST` up, so the two id spaces never meet.
+unsafe fn append_custom(hmenu: HMENU, items: &[CustomItem]) {
+    unsafe {
+        for it in items {
+            if it.label.is_empty() {
+                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+                continue;
+            }
+            let mut label = wide(&it.label);
+            let mut state = MENU_ITEM_STATE(0);
+            if !it.enabled {
+                state |= MFS_GRAYED;
+            }
+            if it.checked {
+                state |= MFS_CHECKED;
+            }
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_STRING | MIIM_STATE | MIIM_FTYPE,
+                fType: if it.radio { MFT_RADIOCHECK } else { MENU_ITEM_TYPE(0) },
+                fState: state,
+                wID: it.id,
+                dwTypeData: PWSTR(label.as_mut_ptr()),
+                ..Default::default()
+            };
+            if !it.children.is_empty()
+                && let Ok(sub) = CreatePopupMenu()
+            {
+                append_custom(sub, &it.children);
+                info.fMask |= MIIM_SUBMENU;
+                info.hSubMenu = sub;
+            }
+            let at = GetMenuItemCount(Some(hmenu)) as u32;
+            let _ = InsertMenuItemW(hmenu, at, true, &info);
+        }
+    }
+}
+
 unsafe fn run(
     hwnd: HWND,
     cm: IContextMenu,
@@ -243,19 +322,7 @@ unsafe fn run(
         let Ok(hmenu) = CreatePopupMenu() else {
             return MenuOutcome::Dismissed;
         };
-        for (id, label, enabled) in custom {
-            if label.is_empty() {
-                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
-            } else {
-                let flags = if *enabled {
-                    MF_STRING
-                } else {
-                    MF_STRING | MF_GRAYED
-                };
-                let w = wide(label);
-                let _ = AppendMenuW(hmenu, flags, *id as usize, PCWSTR(w.as_ptr()));
-            }
-        }
+        append_custom(hmenu, custom);
         if !custom.is_empty() {
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
         }

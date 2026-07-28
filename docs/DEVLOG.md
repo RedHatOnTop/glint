@@ -161,7 +161,37 @@ lowercase. PowerShell hashtable keys are case-insensitive, so `Y` found the `y`
 entry and never took the shift branch — which is how a `YES` confirmation prompt
 came back as `yes` and cancelled a shell registration.
 
-Still open on the desktop: view options.
+**보기 and 정렬 기준.** The background menu had four flat entries and no view
+options at all: one icon size, one order, no way to say either.
+
+- `CustomItem` grew from an `(id, label, enabled)` tuple into a struct with
+  children, a checked flag and a radio flag, so our half of the menu can nest
+  and show state. Items go in with `InsertMenuItemW` now rather than
+  `AppendMenuW` — `MFT_RADIOCHECK` is per-item there, which is what makes an
+  exclusive group read as bullets instead of ticks.
+- 보기: 큰/보통/작은 아이콘 (96/48/32), 아이콘 자동 정렬, 바탕 화면 아이콘 표시.
+  정렬 기준: 이름 / 크기 / 항목 유형 / 수정한 날짜, folders always leading and
+  the name breaking every tie so a layout is stable between reads.
+- The cell is `icon + padding` now instead of two constants, so one number
+  drives layout, hit testing, the marquee and the rename box.
+- Sorting, or turning auto-arrange on, repacks and overwrites saved positions —
+  what explorer does. Changing the icon size does not: the grid changes shape
+  but the cell an icon was dragged to still means the same thing.
+- No 아이콘을 그리드에 맞춤 entry: this layout is grid-snapped always, and a
+  toggle that cannot be off would be a lie.
+- Settings live in `%APPDATA%\glide-shell\desktop-view.txt`, beside the
+  positions.
+
+Verified in the lab, each one: the menu opens with 보기 ▸ and 정렬 기준 ▸ above
+the shell's own items, the current size carries a radio bullet and 바탕 화면
+아이콘 표시 a tick; 큰 아이콘 scaled the icons to 96px with all three staying in
+their own cells; 수정한 날짜 repacked into newest-first and wrote the new cells
+to disk; 아이콘 자동 정렬 made a drag to mid-screen snap back to (0,0); 바탕 화면
+아이콘 표시 cleared the desktop to bare wallpaper and restored it. The file read
+back `icon=96 / sort=modified / auto_arrange=0 / show_icons=1`.
+
+That closes the desktop list: namespace items, folder watch, keyboard, drop
+target, drag with saved positions, multi-monitor, view options.
 
 ## 2026-07-27
 
