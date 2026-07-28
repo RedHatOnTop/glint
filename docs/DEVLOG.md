@@ -92,8 +92,31 @@ Verified in the lab: `drag-me.txt` dragged out of a `C:\dragsrc` explorer window
 onto bare desktop. The folder went to 0개 항목 and the file appeared in the icon
 column — a same-volume drag, so a move, which is what explorer would have done.
 
-That closes the four desktop gaps. Still open there: icon drag and saved
-positions, multi-monitor, view options.
+That closes the four desktop gaps.
+
+**Icons drag, and stay where they are put.** Until now the layout was derived
+from the item order every time, so there was nowhere to *put* an icon.
+
+- The grid cell is the authority and x/y follow from it. Items take the cell
+  they were dragged to, and everything else fills the first free cell in
+  reading order, so a gap the user left stays a gap.
+- Dragging moves the whole selection by one delta, snapped, with anything
+  landing on an occupied cell sliding to the next free one instead of stacking.
+  The threshold is `SM_CXDRAG`, so a click with a shaky hand is still a click,
+  and a lost capture abandons the drag rather than dropping icons somewhere
+  arbitrary.
+- Positions live in `%APPDATA%\glide-shell\desktop-icons.txt` as
+  `col,row=parsing name` — explorer's own store is an undocumented ItemPos blob.
+- Arrow keys had to move to the cells too; after a drag, item order and screen
+  position have nothing to do with each other. They now step cell by cell and
+  skip the empty ones.
+
+Verified in the lab: 휴지통 dragged from (0,0) to mid-screen, snapped to the
+grid, and the file read back `4,3=::{645FF040-…}` with the other two still at
+`0,1` and `0,2`. After a full shell restart it came up in the same place, gap at
+(0,0) intact.
+
+Still open on the desktop: multi-monitor, view options.
 
 ## 2026-07-27
 

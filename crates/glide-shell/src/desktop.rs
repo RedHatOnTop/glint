@@ -111,6 +111,9 @@ struct Item {
     path: Option<PathBuf>,
     label: Vec<u16>,
     bitmap: Option<ID2D1Bitmap1>,
+    /// Grid cell. The authority for where the item is; x/y follow from it.
+    col: u32,
+    row: u32,
     /// Cell top-left, logical.
     x: f32,
     y: f32,
@@ -143,6 +146,19 @@ struct Rename {
     edit: HWND,
 }
 
+/// A selection being dragged across the grid.
+struct Drag {
+    /// Where the button went down, logical.
+    ox: f32,
+    oy: f32,
+    /// Where the cursor is now, logical.
+    x: f32,
+    y: f32,
+    /// Past the system drag threshold. Below it this is still a plain click,
+    /// and letting go must not move anything.
+    moved: bool,
+}
+
 pub struct Desktop {
     renderer: Renderer,
     fmt_label: IDWriteTextFormat,
@@ -156,10 +172,12 @@ pub struct Desktop {
     items_sig: (Vec<String>, (i32, i32, i32, i32)),
     hover: Option<usize>,
     marquee: Option<Marquee>,
+    drag: Option<Drag>,
     tracking: bool,
-    /// Rows per column in the current layout — arrow keys walk the grid in
-    /// the order load_items laid it out, which is column-major.
+    /// Rows per column in the current layout.
     rows: usize,
+    /// Top of row 0, logical — below the work area's top edge.
+    origin_y: f32,
     /// Where the keyboard is. Clicks move it too, so F2 after a click means
     /// what the user expects.
     cursor: usize,
@@ -235,8 +253,10 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
             items_sig: (Vec::new(), (0, 0, 0, 0)),
             hover: None,
             marquee: None,
+            drag: None,
             tracking: false,
             rows: 1,
+            origin_y: 0.0,
             cursor: 0,
             rename: None,
             w: sw as f32 / scale,
@@ -401,15 +421,13 @@ impl Desktop {
 
         let top = work.top as f32 / self.scale + MARGIN;
         let bottom = work.bottom as f32 / self.scale - MARGIN;
-        let rows = (((bottom - top) / (CELL_H + CELL_GAP)).floor() as usize).max(1);
-        self.rows = rows;
+        self.rows = (((bottom - top) / (CELL_H + CELL_GAP)).floor() as usize).max(1);
+        self.origin_y = top;
 
         let px = (ICON * self.scale * 2.0) as i32; // downscale-only quality
         self.items = found
             .into_iter()
-            .enumerate()
-            .map(|(i, (parsing, path))| {
-                let (col, row) = (i / rows, i % rows);
+            .map(|(parsing, path)| {
                 let label: String = match &path {
                     Some(p) => {
                         let stem_only = matches!(
@@ -430,12 +448,68 @@ impl Desktop {
                     label: label.encode_utf16().collect(),
                     parsing,
                     path,
-                    x: MARGIN + col as f32 * (CELL_W + CELL_GAP),
-                    y: top + row as f32 * (CELL_H + CELL_GAP),
+                    col: 0,
+                    row: 0,
+                    x: 0.0,
+                    y: 0.0,
                     selected: false,
                 }
             })
             .collect();
+        self.place_items();
+    }
+
+    /// Give every item a cell: the one the user dragged it to if there is a
+    /// saved position for it, otherwise the first free cell in reading order.
+    /// Explorer keeps this in an undocumented ItemPos blob; ours is a text
+    /// file next to the settings.
+    fn place_items(&mut self) {
+        let saved = load_positions();
+        let rows = self.rows as u32;
+        let mut taken: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut homeless: Vec<usize> = Vec::new();
+
+        for i in 0..self.items.len() {
+            // A cell off the bottom means the work area shrank since it was
+            // saved; that item goes back in the flow rather than off-screen.
+            let cell = saved.get(&self.items[i].parsing).copied().filter(|&(_, r)| r < rows);
+            match cell {
+                Some(c) if taken.insert(c) => {
+                    self.items[i].col = c.0;
+                    self.items[i].row = c.1;
+                }
+                _ => homeless.push(i),
+            }
+        }
+
+        let mut free = (0u32, 0u32);
+        for i in homeless {
+            while !taken.insert(free) {
+                free = next_cell(free, rows);
+            }
+            self.items[i].col = free.0;
+            self.items[i].row = free.1;
+        }
+        self.sync_cells();
+    }
+
+    /// Pixel positions follow from the grid cells, never the other way round.
+    fn sync_cells(&mut self) {
+        let origin_y = self.origin_y;
+        for it in &mut self.items {
+            it.x = MARGIN + it.col as f32 * (CELL_W + CELL_GAP);
+            it.y = origin_y + it.row as f32 * (CELL_H + CELL_GAP);
+        }
+    }
+
+    /// The cell a point falls in, rounded to whichever cell the icon's
+    /// top-left is nearest — dragging aims with the icon, not the cursor.
+    fn cell_at(&self, x: f32, y: f32) -> (u32, u32) {
+        let col = ((x - MARGIN) / (CELL_W + CELL_GAP)).round().max(0.0) as u32;
+        let row = ((y - self.origin_y) / (CELL_H + CELL_GAP))
+            .round()
+            .clamp(0.0, self.rows.saturating_sub(1) as f32) as u32;
+        (col, row)
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
@@ -478,8 +552,17 @@ impl Desktop {
                 }
             }
 
+            // A drag in flight: the selection rides with the cursor, faded, so
+            // the cells it came from stay readable underneath.
+            let lift = match &self.drag {
+                Some(d) if d.moved => (d.x - d.ox, d.y - d.oy),
+                _ => (0.0, 0.0),
+            };
             for (i, item) in self.items.iter().enumerate() {
-                let cell = rect(item.x, item.y, item.x + CELL_W, item.y + CELL_H);
+                let (lx, ly) = if item.selected { lift } else { (0.0, 0.0) };
+                let alpha = if (lx, ly) == (0.0, 0.0) { 1.0 } else { 0.72 };
+                let (itx, ity) = (item.x + lx, item.y + ly);
+                let cell = rect(itx, ity, itx + CELL_W, ity + CELL_H);
                 if item.selected {
                     fill_round(r, cell, 6.0, theme::with_alpha(theme::accent(), 0.22));
                     if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.7)) {
@@ -494,13 +577,13 @@ impl Desktop {
                     fill_round(r, cell, 6.0, theme::rgba(255, 255, 255, 0.10));
                 }
 
-                let ix = item.x + (CELL_W - ICON) / 2.0;
-                let iy = item.y + 8.0;
+                let ix = itx + (CELL_W - ICON) / 2.0;
+                let iy = ity + 8.0;
                 if let Some(bmp) = &item.bitmap {
                     r.dc.DrawBitmap(
                         bmp,
                         Some(&rect(ix, iy, ix + ICON, iy + ICON)),
-                        1.0,
+                        alpha,
                         D2D1_INTERPOLATION_MODE_LINEAR,
                         None,
                         None,
@@ -521,7 +604,7 @@ impl Desktop {
                 // Ring the glyphs instead — eight offsets at low alpha build a
                 // halo that reads as a soft shadow but works against any
                 // background, without a scrim box behind every icon.
-                let lr = rect(item.x + 2.0, iy + ICON + 4.0, item.x + CELL_W - 2.0, item.y + CELL_H - 2.0);
+                let lr = rect(itx + 2.0, iy + ICON + 4.0, itx + CELL_W - 2.0, ity + CELL_H - 2.0);
                 const HALO: [(f32, f32); 8] = [
                     (-1.0, -1.0), (0.0, -1.0), (1.0, -1.0),
                     (-1.0, 0.0), (1.0, 0.0),
@@ -529,13 +612,13 @@ impl Desktop {
                 ];
                 for (dx, dy) in HALO {
                     let o = rect(lr.left + dx, lr.top + dy, lr.right + dx, lr.bottom + dy);
-                    self.label(&item.label, o, theme::rgba(0, 0, 0, 0.34));
+                    self.label(&item.label, o, theme::rgba(0, 0, 0, 0.34 * alpha));
                 }
                 // Weight under the text so it sits on the wallpaper rather than
                 // floating in a uniform outline.
                 let drop = rect(lr.left, lr.top + 2.0, lr.right, lr.bottom + 2.0);
-                self.label(&item.label, drop, theme::rgba(0, 0, 0, 0.35));
-                self.label(&item.label, lr, theme::rgba(244, 246, 250, 1.0));
+                self.label(&item.label, drop, theme::rgba(0, 0, 0, 0.35 * alpha));
+                self.label(&item.label, lr, theme::rgba(244, 246, 250, alpha));
             }
 
             if let Some(m) = &self.marquee {
@@ -580,27 +663,70 @@ impl Desktop {
         self.paint();
     }
 
-    /// Grid navigation. `load_items` fills column by column, so the next row
-    /// is the next index and the next column is `rows` further on.
+    /// Grid navigation over the cells themselves, not the item order — after
+    /// a drag the two have nothing to do with each other. Empty cells are
+    /// stepped over, so a gap left by a drag does not stop the cursor.
     fn move_cursor(&mut self, dx: isize, dy: isize) {
         if self.items.is_empty() {
             return;
         }
         let rows = self.rows as isize;
-        let cur = self.cursor.min(self.items.len() - 1) as isize;
-        let (col, row) = (cur / rows, cur % rows);
-        let mut next = (col + dx) * rows + (row + dy);
-        // Off the top or bottom of a column: carry into the neighbouring one,
-        // so Down at the end of a column continues rather than stopping.
-        if row + dy < 0 || row + dy >= rows {
-            next = cur + dy;
+        let last_col = self.items.iter().map(|it| it.col as isize).max().unwrap_or(0);
+        let cur = self.cursor.min(self.items.len() - 1);
+        let (mut c, mut r) = (self.items[cur].col as isize, self.items[cur].row as isize);
+
+        for _ in 0..=(rows * (last_col + 1)) {
+            c += dx;
+            r += dy;
+            // Vertical movement wraps into the neighbouring column, the way a
+            // column of icons reads. Horizontal movement just stops.
+            if r < 0 {
+                c -= 1;
+                r = rows - 1;
+            } else if r >= rows {
+                c += 1;
+                r = 0;
+            }
+            if c < 0 || c > last_col {
+                return;
+            }
+            if let Some(i) =
+                self.items.iter().position(|it| it.col as isize == c && it.row as isize == r)
+            {
+                self.cursor = i;
+                for (j, it) in self.items.iter_mut().enumerate() {
+                    it.selected = j == i;
+                }
+                return;
+            }
         }
-        let last = self.items.len() as isize - 1;
-        let next = next.clamp(0, last) as usize;
-        self.cursor = next;
-        for (i, it) in self.items.iter_mut().enumerate() {
-            it.selected = i == next;
+    }
+
+    /// Commit a drag: every selected icon moves by the same delta, snapped to
+    /// the grid, and anything landing on an occupied cell slides on to the
+    /// next free one rather than stacking.
+    fn drop_icons(&mut self) {
+        let Some(d) = self.drag.take() else { return };
+        if !d.moved {
+            return;
         }
+        let (dx, dy) = (d.x - d.ox, d.y - d.oy);
+        let rows = self.rows as u32;
+        let mut taken: std::collections::HashSet<(u32, u32)> =
+            self.items.iter().filter(|it| !it.selected).map(|it| (it.col, it.row)).collect();
+
+        let moving: Vec<usize> =
+            (0..self.items.len()).filter(|&i| self.items[i].selected).collect();
+        for i in moving {
+            let mut cell = self.cell_at(self.items[i].x + dx, self.items[i].y + dy);
+            while !taken.insert(cell) {
+                cell = next_cell(cell, rows);
+            }
+            self.items[i].col = cell.0;
+            self.items[i].row = cell.1;
+        }
+        self.sync_cells();
+        save_positions(&self.items);
     }
 
     fn select_all(&mut self) {
@@ -878,6 +1004,42 @@ unsafe fn watch(hwnd: HWND) {
     }
 }
 
+/// Reading order down a column, then on to the next.
+fn next_cell((col, row): (u32, u32), rows: u32) -> (u32, u32) {
+    if row + 1 < rows { (col, row + 1) } else { (col + 1, 0) }
+}
+
+fn positions_path() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("glide-shell").join("desktop-icons.txt")
+}
+
+/// `col,row=parsing name`, one per line. The name goes last because it is the
+/// only field that can contain anything.
+fn load_positions() -> std::collections::HashMap<String, (u32, u32)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(txt) = std::fs::read_to_string(positions_path()) else { return out };
+    for line in txt.lines() {
+        let Some((cell, name)) = line.split_once('=') else { continue };
+        let Some((c, r)) = cell.split_once(',') else { continue };
+        let (Ok(c), Ok(r)) = (c.trim().parse(), r.trim().parse()) else { continue };
+        out.insert(name.to_string(), (c, r));
+    }
+    out
+}
+
+fn save_positions(items: &[Item]) {
+    let p = positions_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut txt = String::new();
+    for it in items {
+        txt.push_str(&format!("{},{}={}\n", it.col, it.row, it.parsing));
+    }
+    let _ = std::fs::write(p, txt);
+}
+
 /// Make the desktop accept drops, by handing the job to the shell rather than
 /// implementing IDropTarget here. The Desktop folder's own drop target already
 /// knows copy against move against link, what the modifier keys mean, what to
@@ -1049,7 +1211,20 @@ extern "system" fn desktop_wndproc(
             WM_ERASEBKGND => LRESULT(1),
             WM_MOUSEMOVE => {
                 let (x, y) = (lx(desk), ly(desk));
-                if desk.marquee.is_some() {
+                if desk.drag.is_some() {
+                    // The threshold is the system's, so a click with a shaky
+                    // hand stays a click.
+                    let (tx, ty) = (
+                        GetSystemMetrics(SM_CXDRAG) as f32 / desk.scale,
+                        GetSystemMetrics(SM_CYDRAG) as f32 / desk.scale,
+                    );
+                    if let Some(d) = &mut desk.drag {
+                        d.x = x;
+                        d.y = y;
+                        d.moved |= (x - d.ox).abs() > tx || (y - d.oy).abs() > ty;
+                    }
+                    desk.paint();
+                } else if desk.marquee.is_some() {
                     if let Some(m) = &mut desk.marquee {
                         m.x1 = x;
                         m.y1 = y;
@@ -1099,6 +1274,10 @@ extern "system" fn desktop_wndproc(
                         desk.cursor = i;
                         if msg == WM_LBUTTONDBLCLK {
                             desk.open(i);
+                        } else {
+                            desk.drag =
+                                Some(Drag { ox: x, oy: y, x, y, moved: false });
+                            SetCapture(hwnd);
                         }
                     }
                     None => {
@@ -1116,7 +1295,8 @@ extern "system" fn desktop_wndproc(
             }
             WM_LBUTTONUP => {
                 // Take state BEFORE ReleaseCapture (synchronous CAPTURECHANGED).
-                let had = desk.marquee.take().is_some();
+                let had = desk.marquee.take().is_some() || desk.drag.is_some();
+                desk.drop_icons();
                 let _ = ReleaseCapture();
                 if had {
                     desk.paint();
@@ -1124,7 +1304,9 @@ extern "system" fn desktop_wndproc(
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
-                if desk.marquee.take().is_some() {
+                // Capture lost rather than released — abandon the drag where
+                // it started instead of dropping icons somewhere arbitrary.
+                if desk.marquee.take().is_some() || desk.drag.take().is_some() {
                     desk.paint();
                 }
                 LRESULT(0)
