@@ -328,7 +328,7 @@ pub fn run(claim_tray: bool) -> anyhow::Result<()> {
         SetTimer(Some(hwnd), TIMER_CLOCK, 1000, None);
         SetTimer(Some(hwnd), TIMER_RESYNC, 2000, None);
 
-        if let Err(e) = crate::desktop::spawn(dpi) {
+        if let Err(e) = crate::desktop::spawn() {
             crate::safety::note(&format!("desktop window failed: {e}"));
         }
         crate::winkey::install(hwnd);

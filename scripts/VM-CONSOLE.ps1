@@ -118,9 +118,11 @@ switch ($Action) {
         foreach ($ch in $Text.ToCharArray()) {
             $c = [string]$ch
             $needShift = $false
-            if ($plain.ContainsKey($c))          { $vk = $plain[$c] }
+            # Capitals are tested first: hashtable keys are case-insensitive,
+            # so 'Y' finds the 'y' entry and would be typed without the shift.
+            if ($c -cmatch '[A-Z]')              { $vk = [uint16][char]$c; $needShift = $true }
+            elseif ($plain.ContainsKey($c))      { $vk = $plain[$c] }
             elseif ($shifted.ContainsKey($c))    { $vk = $shifted[$c]; $needShift = $true }
-            elseif ($c -cmatch '[A-Z]')          { $vk = [uint16][char]$c; $needShift = $true }
             else { throw "keytext cannot type '$c' — extend the table." }
             # TypeKey inside a held shift arrives out of order on this VM and
             # duplicates the run typed before it, so shifted characters go as an

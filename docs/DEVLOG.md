@@ -116,7 +116,52 @@ grid, and the file read back `4,3=::{645FF040-…}` with the other two still at
 `0,1` and `0,2`. After a full shell restart it came up in the same place, gap at
 (0,0) intact.
 
-Still open on the desktop: multi-monitor, view options.
+**One desktop per monitor.** There was exactly one window, sized from
+`SM_CXSCREEN`/`SM_CYSCREEN` at (0,0), so every monitor but the primary got
+nothing at all: no wallpaper, no background menu, not even a surface to click.
+
+- `EnumDisplayMonitors` at startup, one window per monitor, each with its own
+  renderer at its own monitor's effective DPI. Icons stay on the primary, which
+  is where explorer keeps them; the others carry wallpaper and the background
+  menu. A monitor is identified by its device name — HMONITOR handles do not
+  survive a display change, so nothing can be matched back by handle.
+- Icon coordinates became window-relative and the work area is now read per
+  monitor (`GetMonitorInfoW`, not `SPI_GETWORKAREA`, which only ever knew the
+  primary). Cell (0,0) follows the work area's own left edge as well as its top.
+- Wallpaper comes from `IDesktopWallpaper` matched by monitor rect, since
+  Windows holds a separate image per monitor and `SPI_GETDESKWALLPAPER` reports
+  one of them; SPI stays as the fallback for a spanned image.
+- `WM_DISPLAYCHANGE` schedules one debounced rescan: monitors that stayed are
+  moved and rescaled, a new one gets a window, and a departed one has its window
+  closed. Closing goes through `WM_CLOSE` rather than `DestroyWindow` because
+  the rescan runs off a message and the window being retired can be the one
+  whose wndproc is on the stack. `WM_DPICHANGED` refits the same way.
+- **rig: `GUEST-DISPLAY.ps1`**, and `GLIDE_DESK_SPLIT` alongside the existing
+  `GLIDE_DESK_OFF`/`GLIDE_DESK_BARE` — the lab VM has one screen, and the
+  two-window path is the whole change, so the seam splits that screen down the
+  middle into two pseudo-monitors.
+
+Verified in the lab, three ways. Single monitor first: no regression, all three
+icons still in their saved cells with the wallpaper intact. Then `GLIDE_DESK_SPLIT=1`:
+two windows, each cover-cropping the wallpaper to its own 512×768 half (the seam
+at x=512 is unmistakable), icons on the left half only, and a right-click on the
+right half bringing up the full shell background menu — so the secondary is a
+live window, not a painted bitmap. Then the display-change path on a live shell:
+`ChangeDisplaySettings` to 800×600 and back to 1024×768, with the desktop
+refitting both ways — window resized, wallpaper re-cropped for the new size,
+icons still on their cells.
+
+Not verified: a real second monitor (this lab VM has one screen — Hyper-V only
+does multi-monitor over enhanced-session RDP), and therefore neither genuinely
+different per-monitor wallpapers nor a window being created or closed as a
+monitor arrives or leaves.
+
+Also fixed in the rig: `VM-CONSOLE.ps1 -Action keytext` typed every capital as
+lowercase. PowerShell hashtable keys are case-insensitive, so `Y` found the `y`
+entry and never took the shift branch — which is how a `YES` confirmation prompt
+came back as `yes` and cancelled a shell registration.
+
+Still open on the desktop: view options.
 
 ## 2026-07-27
 

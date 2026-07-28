@@ -1,17 +1,17 @@
 //! M3 desktop — wallpaper + icon grid at the bottom of the z-order
-//! (SHELL_DESIGN §6.3). Full-monitor window pinned under every normal window
-//! via WM_WINDOWPOSCHANGING; alongside explorer it visually replaces the
-//! stock desktop (same items, our rendering), after the swap it IS the
-//! desktop.
+//! (SHELL_DESIGN §6.3). One window per monitor, each covering its own screen
+//! and pinned under every normal window via WM_WINDOWPOSCHANGING; alongside
+//! explorer it visually replaces the stock desktop (same items, our
+//! rendering), after the swap it IS the desktop.
 //!
-//! v1 scope: select (click / Ctrl / marquee), double-click open, right-click
-//! shell context menu (shellmenu.rs), wallpaper reload on WM_SETTINGCHANGE.
-//! Not yet: explorer's saved icon positions (undocumented ItemPos blobs — we
-//! auto-arrange), drag, keyboard. Recorded in §6.3.
+//! Scope: select (click / Ctrl / marquee), double-click open, right-click
+//! shell context menu (shellmenu.rs), drag with saved positions, keyboard,
+//! drop target, live folder watch. Icons live on the primary monitor, which
+//! is where explorer keeps them; the others carry their own wallpaper.
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -27,9 +27,12 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     CreateCompatibleDC, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, FF_DONTCARE, FW_NORMAL, GetDIBits, HFONT, OUT_DEFAULT_PRECIS, ValidateRect,
+    DeleteObject, EnumDisplayMonitors, FF_DONTCARE, FW_NORMAL, GetDIBits, GetMonitorInfoW, HDC,
+    HFONT, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
+    OUT_DEFAULT_PRECIS, ValidateRect,
 };
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::System::Ole::{IDropTarget, OleInitialize, RegisterDragDrop};
 use windows::Win32::Graphics::Imaging::{
     GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
@@ -42,7 +45,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_SFUIObject, DefSubclassProc, FO_DELETE, FOF_ALLOWUNDO, IShellItem, IShellItemImageFactory,
+    BHID_SFUIObject, DefSubclassProc, DesktopWallpaper, FO_DELETE, FOF_ALLOWUNDO, IDesktopWallpaper,
+    IShellItem, IShellItemImageFactory,
     RemoveWindowSubclass, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel, SHCNRF_NewDelivery,
     SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock, SHChangeNotifyEntry,
     SHChangeNotifyRegister, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW,
@@ -50,7 +54,7 @@ use windows::Win32::UI::Shell::{
     SetWindowSubclass, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::{BOOL, PCWSTR, w};
 
 use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
@@ -66,6 +70,9 @@ const WM_SHELLCHANGE: u32 = WM_APP + 1;
 const WM_RENAME_DONE: u32 = WM_APP + 2;
 /// Reload debounce: one user action arrives as a burst of notifications.
 const TIMER_RELOAD: usize = 1;
+/// Display-change debounce — a monitor arriving is several messages, and the
+/// rescan has to run off the message that reported it (see `rescan`).
+const TIMER_RESCAN: usize = 2;
 
 // Background context menu, our own entries (SHELL_DESIGN §6.3).
 const ID_REFRESH: u32 = 1;
@@ -159,7 +166,81 @@ struct Drag {
     moved: bool,
 }
 
+/// A monitor, as the desktop needs it. The device name is the identity that
+/// survives a display change — HMONITOR handles do not, so a window cannot be
+/// matched back to its screen by handle after monitors come and go.
+#[derive(Clone)]
+struct Screen {
+    device: String,
+    rect: RECT,
+    dpi: f32,
+    primary: bool,
+}
+
+// Every desktop window, in creation order. One per monitor; the message loop
+// they all live on is the taskbar thread, so this never leaves it.
+thread_local! {
+    static DESKTOPS: std::cell::RefCell<Vec<HWND>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn screens() -> Vec<Screen> {
+    unsafe extern "system" fn cb(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, l: LPARAM) -> BOOL {
+        unsafe {
+            let out = &mut *(l.0 as *mut Vec<Screen>);
+            let mut mi = MONITORINFOEXW::default();
+            mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            if GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut _).as_bool() {
+                let (mut dx, mut dy) = (96u32, 96u32);
+                let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+                let len = mi.szDevice.iter().position(|c| *c == 0).unwrap_or(mi.szDevice.len());
+                out.push(Screen {
+                    device: String::from_utf16_lossy(&mi.szDevice[..len]),
+                    rect: mi.monitorInfo.rcMonitor,
+                    dpi: dx as f32,
+                    // MONITORINFOF_PRIMARY
+                    primary: mi.monitorInfo.dwFlags & 1 != 0,
+                });
+            }
+        }
+        true.into()
+    }
+    let mut out: Vec<Screen> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut out as *mut _ as isize));
+    }
+    // Lab seam: this box has one screen, and the two-window path is the whole
+    // point of the change. Splitting the one it has down the middle exercises
+    // it — two windows, two renderers, icons on the left half only.
+    if std::env::var_os("GLIDE_DESK_SPLIT").is_some() && out.len() == 1 {
+        let s = out.remove(0);
+        let mid = (s.rect.left + s.rect.right) / 2;
+        out.push(Screen {
+            device: format!("{}-L", s.device),
+            rect: RECT { right: mid, ..s.rect },
+            ..s.clone()
+        });
+        out.push(Screen {
+            device: format!("{}-R", s.device),
+            rect: RECT { left: mid, ..s.rect },
+            primary: false,
+            ..s
+        });
+    }
+    out
+}
+
 pub struct Desktop {
+    hwnd: HWND,
+    /// Which monitor this window covers, and where that monitor is — icon
+    /// coordinates are window-relative, the monitor rect is not.
+    device: String,
+    mon: RECT,
+    /// Icons belong to the primary monitor, the way explorer keeps them. The
+    /// rest of the windows are wallpaper and a background menu.
+    primary: bool,
+    /// Whether this window holds the shell change notification. Only the
+    /// primary needs one, and the primary can move between monitors.
+    watching: bool,
     renderer: Renderer,
     fmt_label: IDWriteTextFormat,
     wallpaper: Option<ID2D1Bitmap1>,
@@ -176,7 +257,9 @@ pub struct Desktop {
     tracking: bool,
     /// Rows per column in the current layout.
     rows: usize,
-    /// Top of row 0, logical — below the work area's top edge.
+    /// Cell (0,0), logical and window-relative — inside the work area, which
+    /// on this monitor need not start at the monitor's own top-left.
+    origin_x: f32,
     origin_y: f32,
     /// Where the keyboard is. Clicks move it too, so F2 after a click means
     /// what the user expects.
@@ -187,26 +270,48 @@ pub struct Desktop {
     scale: f32,
 }
 
-/// Create the desktop window; it lives on this thread's message loop for the
-/// life of the process (leaked box, same as the shell itself).
-pub fn spawn(dpi: f32) -> anyhow::Result<()> {
+/// One desktop window per monitor; they live on this thread's message loop for
+/// the life of the process (leaked boxes, same as the shell itself).
+pub fn spawn() -> anyhow::Result<()> {
     if std::env::var_os("GLIDE_DESK_OFF").is_some() {
         return Ok(());
     }
     unsafe {
         let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
-        let class = w!("glide_shell_desktop");
         let wc = WNDCLASSW {
             style: CS_DBLCLKS,
             lpfnWndProc: Some(desktop_wndproc),
             hInstance: hinstance.into(),
-            lpszClassName: class,
+            lpszClassName: CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
         RegisterClassW(&wc);
+        crate::shellmenu::enable_dark_menus();
 
-        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        let screens = screens();
+        let mut first: anyhow::Result<()> = Ok(());
+        for s in &screens {
+            if let Err(e) = create(s) {
+                crate::safety::note(&format!("desktop: no window on {} ({e})", s.device));
+                if first.is_ok() {
+                    first = Err(e);
+                }
+            }
+        }
+        // Every monitor failing is a real failure; one of several is noted and
+        // the rest of the desktop still comes up.
+        if DESKTOPS.with(|d| d.borrow().is_empty()) { first } else { Ok(()) }
+    }
+}
+
+const CLASS: PCWSTR = w!("glide_shell_desktop");
+
+/// Build the window for one monitor and register it.
+unsafe fn create(s: &Screen) -> anyhow::Result<()> {
+    unsafe {
+        let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
+        let (sw, sh) = (s.rect.right - s.rect.left, s.rect.bottom - s.rect.top);
         let hwnd = CreateWindowExW(
             // Activatable, unlike every other window this shell owns: keys
             // only arrive at the focus, and the desktop is a keyboard surface.
@@ -214,11 +319,11 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
             // exactly what explorer's desktop is — focusable and behind
             // everything. TOOLWINDOW keeps it out of Alt+Tab.
             WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
-            class,
+            CLASS,
             w!("glide-shell desktop"),
             WS_POPUP,
-            0,
-            0,
+            s.rect.left,
+            s.rect.top,
             sw,
             sh,
             None,
@@ -227,8 +332,8 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
             None,
         )?;
 
-        let scale = dpi / 96.0;
-        let renderer = Renderer::new(hwnd, sw as u32, sh as u32, dpi)?;
+        let scale = s.dpi / 96.0;
+        let renderer = Renderer::new(hwnd, sw as u32, sh as u32, s.dpi)?;
 
         let fmt_label = renderer.dwrite.CreateTextFormat(
             w!("Segoe UI Variable"),
@@ -244,6 +349,11 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
         ellipsize(&renderer.dwrite, &fmt_label);
 
         let mut desk = Box::new(Desktop {
+            hwnd,
+            device: s.device.clone(),
+            mon: s.rect,
+            primary: s.primary,
+            watching: false,
             renderer,
             fmt_label,
             wallpaper: None,
@@ -256,6 +366,7 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
             drag: None,
             tracking: false,
             rows: 1,
+            origin_x: MARGIN,
             origin_y: 0.0,
             cursor: 0,
             rename: None,
@@ -265,26 +376,34 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
         });
         desk.load_wallpaper();
         desk.load_items();
-        crate::shellmenu::enable_dark_menus();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::leak(desk) as *mut Desktop as isize);
+        DESKTOPS.with(|d| d.borrow_mut().push(hwnd));
         // Only after the pointer is installed: the shell can deliver the first
         // notification before this function returns, and a WM_SHELLCHANGE that
         // lands on a null userdata is a leaked delivery handle.
-        watch(hwnd);
+        let desk = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop);
+        if s.primary {
+            watch(hwnd);
+            desk.watching = true;
+        }
         register_drop(hwnd);
 
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_BOTTOM),
-            0,
-            0,
+            s.rect.left,
+            s.rect.top,
             sw,
             sh,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        let desk = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop);
         eprintln!(
-            "desktop: {} items, wallpaper={} ({})",
+            "desktop: {} on {} ({}×{} @{}), {} items, wallpaper={} ({})",
+            if s.primary { "primary" } else { "secondary" },
+            s.device,
+            sw,
+            sh,
+            s.dpi as u32,
             desk.items.len(),
             desk.wallpaper.is_some(),
             desk.wall_path
@@ -294,21 +413,108 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
     }
 }
 
+/// Re-fit the windows to the monitors after a display change: the ones whose
+/// monitor stayed are moved and rescaled, a monitor that arrived gets a new
+/// window, and one that left has its window closed.
+///
+/// Closing goes through WM_CLOSE rather than DestroyWindow: this runs off a
+/// message, and the window being retired can be the one whose wndproc is on
+/// the stack — destroying it there would free the Desktop underneath the
+/// frame that called us.
+fn rescan() {
+    let screens = screens();
+    let existing = DESKTOPS.with(|d| d.borrow().clone());
+    let mut fitted: Vec<&str> = Vec::new();
+    for hwnd in existing {
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Desktop;
+        if ptr.is_null() {
+            continue;
+        }
+        let desk = unsafe { &mut *ptr };
+        match screens.iter().find(|s| s.device == desk.device) {
+            Some(s) => {
+                desk.refit(s);
+                fitted.push(&s.device);
+            }
+            None => unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            },
+        }
+    }
+    for s in screens.iter().filter(|s| !fitted.contains(&s.device.as_str())) {
+        if let Err(e) = unsafe { create(s) } {
+            crate::safety::note(&format!("desktop: no window on {} ({e})", s.device));
+        }
+    }
+}
+
 impl Desktop {
+    /// Take the geometry of the monitor this window is on, and answer with its
+    /// work area. Both move under us — a bar docking, a resolution change, the
+    /// monitor itself being rearranged — so nothing about them is cached past
+    /// the call that needs it.
+    fn work_area(&mut self) -> RECT {
+        unsafe {
+            let mut mi = MONITORINFOEXW::default();
+            mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let hmon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            if !GetMonitorInfoW(hmon, &mut mi as *mut _ as *mut _).as_bool() {
+                return self.mon;
+            }
+            self.mon = mi.monitorInfo.rcMonitor;
+            mi.monitorInfo.rcWork
+        }
+    }
+
+    /// The monitor moved, resized or changed scaling: follow it, and rebuild
+    /// everything that was sized against the old one.
+    fn refit(&mut self, s: &Screen) {
+        let (w, h) = (s.rect.right - s.rect.left, s.rect.bottom - s.rect.top);
+        let same_geometry = s.rect == self.mon && s.dpi == self.scale * 96.0;
+        let same_role = s.primary == self.primary;
+        self.mon = s.rect;
+        self.scale = s.dpi / 96.0;
+        self.w = w as f32 / self.scale;
+        self.h = h as f32 / self.scale;
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_BOTTOM),
+                s.rect.left,
+                s.rect.top,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        // The icons follow the primary monitor, so a monitor that gained or
+        // lost the role has to re-read the folder even if it did not move.
+        self.primary = s.primary;
+        if s.primary && !self.watching {
+            unsafe { watch(self.hwnd) };
+            self.watching = true;
+        }
+        if same_geometry && same_role {
+            return;
+        }
+        if !same_geometry {
+            let _ = self.renderer.resize(w as u32, h as u32, s.dpi);
+        }
+        self.items_sig.0.clear();
+        self.load_items();
+        // The wallpaper was decoded at the old monitor's size, and a monitor
+        // can carry its own image.
+        self.wall_path.clear();
+        self.load_wallpaper();
+        self.paint();
+    }
+
     fn load_wallpaper(&mut self) {
         if std::env::var_os("GLIDE_DESK_BARE").is_some() {
             return;
         }
         unsafe {
-            let mut buf = [0u16; 512];
-            let _ = SystemParametersInfoW(
-                SPI_GETDESKWALLPAPER,
-                buf.len() as u32,
-                Some(buf.as_mut_ptr() as *mut _),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            );
-            let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
-            let path = String::from_utf16_lossy(&buf[..len]);
+            let path = wallpaper_path(self.mon);
             let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             if path == self.wall_path && mtime == self.wall_mtime && self.wallpaper.is_some() {
                 return;
@@ -358,8 +564,13 @@ impl Desktop {
 
     /// The enabled namespace roots, then the user and public Desktop folders
     /// merged with dirs first and then by name, laid out in explorer-style
-    /// columns inside the work area.
+    /// columns inside the work area. Only the primary monitor has them.
     fn load_items(&mut self) {
+        if !self.primary {
+            self.items.clear();
+            self.items_sig = (Vec::new(), (0, 0, 0, 0));
+            return;
+        }
         let mut found: Vec<(String, Option<PathBuf>)> = NAMESPACE_ITEMS
             .iter()
             .filter(|(clsid, default_on)| namespace_visible(clsid, *default_on))
@@ -400,16 +611,10 @@ impl Desktop {
                 .map(|(p, _)| (p.as_os_str().to_string_lossy().into_owned(), Some(p))),
         );
 
-        // Work area (explorer's bar + ours both reserve; icons stay above).
-        let mut work = windows::Win32::Foundation::RECT::default();
-        unsafe {
-            let _ = SystemParametersInfoW(
-                SPI_GETWORKAREA,
-                0,
-                Some(&mut work as *mut _ as *mut _),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            );
-        }
+        // Work area of this window's monitor (explorer's bar + ours both
+        // reserve; icons stay above). SPI_GETWORKAREA only knows the primary
+        // one, which is no help once there are several.
+        let work = self.work_area();
         let sig = (
             found.iter().map(|(p, _)| p.clone()).collect::<Vec<String>>(),
             (work.left, work.top, work.right, work.bottom),
@@ -419,9 +624,12 @@ impl Desktop {
         }
         self.items_sig = sig;
 
-        let top = work.top as f32 / self.scale + MARGIN;
-        let bottom = work.bottom as f32 / self.scale - MARGIN;
+        // Window-relative: the work area is in screen coordinates and this
+        // window starts at its monitor's top-left, not the desktop's.
+        let top = (work.top - self.mon.top) as f32 / self.scale + MARGIN;
+        let bottom = (work.bottom - self.mon.top) as f32 / self.scale - MARGIN;
         self.rows = (((bottom - top) / (CELL_H + CELL_GAP)).floor() as usize).max(1);
+        self.origin_x = (work.left - self.mon.left) as f32 / self.scale + MARGIN;
         self.origin_y = top;
 
         let px = (ICON * self.scale * 2.0) as i32; // downscale-only quality
@@ -495,9 +703,9 @@ impl Desktop {
 
     /// Pixel positions follow from the grid cells, never the other way round.
     fn sync_cells(&mut self) {
-        let origin_y = self.origin_y;
+        let (origin_x, origin_y) = (self.origin_x, self.origin_y);
         for it in &mut self.items {
-            it.x = MARGIN + it.col as f32 * (CELL_W + CELL_GAP);
+            it.x = origin_x + it.col as f32 * (CELL_W + CELL_GAP);
             it.y = origin_y + it.row as f32 * (CELL_H + CELL_GAP);
         }
     }
@@ -505,7 +713,7 @@ impl Desktop {
     /// The cell a point falls in, rounded to whichever cell the icon's
     /// top-left is nearest — dragging aims with the icon, not the cursor.
     fn cell_at(&self, x: f32, y: f32) -> (u32, u32) {
-        let col = ((x - MARGIN) / (CELL_W + CELL_GAP)).round().max(0.0) as u32;
+        let col = ((x - self.origin_x) / (CELL_W + CELL_GAP)).round().max(0.0) as u32;
         let row = ((y - self.origin_y) / (CELL_H + CELL_GAP))
             .round()
             .clamp(0.0, self.rows.saturating_sub(1) as f32) as u32;
@@ -1074,6 +1282,41 @@ unsafe fn register_drop(hwnd: HWND) {
 
 /// Is this namespace root on the desktop? `default_on` stands in for the
 /// value explorer has never written.
+/// The wallpaper image for one monitor. Windows holds a separate one per
+/// monitor and SPI_GETDESKWALLPAPER answers with only one of them, so ask the
+/// wallpaper service; its monitor IDs come in an order of their own, so the
+/// one we want is found by rect. Falls back to SPI when the service says
+/// nothing useful — a spanned image, or no per-monitor entry at all.
+fn wallpaper_path(mon: RECT) -> String {
+    unsafe {
+        if let Ok(dw) = CoCreateInstance::<_, IDesktopWallpaper>(&DesktopWallpaper, None, CLSCTX_ALL)
+        {
+            for i in 0..dw.GetMonitorDevicePathCount().unwrap_or(0) {
+                let Ok(id) = dw.GetMonitorDevicePathAt(i) else { continue };
+                let mine = dw.GetMonitorRECT(PCWSTR(id.0)).is_ok_and(|r| r == mon);
+                let found = mine.then(|| dw.GetWallpaper(PCWSTR(id.0)).ok()).flatten();
+                CoTaskMemFree(Some(id.0 as *const _));
+                if let Some(p) = found {
+                    let path = p.to_string().unwrap_or_default();
+                    CoTaskMemFree(Some(p.0 as *const _));
+                    if !path.is_empty() {
+                        return path;
+                    }
+                }
+            }
+        }
+        let mut buf = [0u16; 512];
+        let _ = SystemParametersInfoW(
+            SPI_GETDESKWALLPAPER,
+            buf.len() as u32,
+            Some(buf.as_mut_ptr() as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+    }
+}
+
 fn namespace_visible(clsid: &str, default_on: bool) -> bool {
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
@@ -1193,6 +1436,13 @@ extern "system" fn desktop_wndproc(
                 (*wp).hwndInsertAfter = HWND_BOTTOM;
                 (*wp).flags &= !SWP_NOZORDER;
             }
+            return LRESULT(0);
+        }
+        // Before the Desktop is borrowed: the rescan reaches into every one of
+        // them, including this window's, and may retire this very window.
+        if msg == WM_TIMER && wparam.0 == TIMER_RESCAN {
+            let _ = KillTimer(Some(hwnd), TIMER_RESCAN);
+            rescan();
             return LRESULT(0);
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop;
@@ -1448,26 +1698,30 @@ extern "system" fn desktop_wndproc(
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE => {
-                let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_BOTTOM),
-                    0,
-                    0,
-                    sw,
-                    sh,
-                    SWP_NOACTIVATE,
-                );
-                desk.w = sw as f32 / desk.scale;
-                desk.h = sh as f32 / desk.scale;
-                let dpi = desk.scale * 96.0;
-                let _ = desk.renderer.resize(sw as u32, sh as u32, dpi);
-                desk.items_sig.0.clear();
-                desk.load_items();
-                // Wallpaper was scaled for the old monitor size.
-                desk.wall_path.clear();
-                desk.load_wallpaper();
-                desk.paint();
+                // A monitor arriving or leaving is a burst of these, one to
+                // every window; coalesce and let a single rescan sort out
+                // which windows the new arrangement wants.
+                let _ = SetTimer(Some(hwnd), TIMER_RESCAN, 400, None);
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                // The suggested rect is for a window being dragged between
+                // monitors; this one covers its monitor and stays there, so
+                // only the scaling is news.
+                let dpi = (wparam.0 & 0xFFFF) as f32;
+                let s = Screen {
+                    device: desk.device.clone(),
+                    rect: desk.mon,
+                    dpi,
+                    primary: desk.primary,
+                };
+                desk.refit(&s);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                DESKTOPS.with(|d| d.borrow_mut().retain(|&h| h != hwnd));
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(Box::from_raw(ptr));
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
