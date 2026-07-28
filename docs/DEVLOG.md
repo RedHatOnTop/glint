@@ -52,6 +52,28 @@ from the console and the file appeared with no refresh; recycling it through
 `Shell.Application.InvokeVerb('delete')` — a path that touches none of our own
 code — removed the icon *and* switched 휴지통 from the empty bin to the full one.
 
+Desktop gap 3 of 4: **the desktop was mouse-only.** It could not even receive a
+keystroke — `WS_EX_NOACTIVATE` plus `MA_NOACTIVATE` meant it never held focus.
+
+- Dropped both. The window is activatable now, and `WM_WINDOWPOSCHANGING` still
+  pins it to the bottom of the z-order, which is precisely what explorer's
+  desktop is: focusable and behind everything. `WS_EX_TOOLWINDOW` keeps it out
+  of Alt+Tab.
+- Arrows (the grid is column-major, and running off a column carries into the
+  next), Ctrl+A, Enter, Esc, Delete (`SHFileOperation` with `FOF_ALLOWUNDO`,
+  shift to erase, one call for the batch so there is one undo entry), F2.
+- F2 opens a real EDIT window rather than something drawn here: a self-drawn box
+  would have to reimplement IME composition and these are Korean filenames. It
+  is a popup and not a child, because the desktop is `WS_EX_NOREDIRECTIONBITMAP`
+  and a child HWND has no surface to compose into — it would simply not appear.
+  The stem is preselected and the extension is not, as explorer does.
+
+Verified in the lab, every one: Ctrl+A framed all three icons, ↓ narrowed to
+one, F2 opened the box with `kb-test` selected and `.txt` not, typing +Enter
+renamed the file and the list re-sorted itself through the watcher, Delete
+removed it, ↑ then Enter opened 휴지통 — which listed `renamed` and `watch-test`
+with 원래 위치 `C:\Users\Person\Desktop`, so Delete recycles rather than erases.
+
 ## 2026-07-27
 
 Two more shell-only defects closed, both found by using the guest rather than

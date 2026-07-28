@@ -25,8 +25,9 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, GetDIBits, ValidateRect,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    CreateCompatibleDC, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, FF_DONTCARE, FW_NORMAL, GetDIBits, HFONT, OUT_DEFAULT_PRECIS, ValidateRect,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::Graphics::Imaging::{
@@ -34,15 +35,18 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL,
-    GetKeyState,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IShellItem, IShellItemImageFactory, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel,
-    SHCNRF_NewDelivery, SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock,
-    SHChangeNotifyEntry, SHChangeNotifyRegister, SHCreateItemFromParsingName, SHParseDisplayName,
-    SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT, ShellExecuteW,
+    DefSubclassProc, FO_DELETE, FOF_ALLOWUNDO, IShellItem, IShellItemImageFactory,
+    RemoveWindowSubclass, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel, SHCNRF_NewDelivery,
+    SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock, SHChangeNotifyEntry,
+    SHChangeNotifyRegister, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW,
+    SHParseDisplayName, SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT,
+    SetWindowSubclass, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -50,9 +54,15 @@ use windows::core::{PCWSTR, w};
 use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
 
+// Both live behind the windows crate's "Win32_UI_Controls" feature, which
+// this crate does not take — it would pull in the whole common-control
+// surface for two integers.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const EM_SETSEL: u32 = 0x00B1;
 /// SHChangeNotify delivery — something under the desktop moved.
 const WM_SHELLCHANGE: u32 = WM_APP + 1;
+/// The rename box finished; wparam is 1 to keep what was typed.
+const WM_RENAME_DONE: u32 = WM_APP + 2;
 /// Reload debounce: one user action arrives as a burst of notifications.
 const TIMER_RELOAD: usize = 1;
 
@@ -122,6 +132,16 @@ struct Marquee {
     y1: f32,
 }
 
+/// In-place rename. A real EDIT window rather than something drawn here,
+/// because a self-drawn box would have to reimplement IME composition and
+/// these are Korean filenames. It is a popup and not a child: the desktop is
+/// WS_EX_NOREDIRECTIONBITMAP, which has no surface for a child HWND to
+/// compose into, and a child would simply not appear.
+struct Rename {
+    idx: usize,
+    edit: HWND,
+}
+
 pub struct Desktop {
     renderer: Renderer,
     fmt_label: IDWriteTextFormat,
@@ -136,6 +156,13 @@ pub struct Desktop {
     hover: Option<usize>,
     marquee: Option<Marquee>,
     tracking: bool,
+    /// Rows per column in the current layout — arrow keys walk the grid in
+    /// the order load_items laid it out, which is column-major.
+    rows: usize,
+    /// Where the keyboard is. Clicks move it too, so F2 after a click means
+    /// what the user expects.
+    cursor: usize,
+    rename: Option<Rename>,
     w: f32,
     h: f32,
     scale: f32,
@@ -162,7 +189,12 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
 
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+            // Activatable, unlike every other window this shell owns: keys
+            // only arrive at the focus, and the desktop is a keyboard surface.
+            // WM_WINDOWPOSCHANGING keeps it at the bottom regardless, which is
+            // exactly what explorer's desktop is — focusable and behind
+            // everything. TOOLWINDOW keeps it out of Alt+Tab.
+            WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
             class,
             w!("glide-shell desktop"),
             WS_POPUP,
@@ -203,6 +235,9 @@ pub fn spawn(dpi: f32) -> anyhow::Result<()> {
             hover: None,
             marquee: None,
             tracking: false,
+            rows: 1,
+            cursor: 0,
+            rename: None,
             w: sw as f32 / scale,
             h: sh as f32 / scale,
             scale,
@@ -365,6 +400,7 @@ impl Desktop {
         let top = work.top as f32 / self.scale + MARGIN;
         let bottom = work.bottom as f32 / self.scale - MARGIN;
         let rows = (((bottom - top) / (CELL_H + CELL_GAP)).floor() as usize).max(1);
+        self.rows = rows;
 
         let px = (ICON * self.scale * 2.0) as i32; // downscale-only quality
         self.items = found
@@ -542,6 +578,145 @@ impl Desktop {
         self.paint();
     }
 
+    /// Grid navigation. `load_items` fills column by column, so the next row
+    /// is the next index and the next column is `rows` further on.
+    fn move_cursor(&mut self, dx: isize, dy: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let rows = self.rows as isize;
+        let cur = self.cursor.min(self.items.len() - 1) as isize;
+        let (col, row) = (cur / rows, cur % rows);
+        let mut next = (col + dx) * rows + (row + dy);
+        // Off the top or bottom of a column: carry into the neighbouring one,
+        // so Down at the end of a column continues rather than stopping.
+        if row + dy < 0 || row + dy >= rows {
+            next = cur + dy;
+        }
+        let last = self.items.len() as isize - 1;
+        let next = next.clamp(0, last) as usize;
+        self.cursor = next;
+        for (i, it) in self.items.iter_mut().enumerate() {
+            it.selected = i == next;
+        }
+    }
+
+    fn select_all(&mut self) {
+        for it in &mut self.items {
+            it.selected = true;
+        }
+    }
+
+    fn open_selected(&self) {
+        for i in 0..self.items.len() {
+            if self.items[i].selected {
+                self.open(i);
+            }
+        }
+    }
+
+    /// Recycle (or, with shift, erase) every selected item that is a file.
+    /// Namespace items are not deletable and are simply skipped.
+    fn delete_selected(&self, hwnd: HWND, permanent: bool) {
+        // SHFileOperation takes the whole batch as one double-null-terminated
+        // block, which is also why this is one call and not one per item: the
+        // user gets a single undo entry, as they would from explorer.
+        let mut from: Vec<u16> = Vec::new();
+        for it in self.items.iter().filter(|it| it.selected) {
+            let Some(p) = &it.path else { continue };
+            from.extend(p.as_os_str().to_string_lossy().encode_utf16());
+            from.push(0);
+        }
+        if from.is_empty() {
+            return;
+        }
+        from.push(0);
+
+        let mut op = SHFILEOPSTRUCTW {
+            hwnd,
+            wFunc: FO_DELETE,
+            pFrom: PCWSTR(from.as_ptr()),
+            fFlags: if permanent { 0 } else { FOF_ALLOWUNDO.0 as u16 },
+            ..Default::default()
+        };
+        unsafe {
+            SHFileOperationW(&mut op);
+        }
+        // No refresh here — the operation raises the shell notification we are
+        // already listening for.
+    }
+
+    fn begin_rename(&mut self, hwnd: HWND, idx: usize) {
+        let Some(item) = self.items.get(idx) else { return };
+        // Namespace items rename through the shell, not the filesystem; not
+        // worth the machinery for "휴지통" → something else.
+        let Some(path) = item.path.clone() else { return };
+        let (x, y) = (item.x, item.y + ICON + 14.0);
+        self.end_rename(false);
+
+        let name: Vec<u16> = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let (px, py) = ((x * self.scale) as i32, (y * self.scale) as i32);
+        let (pw, ph) = ((CELL_W * self.scale) as i32, (22.0 * self.scale) as i32);
+
+        let edit = unsafe {
+            let Ok(edit) = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                w!("EDIT"),
+                PCWSTR(name.as_ptr()),
+                WS_POPUP | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                px,
+                py,
+                pw,
+                ph,
+                Some(hwnd),
+                None,
+                None,
+                None,
+            ) else {
+                return;
+            };
+            SendMessageW(edit, WM_SETFONT, Some(WPARAM(ui_font(self.scale).0 as usize)), None);
+            // Explorer selects the stem and leaves the extension alone, which
+            // is the whole point of renaming in place.
+            let stem = path.file_stem().map_or(0, |s| s.to_string_lossy().encode_utf16().count());
+            let _ = SetWindowSubclass(edit, Some(rename_proc), 0x0D17, hwnd.0 as usize);
+            let _ = SetForegroundWindow(edit);
+            let _ = SetFocus(Some(edit));
+            SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(stem as isize)));
+            edit
+        };
+        self.rename = Some(Rename { idx, edit });
+    }
+
+    fn end_rename(&mut self, commit: bool) {
+        let Some(r) = self.rename.take() else { return };
+        let mut buf = [0u16; 512];
+        let len = unsafe { GetWindowTextW(r.edit, &mut buf) } as usize;
+        unsafe {
+            let _ = RemoveWindowSubclass(r.edit, Some(rename_proc), 0x0D17);
+            let _ = DestroyWindow(r.edit);
+        }
+        if !commit || len == 0 {
+            return;
+        }
+        let typed = String::from_utf16_lossy(&buf[..len]);
+        let Some(path) = self.items.get(r.idx).and_then(|it| it.path.clone()) else { return };
+        if path.file_name().is_some_and(|n| n.to_string_lossy() == typed) {
+            return;
+        }
+        let target = path.with_file_name(&typed);
+        if let Err(e) = std::fs::rename(&path, &target) {
+            crate::safety::note(&format!("desktop: rename to {typed} failed: {e}"));
+        }
+        // The rename raises a shell notification; the refresh rides on that.
+    }
+
     fn marquee_apply(&mut self) {
         let Some(m) = &self.marquee else { return };
         let (l, t) = (m.x0.min(m.x1), m.y0.min(m.y1));
@@ -551,6 +726,64 @@ impl Desktop {
                 item.x < r && item.x + CELL_W > l && item.y < b && item.y + CELL_H > t;
         }
     }
+}
+
+/// The rename box, told about the two keys an EDIT does not handle. Both
+/// answers are posted rather than acted on here, because acting on them
+/// destroys this very window from inside its own message handler.
+unsafe extern "system" fn rename_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    owner: usize,
+) -> LRESULT {
+    unsafe {
+        let desk = HWND(owner as *mut core::ffi::c_void);
+        match msg {
+            WM_KEYDOWN if wparam.0 as u16 == VK_RETURN.0 || wparam.0 as u16 == VK_ESCAPE.0 => {
+                let commit = wparam.0 as u16 == VK_RETURN.0;
+                let _ = PostMessageW(Some(desk), WM_RENAME_DONE, WPARAM(commit as usize), LPARAM(0));
+                LRESULT(0)
+            }
+            // A single-line EDIT beeps at these; it was never asked to be a
+            // dialog and there is no default button to press.
+            WM_CHAR if wparam.0 as u16 == 0x0D || wparam.0 as u16 == 0x1B => LRESULT(0),
+            WM_KILLFOCUS => {
+                // Clicking away keeps the edit, same as explorer.
+                let _ = PostMessageW(Some(desk), WM_RENAME_DONE, WPARAM(1), LPARAM(0));
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// One shared UI font for the rename box, made on first use and kept — it
+/// outlives every rename and there is only ever one desktop.
+fn ui_font(scale: f32) -> HFONT {
+    use std::sync::OnceLock;
+    static FONT: OnceLock<isize> = OnceLock::new();
+    HFONT(*FONT.get_or_init(|| unsafe {
+        CreateFontW(
+            -((12.0 * scale) as i32),
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            w!("Segoe UI"),
+        )
+        .0 as isize
+    }) as *mut core::ffi::c_void)
 }
 
 fn open_uri(uri: &str) {
@@ -780,7 +1013,6 @@ extern "system" fn desktop_wndproc(
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_MOUSEMOVE => {
                 let (x, y) = (lx(desk), ly(desk));
                 if desk.marquee.is_some() {
@@ -830,6 +1062,7 @@ extern "system" fn desktop_wndproc(
                             }
                             desk.items[i].selected = true;
                         }
+                        desk.cursor = i;
                         if msg == WM_LBUTTONDBLCLK {
                             desk.open(i);
                         }
@@ -933,6 +1166,38 @@ extern "system" fn desktop_wndproc(
                     MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
                     _ => {}
                 }
+                LRESULT(0)
+            }
+            WM_KEYDOWN => {
+                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                let vk = VIRTUAL_KEY(wparam.0 as u16);
+                match vk {
+                    VK_LEFT => desk.move_cursor(-1, 0),
+                    VK_RIGHT => desk.move_cursor(1, 0),
+                    VK_UP => desk.move_cursor(0, -1),
+                    VK_DOWN => desk.move_cursor(0, 1),
+                    VK_RETURN => desk.open_selected(),
+                    VK_F2 => {
+                        let idx = desk.cursor;
+                        desk.begin_rename(hwnd, idx);
+                        return LRESULT(0);
+                    }
+                    VK_DELETE => desk.delete_selected(hwnd, shift),
+                    VK_ESCAPE => {
+                        for it in &mut desk.items {
+                            it.selected = false;
+                        }
+                    }
+                    // 'A'. There is no VK constant for the letter keys.
+                    VIRTUAL_KEY(0x41) if ctrl => desk.select_all(),
+                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+                desk.paint();
+                LRESULT(0)
+            }
+            WM_RENAME_DONE => {
+                desk.end_rename(wparam.0 != 0);
                 LRESULT(0)
             }
             WM_SHELLCHANGE => {
