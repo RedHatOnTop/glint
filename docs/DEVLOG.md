@@ -80,6 +80,40 @@ typed into the guest console (`powershell -ep bypass -f C:\glint\GUEST-MOUSE.ps1
 …`); running it from the host clicks the host, and four "the menu will not
 dismiss" rounds were nothing but clicks that never reached the VM.
 
+**Third weakness: the desktop looked finished and did not act it.** No
+clipboard, no F5, arrows moved the cursor but could not extend a selection, and
+typing a letter did nothing. All four are in.
+
+- Ctrl+C / Ctrl+X / Ctrl+V. The data object is not ours: the selection's PIDLs
+  go into `SHCreateShellItemArrayFromIDLists`, and `BindToHandler(BHID_DataObject)`
+  hands back the shell's own `IDataObject` — CF_HDROP and every shell format
+  with it. Cut versus copy rides in the registered `Preferred DropEffect`
+  format, one DWORD in an HGLOBAL, which is what explorer reads too.
+- Paste is a simulated drop onto the Desktop folder's own `IDropTarget`
+  (`BHID_SFUIObject`): `DragEnter` / `DragOver` / `Drop`. **`grfKeyState` must
+  carry `MK_LBUTTON`.** Without a mouse button in it the shell target reads the
+  drop as a *right*-drag and answers with the 여기에 복사 / 취소 menu instead of
+  pasting — an hour lost to that.
+- Cut items are drawn at 0.45 alpha, icon and chip together, and Esc clears the
+  ghosting the way it clears everything else.
+- Shift+arrow extends: the cursor keeps an anchor, and the selection is the
+  rectangle of cells between anchor and cursor, not the linear run — the icons
+  are on a grid and a grid selection is what the eye expects.
+- A letter key selects the next item whose name starts with it; the same letter
+  again cycles through the matches. The prefix accumulates for 1.2s, so `de`
+  reaches `desktop-view.txt` past `drag-me.txt`.
+- F5 re-enumerates.
+
+Verified in the lab on the running shell, driven from the guest console:
+Shift+Down puts two cards and two accent chips up (`kb2`); Ctrl+C then Ctrl+V
+produced `drag-me - 복사본.txt` on the desktop with no menu in the way (`kb4`);
+Ctrl+X ghosted it (`kb5`); Esc then `m` jumped the selection to Microsoft Edge
+(`kb6`); F5 came back with the desktop whole and the new copy still on it
+(`kb7`).
+
+Still open on the desktop: it is a drag *target* and not a drag *source* —
+`DoDragDrop` with the same `selection_data()` is the missing half.
+
 ## 2026-07-27 (evening)
 
 Desktop gap 1 of 4: **the desktop had no namespace items.** It enumerated two

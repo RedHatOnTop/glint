@@ -11,7 +11,9 @@
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GENERIC_READ, HGLOBAL, HWND, LPARAM, LRESULT, POINTL, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -32,22 +34,32 @@ use windows::Win32::Graphics::Gdi::{
     HFONT, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
     OUT_DEFAULT_PRECIS, ValidateRect,
 };
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject,
+    STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+};
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::SystemServices::{
+    MK_CONTROL, MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::System::Ole::{IDropTarget, OleInitialize, RegisterDragDrop};
+use windows::Win32::System::Ole::{
+    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, IDropTarget, OleFlushClipboard, OleGetClipboard,
+    OleInitialize, OleSetClipboard, RegisterDragDrop, ReleaseStgMedium,
+};
 use windows::Win32::Graphics::Imaging::{
     GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_UP,
+    VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_F5, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_SFUIObject, DefSubclassProc, DesktopWallpaper, FO_DELETE, FOF_ALLOWUNDO, IDesktopWallpaper,
-    IShellItem, IShellItemImageFactory,
+    BHID_DataObject, BHID_SFUIObject, DefSubclassProc, DesktopWallpaper, FO_DELETE, FOF_ALLOWUNDO,
+    IDesktopWallpaper, IShellItem, IShellItemImageFactory, SHCreateShellItemArrayFromIDLists,
     RemoveWindowSubclass, SHCNE_ALLEVENTS, SHCNRF_InterruptLevel, SHCNRF_NewDelivery,
     SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock, SHChangeNotifyEntry,
     SHChangeNotifyRegister, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW,
@@ -66,6 +78,16 @@ use crate::theme;
 // surface for two integers.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const EM_SETSEL: u32 = 0x00B1;
+
+// The clipboard's cut-or-copy flag is one DWORD in an HGLOBAL, and the global
+// heap sits behind "Win32_System_Memory". Declared here for the same reason as
+// the two constants above: a whole feature for three calls is not a trade.
+const GMEM_MOVEABLE: u32 = 0x0002;
+unsafe extern "system" {
+    fn GlobalAlloc(uflags: u32, dwbytes: usize) -> HGLOBAL;
+    fn GlobalLock(hmem: HGLOBAL) -> *mut core::ffi::c_void;
+    fn GlobalUnlock(hmem: HGLOBAL) -> BOOL;
+}
 /// SHChangeNotify delivery — something under the desktop moved.
 const WM_SHELLCHANGE: u32 = WM_APP + 1;
 /// The rename box finished; wparam is 1 to keep what was typed.
@@ -99,6 +121,9 @@ const CELL_GAP: f32 = 6.0;
 const CELL_PAD_X: f32 = 36.0;
 const CELL_PAD_Y: f32 = 54.0;
 const MARGIN: f32 = 18.0;
+/// Type-ahead window. Explorer uses a second; a shell that redraws the whole
+/// desktop per keystroke is better off forgiving a slower typist.
+const TYPE_AHEAD_MS: u32 = 1200;
 
 /// Icon cell design (SHELL_DESIGN §5). Explorer rings its labels in a black
 /// halo and washes the whole cell in accent when selected; both are its look,
@@ -412,6 +437,17 @@ pub struct Desktop {
     /// Where the keyboard is. Clicks move it too, so F2 after a click means
     /// what the user expects.
     cursor: usize,
+    /// The far end of a Shift+arrow range. Every plain move and every click
+    /// re-drops it where the cursor lands.
+    anchor: usize,
+    /// Type-ahead: the prefix typed so far, and when the last key landed. A
+    /// pause longer than TYPE_AHEAD_MS starts a new word.
+    typed: String,
+    typed_at: std::time::Instant,
+    /// Parsing names put on the clipboard by Ctrl+X. They stay on the desktop
+    /// until something pastes them, drawn faded — the only sign a cut is
+    /// pending, since the clipboard itself says nothing on screen.
+    cut: Vec<String>,
     rename: Option<Rename>,
     view: View,
     w: f32,
@@ -518,6 +554,10 @@ unsafe fn create(s: &Screen) -> anyhow::Result<()> {
             origin_x: MARGIN,
             origin_y: 0.0,
             cursor: 0,
+            anchor: 0,
+            typed: String::new(),
+            typed_at: std::time::Instant::now(),
+            cut: Vec::new(),
             rename: None,
             view: View::load(),
             w: sw as f32 / scale,
@@ -977,7 +1017,10 @@ impl Desktop {
             }
             for (i, item) in self.items.iter().enumerate() {
                 let (lx, ly) = if item.selected { lift } else { (0.0, 0.0) };
-                let alpha = if (lx, ly) == (0.0, 0.0) { 1.0 } else { 0.72 };
+                let mut alpha = if (lx, ly) == (0.0, 0.0) { 1.0 } else { 0.72 };
+                if self.cut.contains(&item.parsing) {
+                    alpha *= 0.45;
+                }
                 let (itx, ity) = (item.x + lx, item.y + ly);
                 let cell = rect(itx, ity, itx + cw, ity + ch);
                 let hovered = self.hover == Some(i);
@@ -1149,7 +1192,12 @@ impl Desktop {
     /// Grid navigation over the cells themselves, not the item order — after
     /// a drag the two have nothing to do with each other. Empty cells are
     /// stepped over, so a gap left by a drag does not stop the cursor.
-    fn move_cursor(&mut self, dx: isize, dy: isize) {
+    ///
+    /// `extend` is Shift held: the selection becomes every item inside the
+    /// block of cells the anchor and the cursor span. A list would extend
+    /// along its one order; this is a grid, and the rectangle is the only
+    /// reading of "everything between here and there" that survives a drag.
+    fn move_cursor(&mut self, dx: isize, dy: isize, extend: bool) {
         if self.items.is_empty() {
             return;
         }
@@ -1177,6 +1225,54 @@ impl Desktop {
                 self.items.iter().position(|it| it.col as isize == c && it.row as isize == r)
             {
                 self.cursor = i;
+                if extend {
+                    self.select_block();
+                } else {
+                    self.anchor = i;
+                    for (j, it) in self.items.iter_mut().enumerate() {
+                        it.selected = j == i;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// Select every item in the block of cells the anchor and cursor corner.
+    fn select_block(&mut self) {
+        let (Some(a), Some(c)) = (self.items.get(self.anchor), self.items.get(self.cursor)) else {
+            return;
+        };
+        let (c0, c1) = (a.col.min(c.col), a.col.max(c.col));
+        let (r0, r1) = (a.row.min(c.row), a.row.max(c.row));
+        for it in &mut self.items {
+            it.selected = (c0..=c1).contains(&it.col) && (r0..=r1).contains(&it.row);
+        }
+    }
+
+    /// Type-ahead: jump to the first item whose name starts with what has been
+    /// typed. Matching is on the label rather than the filename, because that
+    /// is what is on screen — and it is the localized one for 휴지통.
+    fn type_ahead(&mut self, ch: char) {
+        if self.typed_at.elapsed().as_millis() as u32 > TYPE_AHEAD_MS {
+            self.typed.clear();
+        }
+        self.typed_at = std::time::Instant::now();
+        // The same letter again means "next item starting with it", which is
+        // only distinguishable from a prefix while the prefix is one letter.
+        let repeat = self.typed.chars().next() == Some(ch) && self.typed.chars().count() == 1;
+        if !repeat {
+            self.typed.push(ch);
+        }
+        let needle = self.typed.to_lowercase();
+        let start = if repeat { self.cursor + 1 } else { 0 };
+        let n = self.items.len();
+        for k in 0..n {
+            let i = (start + k) % n;
+            let label = String::from_utf16_lossy(&self.items[i].label).to_lowercase();
+            if label.starts_with(&needle) {
+                self.cursor = i;
+                self.anchor = i;
                 for (j, it) in self.items.iter_mut().enumerate() {
                     it.selected = j == i;
                 }
@@ -1212,6 +1308,106 @@ impl Desktop {
         }
         self.sync_cells();
         save_positions(&self.items);
+    }
+
+    /// The selection as the shell's own data object — CF_HDROP and every other
+    /// format an app might ask for. Same principle as the drop target: the
+    /// shell already builds one, and anything written here would be a worse
+    /// version of it.
+    fn selection_data(&self) -> Option<IDataObject> {
+        let mut pidls: Vec<*const ITEMIDLIST> = Vec::new();
+        for it in self.items.iter().filter(|it| it.selected) {
+            let w: Vec<u16> = it.parsing.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            unsafe {
+                if SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).is_ok() {
+                    pidls.push(pidl as *const _);
+                }
+            }
+        }
+        if pidls.is_empty() {
+            return None;
+        }
+        let data = unsafe {
+            SHCreateShellItemArrayFromIDLists(&pidls)
+                .ok()
+                .and_then(|arr| arr.BindToHandler(None, &BHID_DataObject).ok())
+        };
+        for p in pidls {
+            unsafe { CoTaskMemFree(Some(p as *const _)) };
+        }
+        data
+    }
+
+    /// Ctrl+C and Ctrl+X. Which of the two it was rides on the clipboard as
+    /// the shell's "Preferred DropEffect" format, which is where every file
+    /// manager on the machine looks for it — including the one pasting into a
+    /// folder window that has nothing to do with us.
+    fn clipboard_put(&mut self, cut: bool) {
+        let Some(data) = self.selection_data() else { return };
+        let effect = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+        unsafe {
+            set_preferred_effect(&data, effect);
+            if OleSetClipboard(&data).is_err() {
+                return;
+            }
+            // Rendered now rather than on demand: a shell that dies holding a
+            // delayed render takes the clipboard down with it.
+            let _ = OleFlushClipboard();
+        }
+        self.cut = if cut {
+            self.items.iter().filter(|it| it.selected).map(|it| it.parsing.clone()).collect()
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// Ctrl+V. The paste is a drop: the Desktop folder's own drop target is
+    /// handed the clipboard's data object, so collisions, .lnk files and
+    /// cross-volume moves behave exactly as they do for a real drag. The
+    /// modifier is stated rather than left to the target's default, which
+    /// would turn a copy into a move whenever the source is on this volume.
+    fn clipboard_paste(&mut self) {
+        unsafe {
+            let Ok(data) = OleGetClipboard() else { return };
+            let move_it = preferred_effect(&data) == DROPEFFECT_MOVE;
+            let Some(dir) = desktop_dir() else { return };
+            let w: Vec<u16> =
+                dir.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            let target = (|| -> windows::core::Result<IDropTarget> {
+                let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None)?;
+                item.BindToHandler(None, &BHID_SFUIObject)
+            })();
+            let Ok(target) = target else { return };
+
+            let mut pt = windows::Win32::Foundation::POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let at = POINTL { x: pt.x, y: pt.y };
+            // MK_LBUTTON is not decoration: a drop with no button in the key
+            // state is a right-drag as far as the shell target is concerned,
+            // and it answers with the 여기에 복사 / 취소 menu instead of pasting.
+            let keys = MODIFIERKEYS_FLAGS(
+                MK_LBUTTON.0 | if move_it { MK_SHIFT.0 } else { MK_CONTROL.0 },
+            );
+            let mut effect = if move_it { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+            if target.DragEnter(&data, keys, at, &mut effect).is_err() {
+                return;
+            }
+            let _ = target.DragOver(keys, at, &mut effect);
+            if effect == DROPEFFECT(0) {
+                let _ = target.DragLeave();
+                return;
+            }
+            if let Err(e) = target.Drop(&data, keys, at, &mut effect) {
+                crate::safety::note(&format!("desktop: paste failed ({e})"));
+                return;
+            }
+            // A cut is spent once it lands, the same as everywhere else.
+            if move_it {
+                let _ = OleSetClipboard(None);
+                self.cut.clear();
+            }
+        }
     }
 
     fn select_all(&mut self) {
@@ -1529,6 +1725,64 @@ fn save_positions(items: &[Item]) {
     let _ = std::fs::write(p, txt);
 }
 
+/// The user's own Desktop folder — where a paste lands and what the drop
+/// target is bound to. The Public one is read as well but never written.
+fn desktop_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Desktop"))
+}
+
+/// "Preferred DropEffect": one DWORD saying whether the files on the clipboard
+/// were cut or copied. Registered by name because it has no fixed CF_ number.
+unsafe fn preferred_effect_format() -> Option<FORMATETC> {
+    let cf = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+    (cf != 0).then(|| FORMATETC {
+        cfFormat: cf as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    })
+}
+
+unsafe fn set_preferred_effect(data: &IDataObject, effect: DROPEFFECT) {
+    unsafe {
+        let Some(fmt) = preferred_effect_format() else { return };
+        let hg = GlobalAlloc(GMEM_MOVEABLE, 4);
+        if hg.is_invalid() {
+            return;
+        }
+        let p = GlobalLock(hg) as *mut u32;
+        if p.is_null() {
+            return;
+        }
+        *p = effect.0;
+        let _ = GlobalUnlock(hg);
+        let medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: hg },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        // fRelease: the data object owns the block from here, including when
+        // SetData itself fails.
+        let _ = data.SetData(&fmt, &medium, true);
+    }
+}
+
+unsafe fn preferred_effect(data: &IDataObject) -> DROPEFFECT {
+    unsafe {
+        let Some(fmt) = preferred_effect_format() else { return DROPEFFECT_COPY };
+        let Ok(mut medium) = data.GetData(&fmt) else { return DROPEFFECT_COPY };
+        let mut effect = DROPEFFECT_COPY;
+        let p = GlobalLock(medium.u.hGlobal) as *const u32;
+        if !p.is_null() {
+            effect = DROPEFFECT(*p);
+            let _ = GlobalUnlock(medium.u.hGlobal);
+        }
+        ReleaseStgMedium(&mut medium);
+        effect
+    }
+}
+
 /// Make the desktop accept drops, by handing the job to the shell rather than
 /// implementing IDropTarget here. The Desktop folder's own drop target already
 /// knows copy against move against link, what the modifier keys mean, what to
@@ -1536,8 +1790,7 @@ fn save_positions(items: &[Item]) {
 /// worse version of it.
 unsafe fn register_drop(hwnd: HWND) {
     unsafe {
-        let Some(dir) = std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Desktop"))
-        else {
+        let Some(dir) = desktop_dir() else {
             return;
         };
         let w: Vec<u16> = dir
@@ -1803,6 +2056,7 @@ extern "system" fn desktop_wndproc(
                             desk.items[i].selected = true;
                         }
                         desk.cursor = i;
+                        desk.anchor = i;
                         if msg == WM_LBUTTONDBLCLK {
                             desk.open(i);
                         } else {
@@ -1942,11 +2196,15 @@ extern "system" fn desktop_wndproc(
                 let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
                 let vk = VIRTUAL_KEY(wparam.0 as u16);
                 match vk {
-                    VK_LEFT => desk.move_cursor(-1, 0),
-                    VK_RIGHT => desk.move_cursor(1, 0),
-                    VK_UP => desk.move_cursor(0, -1),
-                    VK_DOWN => desk.move_cursor(0, 1),
+                    VK_LEFT => desk.move_cursor(-1, 0, shift),
+                    VK_RIGHT => desk.move_cursor(1, 0, shift),
+                    VK_UP => desk.move_cursor(0, -1, shift),
+                    VK_DOWN => desk.move_cursor(0, 1, shift),
                     VK_RETURN => desk.open_selected(),
+                    VK_F5 => {
+                        desk.refresh_all();
+                        return LRESULT(0);
+                    }
                     VK_F2 => {
                         let idx = desk.cursor;
                         desk.begin_rename(hwnd, idx);
@@ -1957,12 +2215,32 @@ extern "system" fn desktop_wndproc(
                         for it in &mut desk.items {
                             it.selected = false;
                         }
+                        // Escape also calls off a pending cut, which is the
+                        // only way to take one back short of pasting it.
+                        desk.cut.clear();
+                        desk.typed.clear();
                     }
-                    // 'A'. There is no VK constant for the letter keys.
+                    // There are no VK constants for the letter keys.
                     VIRTUAL_KEY(0x41) if ctrl => desk.select_all(),
+                    VIRTUAL_KEY(0x43) if ctrl => desk.clipboard_put(false),
+                    VIRTUAL_KEY(0x58) if ctrl => desk.clipboard_put(true),
+                    VIRTUAL_KEY(0x56) if ctrl => desk.clipboard_paste(),
                     _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
                 desk.paint();
+                LRESULT(0)
+            }
+            // Type-ahead. WM_KEYDOWN hands the letters on to DefWindowProc,
+            // which is what turns them into characters — and the character is
+            // what a Korean name is matched on, not the virtual key.
+            WM_CHAR => {
+                match char::from_u32(wparam.0 as u32) {
+                    Some(c) if !c.is_control() && (c != ' ' || !desk.typed.is_empty()) => {
+                        desk.type_ahead(c);
+                        desk.paint();
+                    }
+                    _ => {}
+                }
                 LRESULT(0)
             }
             WM_RENAME_DONE => {
