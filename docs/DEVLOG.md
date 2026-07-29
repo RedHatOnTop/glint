@@ -135,9 +135,27 @@ Notepad window opened it there — title `drag-me - 복사본.txt`, body `dragge
 rearranges: `drag-me.txt` moved a column right and a row down and stayed there
 (`ds6`).
 
-Still open on the desktop: dropping *onto* a desktop icon. 휴지통 and a folder
-icon are drop targets in explorer and are inert here — an internal drag only
-ever rearranges.
+**Dropping onto an icon**, the last of the four. An internal drag only ever
+rearranged, so 휴지통 was a picture and a folder icon was a place to put another
+icon next to. Letting go over an icon now asks that item whether it takes drops
+(`SFGAO_DROPTARGET`) and, if it does, hands it the selection through its own
+`IDropTarget` with no modifier — the target picks the effect, which is what
+makes a drag to the bin a delete and a drag to a folder a move. An icon that is
+part of the selection is not a place to drop the selection, and anything that
+says no falls through to the rearrangement it always was. The three drops we do
+now — paste, onto-icon, and the desktop's own — share one `simulate_drop`.
+
+Verified in the lab: dragging `drag-me - 복사본.txt` onto 휴지통 took it off the
+desktop and the bin's own listing shows it (`Shell.Application` NameSpace(10) →
+`drag-me - 복사본`), so it was recycled and not erased; dragging `drag-me.txt`
+onto an `inbox` folder icon emptied its cell, filled the folder glyph, and
+`dir /b Desktop\inbox` answers `drag-me.txt`.
+
+Rig note, the second: a test script that minimizes the console must put it back.
+`act.ps1` does not, and the next `keytext` went to the *desktop* instead —
+where the new type-ahead read it and Enter opened a folder. Nothing was broken,
+but a whole round was spent reading a screen that showed the wrong thing (it did
+prove type-ahead and Enter work against a real key stream).
 
 ## 2026-07-27 (evening)
 

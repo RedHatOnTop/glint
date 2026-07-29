@@ -41,7 +41,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::SystemServices::{
-    MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS,
+    MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS, SFGAO_DROPTARGET,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::System::Ole::{
@@ -1364,11 +1364,42 @@ impl Desktop {
         };
     }
 
+    /// Dropping the selection *onto* another icon — 휴지통, a folder, a drive,
+    /// a shortcut to one. The item itself says whether it can take a drop
+    /// (`SFGAO_DROPTARGET`) and then does the taking, so deleting by dragging
+    /// to the bin costs no code of ours. Answers whether the drop happened; a
+    /// no means this was an ordinary rearrangement after all.
+    fn drop_onto(&mut self, idx: usize) -> bool {
+        // An icon being dragged is not a place to drop what it is part of.
+        if self.items[idx].selected {
+            return false;
+        }
+        let w: Vec<u16> =
+            self.items[idx].parsing.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let target = (|| -> windows::core::Result<Option<IDropTarget>> {
+                let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None)?;
+                if item.GetAttributes(SFGAO_DROPTARGET)?.0 & SFGAO_DROPTARGET.0 == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(item.BindToHandler(None, &BHID_SFUIObject)?))
+            })();
+            let Ok(Some(target)) = target else { return false };
+            let Some(data) = self.selection_data() else { return false };
+            // No modifier: the target picks, which is what makes a drag to the
+            // bin a delete and a drag to a folder on this volume a move.
+            let dropped =
+                simulate_drop(&target, &data, MODIFIERKEYS_FLAGS(MK_LBUTTON.0), DROP_ALL);
+            if dropped {
+                self.refresh_all();
+            }
+            dropped
+        }
+    }
+
     /// Ctrl+V. The paste is a drop: the Desktop folder's own drop target is
     /// handed the clipboard's data object, so collisions, .lnk files and
-    /// cross-volume moves behave exactly as they do for a real drag. The
-    /// modifier is stated rather than left to the target's default, which
-    /// would turn a copy into a move whenever the source is on this volume.
+    /// cross-volume moves behave exactly as they do for a real drag.
     fn clipboard_paste(&mut self) {
         unsafe {
             let Ok(data) = OleGetClipboard() else { return };
@@ -1382,26 +1413,14 @@ impl Desktop {
             })();
             let Ok(target) = target else { return };
 
-            let mut pt = windows::Win32::Foundation::POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let at = POINTL { x: pt.x, y: pt.y };
-            // MK_LBUTTON is not decoration: a drop with no button in the key
-            // state is a right-drag as far as the shell target is concerned,
-            // and it answers with the 여기에 복사 / 취소 menu instead of pasting.
+            // The modifier is stated rather than left to the target's default,
+            // which would turn a copy into a move whenever the source is on
+            // this volume.
             let keys = MODIFIERKEYS_FLAGS(
                 MK_LBUTTON.0 | if move_it { MK_SHIFT.0 } else { MK_CONTROL.0 },
             );
-            let mut effect = if move_it { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
-            if target.DragEnter(&data, keys, at, &mut effect).is_err() {
-                return;
-            }
-            let _ = target.DragOver(keys, at, &mut effect);
-            if effect == DROPEFFECT(0) {
-                let _ = target.DragLeave();
-                return;
-            }
-            if let Err(e) = target.Drop(&data, keys, at, &mut effect) {
-                crate::safety::note(&format!("desktop: paste failed ({e})"));
+            let effect = if move_it { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
+            if !simulate_drop(&target, &data, keys, effect) {
                 return;
             }
             // A cut is spent once it lands, the same as everywhere else.
@@ -1731,6 +1750,42 @@ fn save_positions(items: &[Item]) {
 /// target is bound to. The Public one is read as well but never written.
 fn desktop_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Desktop"))
+}
+
+/// Everything a source may offer, for the drops where the target is the one
+/// that should decide.
+const DROP_ALL: DROPEFFECT = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
+
+/// Hand a data object to a shell drop target as though the pointer had let go
+/// over it. `keys` must carry `MK_LBUTTON`: with no button in the key state
+/// the target reads the drop as a right-drag and answers with the 여기에 복사 /
+/// 취소 menu instead of doing anything. `effect` on the way in is what the
+/// source allows; the target narrows it.
+unsafe fn simulate_drop(
+    target: &IDropTarget,
+    data: &IDataObject,
+    keys: MODIFIERKEYS_FLAGS,
+    effect: DROPEFFECT,
+) -> bool {
+    unsafe {
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let at = POINTL { x: pt.x, y: pt.y };
+        let mut effect = effect;
+        if target.DragEnter(data, keys, at, &mut effect).is_err() {
+            return false;
+        }
+        let _ = target.DragOver(keys, at, &mut effect);
+        if effect == DROPEFFECT_NONE {
+            let _ = target.DragLeave();
+            return false;
+        }
+        if let Err(e) = target.Drop(data, keys, at, &mut effect) {
+            crate::safety::note(&format!("desktop: drop failed ({e})"));
+            return false;
+        }
+        true
+    }
 }
 
 /// "Preferred DropEffect": one DWORD saying whether the files on the clipboard
@@ -2162,6 +2217,15 @@ extern "system" fn desktop_wndproc(
             WM_LBUTTONUP => {
                 // Take state BEFORE ReleaseCapture (synchronous CAPTURECHANGED).
                 let had = desk.marquee.take().is_some() || desk.drag.is_some();
+                // Let go over an icon that can take a drop and the drag was a
+                // delete or a file into a folder, not a rearrangement.
+                let onto = match desk.drag.as_ref().filter(|d| d.moved) {
+                    Some(_) => desk.hit(lx(desk), ly(desk)),
+                    None => None,
+                };
+                if onto.is_some_and(|i| desk.drop_onto(i)) {
+                    desk.drag = None;
+                }
                 desk.drop_icons();
                 let _ = ReleaseCapture();
                 if had {
