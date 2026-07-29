@@ -53,6 +53,28 @@ and paint but create nothing. Stashing this slice and running the previous
 `TrackPopupMenuEx` binary in the same lab behaves identically — `NewMenu` wants
 a shell-view site we do not give it. 액세스 권한 부여 ▸ is empty in both, too.
 
+**The icons were an explorer copy too.** White label ringed in a black halo,
+translucent-accent wash over the selected cell — that is explorer's look, drawn
+by us. Both are gone.
+
+- A label now sits on a rounded chip cut from the same surface as the bar and
+  the menus. `IDWriteTextLayout` per item, measured once and cached, so the
+  chip fits the text instead of the cell — and it is one text draw where the
+  halo was nine.
+- A selected cell is a card in the panel colour with the accent hairline along
+  its top edge, and its chip goes accent with dark ink. Bright accents make
+  white text on them the unreadable combination, not the safe one.
+- Hover is the shared `HOVER_FILL` wash on the same card, and the marquee is
+  rounded to match.
+- Cell padding went 50 → 54: the chip's own padding has to fit under two lines
+  of label, and at 50 every wrapped name came back trimmed to one line and an
+  ellipsis (caught in the lab, not in review).
+
+Verified in the lab on the running shell: 휴지통 / drag-me.txt / Microsoft Edge
+/ drag-me - 바로 가기 all render with two-line names on chips; hover measured as
+a +3.8% brightness lift over the cell (264.8 → 293.6 mean RGB sum, thumbnails
+`ic6`/`ic7`); a click puts the card, the accent hairline and the teal chip up.
+
 Rig note: `GUEST-MOUSE.ps1` injects into *whatever session runs it*. It must be
 typed into the guest console (`powershell -ep bypass -f C:\glint\GUEST-MOUSE.ps1
 …`); running it from the host clicks the host, and four "the menu will not

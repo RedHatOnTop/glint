@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1, D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -21,7 +21,8 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_ALIGNMENT_CENTER, IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS,
+    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -55,6 +56,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
+use windows_numerics::Vector2;
 
 use crate::render::{Renderer, ellipsize, fill_round, rect};
 use crate::theme;
@@ -95,8 +97,30 @@ const SORTS: [(u32, &str, Sort); 4] = [
 const CELL_GAP: f32 = 6.0;
 /// Cell padding around the icon: sides, and below it for two lines of label.
 const CELL_PAD_X: f32 = 36.0;
-const CELL_PAD_Y: f32 = 50.0;
+const CELL_PAD_Y: f32 = 54.0;
 const MARGIN: f32 = 18.0;
+
+/// Icon cell design (SHELL_DESIGN §5). Explorer rings its labels in a black
+/// halo and washes the whole cell in accent when selected; both are its look,
+/// not ours. A name here rides on a small rounded slab cut from the same
+/// surface as the bar and the menus, and a selected cell is that surface too,
+/// with the accent hairline every other panel wears along its top edge.
+const CARD_RADIUS: f32 = 10.0;
+const CHIP_RADIUS: f32 = 7.0;
+const CHIP_PAD_X: f32 = 7.0;
+const CHIP_PAD_Y: f32 = 3.0;
+/// Icon bottom to the top of the chip. The cell padding below the icon has to
+/// leave this plus two lines of text plus the chip's own padding, or a name
+/// that wrapped before is trimmed to one line and an ellipsis.
+const LABEL_GAP: f32 = 5.0;
+/// Chip surface: darker and denser than BAR_BG, because it sits directly on a
+/// photograph rather than on the acrylic the bar has under it.
+const CHIP_BG: D2D1_COLOR_F = theme::rgba(16, 17, 21, 0.52);
+const CHIP_BG_HOVER: D2D1_COLOR_F = theme::rgba(16, 17, 21, 0.66);
+const CARD_BG: D2D1_COLOR_F = theme::rgba(26, 27, 32, 0.72);
+/// Ink on the accent chip. The accents are bright enough that white text on
+/// them is the unreadable combination, not the safe one.
+const CHIP_INK_SELECTED: D2D1_COLOR_F = theme::rgba(10, 14, 16, 1.0);
 
 /// The desktop's namespace roots, in the order explorer lists them, with the
 /// visibility each has on a fresh profile. They are not files — they live in
@@ -123,6 +147,10 @@ struct Item {
     path: Option<PathBuf>,
     label: Vec<u16>,
     bitmap: Option<ID2D1Bitmap1>,
+    /// Laid-out label, kept because the chip behind it is sized from the text
+    /// and measuring on every frame would mean a layout per icon per paint.
+    /// Rebuilt when the cell width it was measured against changes.
+    text: Option<Label>,
     /// Grid cell. The authority for where the item is; x/y follow from it.
     col: u32,
     row: u32,
@@ -138,6 +166,39 @@ impl Item {
     /// answer to the desktop root, so they group together as `None`.
     fn menu_group(&self) -> Option<PathBuf> {
         self.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    }
+}
+
+/// A label measured once: the layout to draw and the box it actually fills.
+struct Label {
+    layout: IDWriteTextLayout,
+    /// Cell width this was measured against; a different one invalidates it.
+    max_w: f32,
+    w: f32,
+    h: f32,
+}
+
+impl Label {
+    fn measure(
+        dwrite: &IDWriteFactory,
+        fmt: &IDWriteTextFormat,
+        text: &[u16],
+        max_w: f32,
+        max_h: f32,
+    ) -> Option<Label> {
+        unsafe {
+            let layout = dwrite.CreateTextLayout(text, fmt, max_w, max_h.max(1.0)).ok()?;
+            let mut m = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m).ok()?;
+            Some(Label {
+                layout,
+                max_w,
+                // Trailing whitespace is inside the line but not under the
+                // glyphs, and a chip sized to include it looks off-centre.
+                w: m.width.min(max_w),
+                h: m.height.min(max_h.max(1.0)),
+            })
+        }
     }
 }
 
@@ -787,6 +848,7 @@ impl Desktop {
                 Item {
                     bitmap: shell_image(&self.renderer, &parsing, px),
                     label: label.encode_utf16().collect(),
+                    text: None,
                     parsing,
                     path,
                     col: 0,
@@ -901,23 +963,41 @@ impl Desktop {
                 _ => (0.0, 0.0),
             };
             let (cw, ch, icon) = (self.cell_w(), self.cell_h(), self.view.icon);
+            let hair = 1.0 / self.scale;
+            let label_box = cw - 2.0 * CHIP_PAD_X - 4.0;
+            let label_h = ch - 8.0 - icon - LABEL_GAP - 2.0 * CHIP_PAD_Y;
+            // Measuring is a pre-pass: the chip is sized from the laid-out
+            // text, and the draw loop only borrows the items.
+            let (dwrite, fmt) = (self.renderer.dwrite.clone(), self.fmt_label.clone());
+            for item in &mut self.items {
+                if item.text.as_ref().is_some_and(|t| t.max_w == label_box) {
+                    continue;
+                }
+                item.text = Label::measure(&dwrite, &fmt, &item.label, label_box, label_h);
+            }
             for (i, item) in self.items.iter().enumerate() {
                 let (lx, ly) = if item.selected { lift } else { (0.0, 0.0) };
                 let alpha = if (lx, ly) == (0.0, 0.0) { 1.0 } else { 0.72 };
                 let (itx, ity) = (item.x + lx, item.y + ly);
                 let cell = rect(itx, ity, itx + cw, ity + ch);
+                let hovered = self.hover == Some(i);
                 if item.selected {
-                    fill_round(r, cell, 6.0, theme::with_alpha(theme::accent(), 0.22));
-                    if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.7)) {
-                        r.dc.DrawRoundedRectangle(
-                            &D2D1_ROUNDED_RECT { rect: cell, radiusX: 6.0, radiusY: 6.0 },
-                            &b,
-                            1.0,
-                            None,
-                        );
-                    }
-                } else if self.hover == Some(i) {
-                    fill_round(r, cell, 6.0, theme::rgba(255, 255, 255, 0.10));
+                    fill_round(r, cell, CARD_RADIUS, theme::with_alpha(CARD_BG, CARD_BG.a * alpha));
+                    // Inset by the corner radius so the line ends where the
+                    // curve starts instead of overhanging it.
+                    fill_round(
+                        r,
+                        rect(
+                            cell.left + CARD_RADIUS,
+                            cell.top,
+                            cell.right - CARD_RADIUS,
+                            cell.top + hair,
+                        ),
+                        0.0,
+                        theme::with_alpha(theme::accent(), alpha),
+                    );
+                } else if hovered {
+                    fill_round(r, cell, CARD_RADIUS, theme::HOVER_FILL);
                 }
 
                 let ix = itx + (cw - icon) / 2.0;
@@ -942,35 +1022,52 @@ impl Desktop {
                     );
                 }
 
-                // Label: a single drop shadow only darkens one side, and a
-                // bright busy wallpaper eats white text on the other three.
-                // Ring the glyphs instead — eight offsets at low alpha build a
-                // halo that reads as a soft shadow but works against any
-                // background, without a scrim box behind every icon.
-                let lr = rect(itx + 2.0, iy + icon + 4.0, itx + cw - 2.0, ity + ch - 2.0);
-                const HALO: [(f32, f32); 8] = [
-                    (-1.0, -1.0), (0.0, -1.0), (1.0, -1.0),
-                    (-1.0, 0.0), (1.0, 0.0),
-                    (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0),
-                ];
-                for (dx, dy) in HALO {
-                    let o = rect(lr.left + dx, lr.top + dy, lr.right + dx, lr.bottom + dy);
-                    self.label(&item.label, o, theme::rgba(0, 0, 0, 0.34 * alpha));
+                // Label: a chip, not a halo. Ringing the glyphs in black is how
+                // explorer survives a bright wallpaper; a slab does it in one
+                // draw, holds any accent behind selected text, and belongs to
+                // the same family as the bar and the menus.
+                let Some(t) = &item.text else { continue };
+                let chip_w = (t.w + 2.0 * CHIP_PAD_X).min(cw - 4.0);
+                let chip_x = itx + (cw - chip_w) / 2.0;
+                let chip_y = iy + icon + LABEL_GAP;
+                let chip_h = t.h + 2.0 * CHIP_PAD_Y;
+                let chip = rect(chip_x, chip_y, chip_x + chip_w, chip_y + chip_h);
+                let (fill, ink) = if item.selected {
+                    (theme::with_alpha(theme::accent(), 0.92), CHIP_INK_SELECTED)
+                } else if hovered {
+                    (CHIP_BG_HOVER, theme::TEXT)
+                } else {
+                    (CHIP_BG, theme::TEXT)
+                };
+                fill_round(
+                    r,
+                    chip,
+                    CHIP_RADIUS.min(chip_h / 2.0),
+                    theme::with_alpha(fill, fill.a * alpha),
+                );
+                if let Ok(b) = r.brush(theme::with_alpha(ink, alpha)) {
+                    r.dc.DrawTextLayout(
+                        Vector2 {
+                            X: itx + (cw - t.max_w) / 2.0,
+                            Y: chip_y + CHIP_PAD_Y,
+                        },
+                        &t.layout,
+                        &b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    );
                 }
-                // Weight under the text so it sits on the wallpaper rather than
-                // floating in a uniform outline.
-                let drop = rect(lr.left, lr.top + 2.0, lr.right, lr.bottom + 2.0);
-                self.label(&item.label, drop, theme::rgba(0, 0, 0, 0.35 * alpha));
-                self.label(&item.label, lr, theme::rgba(244, 246, 250, alpha));
             }
 
             if let Some(m) = &self.marquee {
                 let sel = rect(m.x0.min(m.x1), m.y0.min(m.y1), m.x0.max(m.x1), m.y0.max(m.y1));
-                if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.12)) {
-                    r.dc.FillRectangle(&sel, &b);
-                }
-                if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.6)) {
-                    r.dc.DrawRectangle(&sel, &b, 1.0, None);
+                fill_round(r, sel, 4.0, theme::with_alpha(theme::accent(), 0.14));
+                if let Ok(b) = r.brush(theme::with_alpha(theme::accent(), 0.65)) {
+                    r.dc.DrawRoundedRectangle(
+                        &D2D1_ROUNDED_RECT { rect: sel, radiusX: 4.0, radiusY: 4.0 },
+                        &b,
+                        hair,
+                        None,
+                    );
                 }
             }
 
@@ -979,21 +1076,6 @@ impl Desktop {
             }
             if let Err(e) = r.present() {
                 eprintln!("desktop present: {e}");
-            }
-        }
-    }
-
-    fn label(&self, text: &[u16], r: D2D_RECT_F, c: D2D1_COLOR_F) {
-        unsafe {
-            if let Ok(b) = self.renderer.brush(c) {
-                self.renderer.dc.DrawText(
-                    text,
-                    &self.fmt_label,
-                    &r,
-                    &b,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
             }
         }
     }
