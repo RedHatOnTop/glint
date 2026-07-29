@@ -10,6 +10,54 @@ build is not evidence that anything rendered).
 
 ---
 
+## 2026-07-29
+
+The desktop worked and still looked bought-in: bar and action centre are
+floating rounded panels, and a right-click brought up the grey win32 box
+`TrackPopupMenuEx` draws. **The context menu is ours now** (`menupopup.rs`).
+
+- The shell still builds a real `HMENU` — `IContextMenu::QueryContextMenu` has
+  nowhere else to put its items, and an extension fills its submenu into one —
+  but nothing ever shows it. Each level is read back with `GetMenuItemInfoW`
+  and painted into a composition window of ours: `WS_EX_NOREDIRECTIONBITMAP`,
+  `DWMSBT_TRANSIENTWINDOW`, `DWMWCP_ROUND`, a 0.92-alpha body so the acrylic
+  reads through, the accent hairline the overflow panel wears, rounded hover
+  rows with an accent pill at the leading edge, and the same rise-and-fade the
+  other panels open with.
+- A menu loop sends `WM_INITMENUPOPUP` so a shell extension can fill a lazy
+  submenu on the way open — 새로 만들기 is empty without it. We have no loop, so
+  `shellmenu::init_popup` hands it to the `IContextMenu2/3` by hand just before
+  each level is read.
+- Levels are their own windows, the root takes capture and focus, and the
+  wndproc never creates or destroys a window: it sets `want` / `close_to` and
+  the loop applies them after `DispatchMessageW`. Submenus open on an 180ms
+  dwell, and only a *change* of row re-arms it.
+- `hbmpItem` doubles as an enum — the `HBMMENU_*` marks are tiny integers cast
+  to a handle, and asking GDI about one is a crash. Menu bitmaps also arrive
+  premultiplied from the shell and straight from older extensions, so the
+  pixels get inspected rather than multiplied twice.
+- Given up with the menu loop: owner-drawn items. An extension that paints its
+  own rows hands out no string, and is skipped rather than drawn as a blank.
+
+Verified in the lab, on the shipping build: background menu and item menu both
+render in the panel; 보기 opens on hover with a teal radio bullet and a check
+glyph; 새로 만들기 populates with real per-type icons (which is the hand-sent
+`WM_INITMENUPOPUP` working); Down/Down/Right/Enter navigates and picks
+(`desktop-view.txt` → `sort=name`); a *mouse* click on 바로 가기 만들기 in
+drag-me.txt's menu invoked the shell verb and `drag-me - 바로 가기` appeared on
+the desktop; a click on bare desktop dismisses, Esc dismisses; the rounded
+corner and the hairline sampled (41,81,82) against a (24,32,33) body.
+
+Not a regression, established by A/B: New ▸ 텍스트 문서 and New ▸ 폴더 populate
+and paint but create nothing. Stashing this slice and running the previous
+`TrackPopupMenuEx` binary in the same lab behaves identically — `NewMenu` wants
+a shell-view site we do not give it. 액세스 권한 부여 ▸ is empty in both, too.
+
+Rig note: `GUEST-MOUSE.ps1` injects into *whatever session runs it*. It must be
+typed into the guest console (`powershell -ep bypass -f C:\glint\GUEST-MOUSE.ps1
+…`); running it from the host clicks the host, and four "the menu will not
+dismiss" rounds were nothing but clicks that never reached the VM.
+
 ## 2026-07-27 (evening)
 
 Desktop gap 1 of 4: **the desktop had no namespace items.** It enumerated two

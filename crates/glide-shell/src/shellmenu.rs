@@ -13,17 +13,15 @@ use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, DefSubclassProc, GCS_VERBW, IContextMenu,
-    IContextMenu2, IContextMenu3, IShellFolder, RemoveWindowSubclass, SHBindToParent,
-    SHGetDesktopFolder, SHParseDisplayName, SetWindowSubclass,
+    CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, GCS_VERBW, IContextMenu, IContextMenu2,
+    IContextMenu3, IShellFolder, SHBindToParent, SHGetDesktopFolder, SHParseDisplayName,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetCursorPos, GetMenuItemCount,
     GetMenuItemID, GetMenuItemInfoW, HMENU, InsertMenuItemW, MENU_ITEM_STATE, MENU_ITEM_TYPE,
     MENUITEMINFOW, MF_BYPOSITION, MF_SEPARATOR, MFS_CHECKED, MFS_GRAYED, MFT_RADIOCHECK,
     MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, PostMessageW,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP,
-    WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
+    WM_INITMENUPOPUP, WM_NULL,
 };
 use windows::core::{Interface, PCSTR, PCWSTR, PSTR, PWSTR, w};
 
@@ -109,39 +107,31 @@ pub fn enable_dark_menus() {
     }
 }
 
-unsafe extern "system" fn menu_subclass_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    if matches!(
-        msg,
-        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
-    ) {
-        let handled = MENU_FWD.with(|f| {
-            let f = f.borrow();
-            let (cm2, cm3) = f.as_ref()?;
+/// A menu loop sends WM_INITMENUPOPUP so a shell extension can fill its
+/// submenu on the way open — 새로 만들기 is empty without it. We draw the menu
+/// ourselves and have no loop, so menupopup calls this instead, just before it
+/// reads a level's items.
+fn init_popup(hmenu: HMENU, pos: u32) {
+    MENU_FWD.with(|f| {
+        let f = f.borrow();
+        let Some((cm2, cm3)) = f.as_ref() else { return };
+        let wparam = WPARAM(hmenu.0 as usize);
+        let lparam = LPARAM(pos as isize);
+        unsafe {
             if let Some(cm3) = cm3 {
                 let mut lres = LRESULT(0);
-                if unsafe { cm3.HandleMenuMsg2(msg, wparam, lparam, Some(&mut lres)) }.is_ok() {
-                    return Some(lres);
+                if cm3
+                    .HandleMenuMsg2(WM_INITMENUPOPUP, wparam, lparam, Some(&mut lres))
+                    .is_ok()
+                {
+                    return;
                 }
             }
             if let Some(cm2) = cm2 {
-                if unsafe { cm2.HandleMenuMsg(msg, wparam, lparam) }.is_ok() {
-                    return Some(LRESULT(0));
-                }
+                let _ = cm2.HandleMenuMsg(WM_INITMENUPOPUP, wparam, lparam);
             }
-            None
-        });
-        if let Some(lres) = handled {
-            return lres;
         }
-    }
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    });
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -337,25 +327,13 @@ unsafe fn run(
         filter_verbs(hmenu, &cm, verb_filter);
 
         MENU_FWD.with(|f| *f.borrow_mut() = Some((cm.cast().ok(), cm.cast().ok())));
-        let _ = SetWindowSubclass(hwnd, Some(menu_subclass_proc), 0x51DE, 0);
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
-        let picked = TrackPopupMenuEx(
-            hmenu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
-            pt.x,
-            pt.y,
-            hwnd,
-            None,
-        );
-        // NOACTIVATE window hosting a menu: the classic tray-menu epilogue so
-        // the menu loop fully unwinds.
+        let cmd = crate::menupopup::track(hwnd, hmenu, pt.x, pt.y, init_popup);
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = RemoveWindowSubclass(hwnd, Some(menu_subclass_proc), 0x51DE);
         MENU_FWD.with(|f| *f.borrow_mut() = None);
         let _ = DestroyMenu(hmenu);
 
-        let cmd = picked.0 as u32;
         if cmd == 0 {
             MenuOutcome::Dismissed
         } else if cmd < ID_SHELL_FIRST {

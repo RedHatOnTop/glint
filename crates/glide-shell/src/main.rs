@@ -14,6 +14,7 @@ mod datetime;
 mod desktop;
 mod flyout;
 mod icons;
+mod menupopup;
 mod osd;
 mod power;
 mod preview;

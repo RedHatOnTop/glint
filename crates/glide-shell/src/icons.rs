@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, GetDIBits, GetObjectW,
+    DeleteObject, GetDIBits, GetObjectW, HBITMAP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GCLP_HICON, GCLP_HICONSM, GetClassLongPtrW, GetIconInfo, HICON, ICON_BIG, ICON_SMALL,
@@ -83,6 +83,20 @@ fn query_hicon(hwnd: HWND) -> Option<HICON> {
     }
 }
 
+/// Menu item image (MIIM_BITMAP hbmpItem), for the own-drawn context menu.
+/// The caller owns the bitmap — the shell keeps it for the menu's lifetime —
+/// so nothing is freed here.
+pub fn hbitmap_bitmap(dc: &ID2D1DeviceContext, hbm: HBITMAP) -> Option<ID2D1Bitmap1> {
+    let (w, h, mut pixels) = dib_pixels(hbm)?;
+    opaque_if_alphaless(&mut pixels);
+    // Shell menu bitmaps arrive premultiplied, old extensions' do not.
+    // Multiplying twice darkens every edge, so the pixels get asked.
+    if pixels.chunks_exact(4).any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) {
+        premultiply(&mut pixels);
+    }
+    make_bitmap(dc, w, h, &pixels)
+}
+
 fn hicon_to_bitmap(dc: &ID2D1DeviceContext, hicon: HICON) -> Option<ID2D1Bitmap1> {
     unsafe {
         let mut info = ICONINFO::default();
@@ -94,78 +108,11 @@ fn hicon_to_bitmap(dc: &ID2D1DeviceContext, hicon: HICON) -> Option<ID2D1Bitmap1
             if color.is_invalid() {
                 return None; // monochrome/mask-only icon — not worth rendering
             }
-            let mut bm = BITMAP::default();
-            if GetObjectW(
-                color.into(),
-                std::mem::size_of::<BITMAP>() as i32,
-                Some(&mut bm as *mut _ as *mut _),
-            ) == 0
-            {
-                return None;
-            }
-            let (w, h) = (bm.bmWidth, bm.bmHeight);
-            if w <= 0 || h <= 0 || w > 512 || h > 512 {
-                return None;
-            }
-            let hdc = CreateCompatibleDC(None);
-            let mut bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h, // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            let got = GetDIBits(
-                hdc,
-                color,
-                0,
-                h as u32,
-                Some(pixels.as_mut_ptr() as *mut _),
-                &mut bi,
-                DIB_RGB_COLORS,
-            );
-            let _ = DeleteDC(hdc);
-            if got == 0 {
-                return None;
-            }
-            // Legacy icons carry no alpha channel; treat them as opaque.
-            if pixels.chunks_exact(4).all(|p| p[3] == 0) {
-                for p in pixels.chunks_exact_mut(4) {
-                    p[3] = 255;
-                }
-            }
-            for p in pixels.chunks_exact_mut(4) {
-                let a = p[3] as u32;
-                p[0] = ((p[0] as u32 * a) / 255) as u8;
-                p[1] = ((p[1] as u32 * a) / 255) as u8;
-                p[2] = ((p[2] as u32 * a) / 255) as u8;
-            }
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-                ..Default::default()
-            };
-            dc.CreateBitmap(
-                windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
-                    width: w as u32,
-                    height: h as u32,
-                },
-                Some(pixels.as_ptr() as *const _),
-                (w * 4) as u32,
-                &props,
-            )
-            .ok()
+            let (w, h, mut pixels) = dib_pixels(color)?;
+            opaque_if_alphaless(&mut pixels);
+            // An icon's colour bitmap is straight alpha, always.
+            premultiply(&mut pixels);
+            make_bitmap(dc, w, h, &pixels)
         })();
         if !color.is_invalid() {
             let _ = DeleteObject(color.into());
@@ -174,5 +121,92 @@ fn hicon_to_bitmap(dc: &ID2D1DeviceContext, hicon: HICON) -> Option<ID2D1Bitmap1
             let _ = DeleteObject(mask.into());
         }
         result
+    }
+}
+
+/// A GDI bitmap's pixels as top-down BGRA.
+fn dib_pixels(hbm: HBITMAP) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let mut bm = BITMAP::default();
+        if GetObjectW(
+            hbm.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut _ as *mut _),
+        ) == 0
+        {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if w <= 0 || h <= 0 || w > 512 || h > 512 {
+            return None;
+        }
+        let hdc = CreateCompatibleDC(None);
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let got = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            h as u32,
+            Some(pixels.as_mut_ptr() as *mut _),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteDC(hdc);
+        if got == 0 { None } else { Some((w, h, pixels)) }
+    }
+}
+
+/// Legacy 24-bit sources carry no alpha channel; treat them as opaque.
+fn opaque_if_alphaless(pixels: &mut [u8]) {
+    if pixels.chunks_exact(4).all(|p| p[3] == 0) {
+        for p in pixels.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+    }
+}
+
+fn premultiply(pixels: &mut [u8]) {
+    for p in pixels.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        p[0] = ((p[0] as u32 * a) / 255) as u8;
+        p[1] = ((p[1] as u32 * a) / 255) as u8;
+        p[2] = ((p[2] as u32 * a) / 255) as u8;
+    }
+}
+
+fn make_bitmap(dc: &ID2D1DeviceContext, w: i32, h: i32, pixels: &[u8]) -> Option<ID2D1Bitmap1> {
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        ..Default::default()
+    };
+    unsafe {
+        dc.CreateBitmap(
+            windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                width: w as u32,
+                height: h as u32,
+            },
+            Some(pixels.as_ptr() as *const _),
+            (w * 4) as u32,
+            &props,
+        )
+        .ok()
     }
 }
