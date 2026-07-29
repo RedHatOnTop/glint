@@ -22,6 +22,7 @@ mod preview;
 mod procs;
 mod quicksettings;
 mod render;
+mod rundlg;
 mod safety;
 mod secondary;
 mod services;

@@ -1657,9 +1657,10 @@ unsafe extern "system" fn rename_proc(
     }
 }
 
-/// One shared UI font for the rename box, made on first use and kept — it
-/// outlives every rename and there is only ever one desktop.
-fn ui_font(scale: f32) -> HFONT {
+/// One shared UI font for the shell's stock child controls — the rename box
+/// here and the run box's edit — made on first use and kept, because it
+/// outlives all of them.
+pub fn ui_font(scale: f32) -> HFONT {
     use std::sync::OnceLock;
     static FONT: OnceLock<isize> = OnceLock::new();
     HFONT(*FONT.get_or_init(|| unsafe {

@@ -10,6 +10,59 @@ build is not evidence that anything rendered).
 
 ---
 
+## 2026-07-30
+
+**The run box is ours** (`rundlg.rs`). Win+R had been shelling out to
+`rundll32 shell32.dll,#61` since yesterday, which works and looks like it:
+shell32's dialog in shell32's style, with "RunDLL" for a description. It is
+now a floating rounded panel in the same language as the bar, the action
+centre and the menus — accent badge, 확인/취소, a hint that Ctrl+Shift+Enter
+runs as administrator — and it opens on the bar's own thread without blocking
+it, which is the reason the stock one could not be called in-process at all.
+
+- History is explorer's `RunMRU`, read and written in explorer's format
+  (values `a`..`z`, each terminated by `\1`, ordered by `MRUList`), so a
+  machine that switches shells keeps one list instead of two. Up and down walk
+  it; past the newest is the blank line the box opened with.
+- The line is split the way the stock box splits it — first token is the thing
+  to run, the rest are arguments — except when the whole line is a path that
+  exists, which is the case quoting was invented for. `ShellExecuteW` over 32
+  is the only success signal it gives; under it the box stays up and says so
+  in red rather than vanishing.
+- The text field is a real `EDIT`, for the IME and the whole editing
+  vocabulary, the same trade the desktop's rename box made.
+
+Two things about that `EDIT` were wrong the first time and the lab showed both:
+
+- **As a child window it never drew.** `WS_EX_NOREDIRECTIONBITMAP` is what
+  gives the panel its composition surface, and it leaves nothing for a child
+  window to paint into — the field was simply absent, caret and all. It is an
+  owned `WS_POPUP` now, positioned in screen coordinates over the panel, which
+  is what `desktop.rs` had already settled on for the rename box.
+- **Which moves the focus off the panel**, so the panel carries
+  `WS_EX_NOACTIVATE` and never takes activation at all: a click on 확인 must
+  not pull the focus out of the edit before the click is handled. Click-away
+  is therefore the edit's own `WM_KILLFOCUS`, posted to the owner.
+
+Verified in the lab, by the thing it does: Win+R draws the panel with the
+field and a caret in it (`r05`), typing lands in the field (`r06`), Enter
+launches 메모장 and the box goes away with a task button left on the bar
+(`r07`), a second Win+R and up recalls `notepad` from `RunMRU` with the caret
+at the end (`r08`), a line that resolves to nothing turns the description red
+and leaves the box standing (`r09`), Esc closes it and hands the focus back
+(`r10`), and Alt+Tab away closes it too (`r11`). `crash.log` absent after all
+of it.
+
+Rig note, the fifth: `MANAGE-LAB-VM.ps1 -Action push` names the guest file
+after the *source* basename, so pushing `target/debug/glide-shell.exe`
+directly aims at the running shell and fails with `0x80070020` — copy it to
+`glide-shell.new.exe` first, which is what `swap.cmd` expects anyway. And the
+guest keyboard's chord verb does not deliver Ctrl+A to an `EDIT`: `PressKey 17`
+does not put user32's keyboard state where the control reads it, though the
+same chord reaches our own low-level hook fine, because that one reads the VK
+and `GetAsyncKeyState` itself. Select-all in the guest has to be done another
+way.
+
 ## 2026-07-29
 
 The desktop worked and still looked bought-in: bar and action centre are

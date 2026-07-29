@@ -203,10 +203,11 @@ pub fn open_file_manager() {
     }
 }
 
-/// Win+R. shell32's own run dialog, by ordinal, in a process of its own — it
-/// is modal, and hosting it here would freeze the bar for as long as it is up.
+/// Win+R. Ours, on the bar's own thread — shell32's `RunFileDlg` is modal and
+/// would freeze the bar, and reaching it through rundll32 named the window
+/// "RunDLL".
 pub fn run_dialog() {
-    launch("rundll32.exe", Some("shell32.dll,#61"));
+    crate::rundlg::open();
 }
 
 fn launch(exe: &str, args: Option<&str>) {
