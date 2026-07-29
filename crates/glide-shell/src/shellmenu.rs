@@ -30,8 +30,15 @@ pub enum MenuOutcome {
     Custom(u32),
     /// A shell verb ran — caller should refresh the listing.
     Invoked,
+    /// 이름 바꾸기 was picked. The shell puts the item in the right place when
+    /// asked with CMF_CANRENAME, but invoking it wants a shell view site we do
+    /// not have, so it comes back here for our own inline rename instead.
+    Rename,
     Dismissed,
 }
+
+/// CMF_CANRENAME. Only an item menu asks for it.
+const CMF_CANRENAME: u32 = 0x0000_0010;
 
 /// Caller-supplied menu entry, prepended above the shell's own items. An empty
 /// label is a separator; children make it a submenu and its id goes unused.
@@ -200,6 +207,23 @@ unsafe fn background_menu(dir: &Path) -> windows::core::Result<IContextMenu> {
     }
 }
 
+/// Canonical verb of one shell entry, by its offset from `ID_SHELL_FIRST`.
+unsafe fn verb_of(cm: &IContextMenu, offset: u32) -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 128];
+        cm.GetCommandString(
+            offset as usize,
+            GCS_VERBW,
+            None,
+            PSTR(buf.as_mut_ptr() as *mut u8),
+            buf.len() as u32,
+        )
+        .ok()?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        Some(String::from_utf16_lossy(&buf[..len]).to_lowercase())
+    }
+}
+
 /// Delete shell entries whose canonical verb duplicates one of ours, then
 /// collapse the separator runs the deletions leave behind.
 unsafe fn filter_verbs(
@@ -208,37 +232,30 @@ unsafe fn filter_verbs(
     kill: &[&str],
 ) {
     unsafe {
-        let count = GetMenuItemCount(Some(hmenu));
-        for i in (0..count).rev() {
-            // Not GetMenuItemID: it answers -1 for an item that owns a
-            // submenu, which is exactly what 새로 만들기 and 액세스 권한 부여
-            // are, so they slipped through every filter until now.
-            let mut mii = MENUITEMINFOW {
-                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_ID,
-                ..Default::default()
-            };
-            if GetMenuItemInfoW(hmenu, i as u32, true, &mut mii).is_err() {
-                continue;
-            }
-            let id = mii.wID;
-            if id < ID_SHELL_FIRST {
-                continue;
-            }
-            let mut buf = [0u16; 128];
-            if cm
-                .GetCommandString(
-                    (id - ID_SHELL_FIRST) as usize,
-                    GCS_VERBW,
-                    None,
-                    PSTR(buf.as_mut_ptr() as *mut u8),
-                    buf.len() as u32,
-                )
-                .is_ok()
-            {
-                let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-                let verb = String::from_utf16_lossy(&buf[..len]).to_lowercase();
-                if kill.contains(&verb.as_str()) {
+        // An item menu passes no filter, and asking a shell extension for the
+        // verb of every row it just built — rows that own submenus included —
+        // is a question it does not have to survive. It did not: the item menu
+        // took the whole shell down with it, silently, no panic and no log.
+        if !kill.is_empty() {
+            for i in (0..GetMenuItemCount(Some(hmenu))).rev() {
+                // Not GetMenuItemID: it answers -1 for an item that owns a
+                // submenu, which is exactly what 새로 만들기 and 액세스 권한
+                // 부여 are, so they slipped through every filter until now.
+                let mut mii = MENUITEMINFOW {
+                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_ID,
+                    ..Default::default()
+                };
+                if GetMenuItemInfoW(hmenu, i as u32, true, &mut mii).is_err() {
+                    continue;
+                }
+                let id = mii.wID;
+                if id < ID_SHELL_FIRST {
+                    continue;
+                }
+                if let Some(verb) = verb_of(cm, id - ID_SHELL_FIRST)
+                    && kill.contains(&verb.as_str())
+                {
                     let _ = DeleteMenu(hmenu, i as u32, MF_BYPOSITION);
                 }
             }
@@ -315,11 +332,15 @@ unsafe fn append_custom(hmenu: HMENU, items: &[CustomItem]) {
     }
 }
 
+/// `at` is where the menu opens, in screen px — the cursor when a click raised
+/// it, and the focused item when the keyboard did.
 unsafe fn run(
     hwnd: HWND,
     cm: IContextMenu,
     custom: &[CustomItem],
     verb_filter: &[&str],
+    at: Option<(i32, i32)>,
+    flags: u32,
 ) -> MenuOutcome {
     unsafe {
         let Ok(hmenu) = CreatePopupMenu() else {
@@ -331,7 +352,7 @@ unsafe fn run(
         }
         let insert_at = GetMenuItemCount(Some(hmenu)) as u32;
         if cm
-            .QueryContextMenu(hmenu, insert_at, ID_SHELL_FIRST, ID_SHELL_LAST, 0)
+            .QueryContextMenu(hmenu, insert_at, ID_SHELL_FIRST, ID_SHELL_LAST, flags)
             .is_err()
         {
             let _ = DestroyMenu(hmenu);
@@ -340,9 +361,12 @@ unsafe fn run(
         filter_verbs(hmenu, &cm, verb_filter);
 
         MENU_FWD.with(|f| *f.borrow_mut() = Some((cm.cast().ok(), cm.cast().ok())));
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let cmd = crate::menupopup::track(hwnd, hmenu, pt.x, pt.y, init_popup);
+        let (x, y) = at.unwrap_or_else(|| {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            (pt.x, pt.y)
+        });
+        let cmd = crate::menupopup::track(hwnd, hmenu, x, y, init_popup);
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         MENU_FWD.with(|f| *f.borrow_mut() = None);
         let _ = DestroyMenu(hmenu);
@@ -353,6 +377,11 @@ unsafe fn run(
             MenuOutcome::Custom(cmd)
         } else {
             let offset = cmd - ID_SHELL_FIRST;
+            // One verb, for the row already picked, with the menu down: the
+            // question that killed the shell when it was asked of every row.
+            if flags & CMF_CANRENAME != 0 && verb_of(&cm, offset).as_deref() == Some("rename") {
+                return MenuOutcome::Rename;
+            }
             let info = CMINVOKECOMMANDINFOEX {
                 cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
                 fMask: 0x0000_4000, // CMIC_MASK_UNICODE
@@ -370,19 +399,24 @@ unsafe fn run(
 
 /// Full shell menu for `paths` — shell parsing names sharing one parent. COM
 /// is already up on the taskbar thread.
-pub fn show_item_menu(hwnd: HWND, paths: &[String]) -> MenuOutcome {
+pub fn show_item_menu(hwnd: HWND, paths: &[String], at: Option<(i32, i32)>) -> MenuOutcome {
     unsafe {
         match item_menu(paths) {
-            Ok(cm) => run(hwnd, cm, &[], &[]),
+            Ok(cm) => run(hwnd, cm, &[], &[], at, CMF_CANRENAME),
             Err(_) => MenuOutcome::Dismissed,
         }
     }
 }
 
-pub fn show_background_menu(hwnd: HWND, dir: &Path, custom: &[CustomItem]) -> MenuOutcome {
+pub fn show_background_menu(
+    hwnd: HWND,
+    dir: &Path,
+    custom: &[CustomItem],
+    at: Option<(i32, i32)>,
+) -> MenuOutcome {
     unsafe {
         match background_menu(dir) {
-            Ok(cm) => run(hwnd, cm, custom, BG_VERB_FILTER),
+            Ok(cm) => run(hwnd, cm, custom, BG_VERB_FILTER, at, 0),
             Err(_) => MenuOutcome::Dismissed,
         }
     }

@@ -56,8 +56,8 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_F5, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_UP,
+    VIRTUAL_KEY, VK_APPS, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F2, VK_F5, VK_F10, VK_LEFT,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
@@ -455,6 +455,11 @@ pub struct Desktop {
     /// pending, since the clipboard itself says nothing on screen.
     cut: Vec<String>,
     rename: Option<Rename>,
+    /// Put the selection here the next time the view is rebuilt. A rename is
+    /// refreshed by the shell notification it raises, which arrives after the
+    /// name has changed under the selection — so the item to select is named
+    /// before the refresh and found after it.
+    select_next: Option<PathBuf>,
     view: View,
     w: f32,
     h: f32,
@@ -565,6 +570,7 @@ unsafe fn create(s: &Screen) -> anyhow::Result<()> {
             typed_at: std::time::Instant::now(),
             cut: Vec::new(),
             rename: None,
+            select_next: None,
             view: View::load(),
             w: sw as f32 / scale,
             h: sh as f32 / scale,
@@ -963,6 +969,17 @@ impl Desktop {
         (col, row)
     }
 
+    /// Where a keyboard-raised menu points: inside the focused item's cell, so
+    /// the menu comes up as an item menu and lands beside the icon it is about.
+    /// With nothing focused it is the empty grid above the first cell, which is
+    /// the background menu.
+    fn menu_anchor(&self) -> (f32, f32) {
+        match self.items.get(self.cursor).filter(|it| it.selected) {
+            Some(it) => (it.x + self.cell_w() * 0.5, it.y + self.cell_h() * 0.75),
+            None => (self.origin_x, self.origin_y - CELL_GAP),
+        }
+    }
+
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
         let (cw, ch) = (self.cell_w(), self.cell_h());
         self.items.iter().position(|i| x >= i.x && x < i.x + cw && y >= i.y && y < i.y + ch)
@@ -1180,16 +1197,12 @@ impl Desktop {
         let Some(t) = crate::newmenu::types().get(idx) else { return };
         let Some(dir) = desktop_dir() else { return };
         let Some(path) = crate::newmenu::create(&dir, t) else { return };
+        self.select_next = Some(path);
         self.refresh_all();
-        let Some(i) = self.items.iter().position(|it| it.path.as_deref() == Some(&*path)) else {
-            return;
-        };
-        for (j, it) in self.items.iter_mut().enumerate() {
-            it.selected = j == i;
+        let idx = self.cursor;
+        if self.items.get(idx).is_some_and(|it| it.selected) {
+            self.begin_rename(hwnd, idx);
         }
-        self.cursor = i;
-        self.anchor = i;
-        self.begin_rename(hwnd, i);
     }
 
     /// A view option changed: the icons have to be extracted again at the new
@@ -1226,7 +1239,21 @@ impl Desktop {
         self.items_sig.0.clear();
         self.load_items();
         self.load_wallpaper();
+        if let Some(path) = self.select_next.take()
+            && let Some(i) = self.items.iter().position(|it| it.path.as_deref() == Some(&*path))
+        {
+            self.select_only(i);
+        }
         self.paint();
+    }
+
+    /// The selection is this one item, and the keyboard starts from it.
+    fn select_only(&mut self, idx: usize) {
+        for (j, it) in self.items.iter_mut().enumerate() {
+            it.selected = j == idx;
+        }
+        self.cursor = idx;
+        self.anchor = idx;
     }
 
     /// Grid navigation over the cells themselves, not the item order — after
@@ -1579,10 +1606,12 @@ impl Desktop {
             return;
         }
         let target = path.with_file_name(&typed);
-        if let Err(e) = std::fs::rename(&path, &target) {
-            crate::safety::note(&format!("desktop: rename to {typed} failed: {e}"));
+        match std::fs::rename(&path, &target) {
+            // The rename raises a shell notification; the refresh rides on
+            // that, and takes the selection with it.
+            Ok(()) => self.select_next = Some(target),
+            Err(e) => crate::safety::note(&format!("desktop: rename to {typed} failed: {e}")),
         }
-        // The rename raises a shell notification; the refresh rides on that.
     }
 
     fn marquee_apply(&mut self) {
@@ -2110,6 +2139,103 @@ fn shell_image(renderer: &Renderer, parsing: &str, px: i32) -> Option<ID2D1Bitma
     }
 }
 
+/// The right-click menu, at a point in logical px. Also what the context key
+/// and Shift+F10 raise, which is why it is not inlined in `WM_RBUTTONUP`.
+///
+/// A click leaves `at` as None so the menu opens on the cursor, which is where
+/// the user is looking. From the keyboard the cursor is wherever it was last
+/// left — possibly another monitor — so the anchor is passed through instead.
+///
+/// `desk` is dead the moment the menu opens — the menu pumps this wndproc
+/// reentrantly — so it is re-acquired afterwards, and the caller must not hold
+/// a borrow across the call either.
+unsafe fn context_menu(hwnd: HWND, desk: &mut Desktop, x: f32, y: f32, from_key: bool) {
+    unsafe {
+        let hit = desk.hit(x, y);
+        let at = from_key.then(|| {
+            (
+                desk.mon.left + (x * desk.scale) as i32,
+                desk.mon.top + (y * desk.scale) as i32,
+            )
+        });
+        let paths: Vec<String> = match hit {
+            Some(i) => {
+                // Whole selection, but only siblings of the clicked item — one
+                // IShellFolder serves the menu.
+                let group = desk.items[i].menu_group();
+                let mut sel: Vec<String> = desk
+                    .items
+                    .iter()
+                    .filter(|it| it.selected && it.menu_group() == group)
+                    .map(|it| it.parsing.clone())
+                    .collect();
+                if sel.is_empty() {
+                    sel.push(desk.items[i].parsing.clone());
+                }
+                sel
+            }
+            None => Vec::new(),
+        };
+        // Menus on a NOACTIVATE window only dismiss properly with foreground;
+        // the user's click grants us the SFW right.
+        let _ = SetForegroundWindow(hwnd);
+        let outcome = if hit.is_some() {
+            crate::shellmenu::show_item_menu(hwnd, &paths, at)
+        } else {
+            let custom = desk.bg_menu();
+            match std::env::var("USERPROFILE") {
+                Ok(p) => crate::shellmenu::show_background_menu(
+                    hwnd,
+                    &PathBuf::from(p).join("Desktop"),
+                    &custom,
+                    at,
+                ),
+                Err(_) => return,
+            }
+        };
+        let desk = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop);
+        use crate::shellmenu::MenuOutcome;
+        match outcome {
+            MenuOutcome::Invoked | MenuOutcome::Custom(ID_REFRESH) => desk.refresh_all(),
+            MenuOutcome::Rename => {
+                if let Some(i) = hit {
+                    desk.select_only(i);
+                    desk.begin_rename(hwnd, i);
+                }
+            }
+            MenuOutcome::Custom(ID_GLIDE) => open_glide(),
+            MenuOutcome::Custom(ID_PASTE) => desk.clipboard_paste(),
+            MenuOutcome::Custom(id) if id >= ID_NEW_FIRST => {
+                desk.create_new(hwnd, (id - ID_NEW_FIRST) as usize)
+            }
+            MenuOutcome::Custom(ID_DISPLAY) => open_uri("ms-settings:display"),
+            MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
+            MenuOutcome::Custom(ID_AUTO_ARRANGE) => {
+                desk.view.auto_arrange = !desk.view.auto_arrange;
+                let repack = desk.view.auto_arrange;
+                desk.apply_view(repack);
+            }
+            MenuOutcome::Custom(ID_SHOW_ICONS) => {
+                desk.view.show_icons = !desk.view.show_icons;
+                desk.apply_view(false);
+            }
+            MenuOutcome::Custom(id) => {
+                if let Some((_, _, px)) = ICON_SIZES.iter().find(|(i, _, _)| *i == id) {
+                    desk.view.icon = *px;
+                    // The grid changes shape under them, but the cells an icon
+                    // was dragged to still mean the same thing, so a size
+                    // change is not a rearrangement.
+                    desk.apply_view(false);
+                } else if let Some((_, _, s)) = SORTS.iter().find(|(i, _, _)| *i == id) {
+                    desk.view.sort = *s;
+                    desk.apply_view(true);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 extern "system" fn desktop_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -2305,77 +2431,7 @@ extern "system" fn desktop_wndproc(
             }
             WM_RBUTTONUP => {
                 let (x, y) = (lx(desk), ly(desk));
-                let hit = desk.hit(x, y);
-                let paths: Vec<String> = match hit {
-                    Some(i) => {
-                        // Whole selection, but only siblings of the clicked
-                        // item — one IShellFolder serves the menu.
-                        let group = desk.items[i].menu_group();
-                        let mut sel: Vec<String> = desk
-                            .items
-                            .iter()
-                            .filter(|it| it.selected && it.menu_group() == group)
-                            .map(|it| it.parsing.clone())
-                            .collect();
-                        if sel.is_empty() {
-                            sel.push(desk.items[i].parsing.clone());
-                        }
-                        sel
-                    }
-                    None => Vec::new(),
-                };
-                // Menus on a NOACTIVATE window only dismiss properly with
-                // foreground; the user's click grants us the SFW right.
-                let _ = SetForegroundWindow(hwnd);
-                // TrackPopupMenuEx pumps this wndproc reentrantly — the desk
-                // borrow must not live across it (last use was `paths`).
-                let outcome = if hit.is_some() {
-                    crate::shellmenu::show_item_menu(hwnd, &paths)
-                } else {
-                    let custom = desk.bg_menu();
-                    match std::env::var("USERPROFILE") {
-                        Ok(p) => crate::shellmenu::show_background_menu(
-                            hwnd,
-                            &PathBuf::from(p).join("Desktop"),
-                            &custom,
-                        ),
-                        Err(_) => return LRESULT(0),
-                    }
-                };
-                let desk = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop);
-                use crate::shellmenu::MenuOutcome;
-                match outcome {
-                    MenuOutcome::Invoked | MenuOutcome::Custom(ID_REFRESH) => desk.refresh_all(),
-                    MenuOutcome::Custom(ID_GLIDE) => open_glide(),
-                    MenuOutcome::Custom(ID_PASTE) => desk.clipboard_paste(),
-                    MenuOutcome::Custom(id) if id >= ID_NEW_FIRST => {
-                        desk.create_new(hwnd, (id - ID_NEW_FIRST) as usize)
-                    }
-                    MenuOutcome::Custom(ID_DISPLAY) => open_uri("ms-settings:display"),
-                    MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
-                    MenuOutcome::Custom(ID_AUTO_ARRANGE) => {
-                        desk.view.auto_arrange = !desk.view.auto_arrange;
-                        let repack = desk.view.auto_arrange;
-                        desk.apply_view(repack);
-                    }
-                    MenuOutcome::Custom(ID_SHOW_ICONS) => {
-                        desk.view.show_icons = !desk.view.show_icons;
-                        desk.apply_view(false);
-                    }
-                    MenuOutcome::Custom(id) => {
-                        if let Some((_, _, px)) = ICON_SIZES.iter().find(|(i, _, _)| *i == id) {
-                            desk.view.icon = *px;
-                            // The grid changes shape under them, but the cells
-                            // an icon was dragged to still mean the same thing,
-                            // so a size change is not a rearrangement.
-                            desk.apply_view(false);
-                        } else if let Some((_, _, s)) = SORTS.iter().find(|(i, _, _)| *i == id) {
-                            desk.view.sort = *s;
-                            desk.apply_view(true);
-                        }
-                    }
-                    _ => {}
-                }
+                context_menu(hwnd, desk, x, y, false);
                 LRESULT(0)
             }
             WM_KEYDOWN => {
@@ -2398,6 +2454,13 @@ extern "system" fn desktop_wndproc(
                         return LRESULT(0);
                     }
                     VK_DELETE => desk.delete_selected(hwnd, shift),
+                    // The context key. Explorer anchors its menu on the
+                    // focused item, so `menu_anchor` does.
+                    VK_APPS => {
+                        let (x, y) = desk.menu_anchor();
+                        context_menu(hwnd, desk, x, y, true);
+                        return LRESULT(0);
+                    }
                     VK_ESCAPE => {
                         for it in &mut desk.items {
                             it.selected = false;
@@ -2409,12 +2472,50 @@ extern "system" fn desktop_wndproc(
                     }
                     // There are no VK constants for the letter keys.
                     VIRTUAL_KEY(0x41) if ctrl => desk.select_all(),
+                    // Ctrl+Shift+N. The folder is always the first entry —
+                    // newmenu builds it before it reads a single type.
+                    VIRTUAL_KEY(0x4E) if ctrl && shift => {
+                        desk.create_new(hwnd, 0);
+                        return LRESULT(0);
+                    }
                     VIRTUAL_KEY(0x43) if ctrl => desk.clipboard_put(false),
                     VIRTUAL_KEY(0x58) if ctrl => desk.clipboard_put(true),
                     VIRTUAL_KEY(0x56) if ctrl => desk.clipboard_paste(),
                     _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
                 desk.paint();
+                LRESULT(0)
+            }
+            // Shift+F10, the context key's twin. F10 is a *system* key even
+            // with Shift held, so it never reaches WM_KEYDOWN — and a window
+            // that is not activated never gets the WM_CONTEXTMENU that
+            // DefWindowProc would otherwise synthesize from either one, which
+            // is why both are handled as the keys they are.
+            WM_SYSKEYDOWN
+                if wparam.0 as u16 == VK_F10.0 && GetKeyState(VK_SHIFT.0 as i32) < 0 =>
+            {
+                let (x, y) = desk.menu_anchor();
+                context_menu(hwnd, desk, x, y, true);
+                LRESULT(0)
+            }
+            // Ctrl+wheel steps the icon size, explorer's gesture for it. The
+            // sizes are the same three the 보기 submenu offers, so the menu and
+            // the wheel cannot disagree about what size the icons are.
+            WM_MOUSEWHEEL if GetKeyState(VK_CONTROL.0 as i32) < 0 => {
+                let up = ((wparam.0 >> 16) as i16) > 0;
+                let at = ICON_SIZES.iter().position(|(_, _, px)| *px == desk.view.icon);
+                // ICON_SIZES runs largest first, so a wheel up is a step back
+                // along it — and past either end it stays where it is.
+                let next = match (at, up) {
+                    (Some(i), true) => i.wrapping_sub(1),
+                    (Some(i), false) => i + 1,
+                    (None, _) => 0,
+                };
+                if let Some((_, _, px)) = ICON_SIZES.get(next) {
+                    desk.view.icon = *px;
+                    desk.apply_view(false);
+                    desk.paint();
+                }
                 LRESULT(0)
             }
             // Type-ahead. WM_KEYDOWN hands the letters on to DefWindowProc,

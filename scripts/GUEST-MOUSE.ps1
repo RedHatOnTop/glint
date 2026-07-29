@@ -14,10 +14,13 @@
 param(
     [Parameter(Mandatory)][int]$X,
     [Parameter(Mandatory)][int]$Y,
-    [ValidateSet('move', 'left', 'right', 'double', 'drag')][string]$Click = 'move',
+    [ValidateSet('move', 'left', 'right', 'double', 'drag', 'wheel')][string]$Click = 'move',
     # drag: where to let go.
     [int]$ToX,
     [int]$ToY,
+    # wheel: notches, positive away from the user. WM_MOUSEWHEEL goes to the
+    # focused window, not the one under the pointer, so click it first.
+    [int]$Wheel = 1,
     # Held before the click and released after: 17 Ctrl, 16 Shift.
     [int[]]$Hold
 )
@@ -35,6 +38,9 @@ public class GuestMouse {
 "@
 
 $LDOWN = 0x0002; $LUP = 0x0004; $RDOWN = 0x0008; $RUP = 0x0010
+# Not $WHEEL: variable names are case-insensitive here, so that name is the
+# -Wheel parameter, and every scroll went 2048 notches up whatever was asked.
+$MWHEEL = 0x0800
 $KEYUP = 0x0002
 
 function Tap([int]$down, [int]$up) {
@@ -56,6 +62,13 @@ try {
             # Inside the double-click time, which defaults to 500ms.
             Start-Sleep -Milliseconds 90
             Tap $LDOWN $LUP
+        }
+        'wheel' {
+            # mouse_event takes the delta unsigned; a scroll toward the user is
+            # the two's complement of one notch.
+            $delta = 120 * $Wheel
+            if ($delta -lt 0) { $delta = $delta + 0x100000000 }
+            [GuestMouse]::mouse_event($MWHEEL, 0, 0, [uint32]$delta, [IntPtr]::Zero)
         }
         'drag' {
             # DoDragDrop runs its own modal loop on the source thread and reads
@@ -82,4 +95,6 @@ finally {
     foreach ($vk in $Hold) { [GuestMouse]::keybd_event([byte]$vk, 0, $KEYUP, [IntPtr]::Zero) }
 }
 
-if ($Click -eq 'drag') { Write-Host "drag $X,$Y -> $ToX,$ToY" } else { Write-Host "$Click at $X,$Y" }
+if ($Click -eq 'drag') { Write-Host "drag $X,$Y -> $ToX,$ToY" }
+elseif ($Click -eq 'wheel') { Write-Host "wheel $Wheel at $X,$Y" }
+else { Write-Host "$Click at $X,$Y" }

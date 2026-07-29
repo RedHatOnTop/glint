@@ -209,11 +209,54 @@ Rig note, the third: the lab swap script raced Winlogon. Killing the shell to
 overwrite its exe gives Winlogon its cue to start it again, so the copy lands on
 a locked file, says nothing, and the next round is spent testing the build you
 thought you had replaced (a timestamp on `C:\glint\*.exe` is what caught it).
-`swap.cmd` now retries kill-then-copy until the copy wins, and lets Winlogon —
-not `start` — bring the new image up. And the whole menu scenario has to fit
+Retrying the kill lost too (six times, two seconds apart); what wins is that a
+running image cannot be deleted but *can* be renamed, so `swap.cmd` moves the
+old exe aside first and the copy lands on nothing. Winlogon — not `start` —
+brings the new image up. And the whole menu scenario has to fit
 inside one `act.ps1 -Hold`: when it expires the console comes back to the
 foreground and takes the menu down with it, so keystrokes sent after a host-side
 round trip land in the console instead.
+
+**The item menu killed the shell**, and the verb filter above is what did it.
+A right-click on a desktop icon left a black screen with no `crash.log`, so not
+a panic — the process was simply gone. Item menus call the same `run()` with an
+*empty* kill list, and the filter had no early-out, so `GetCommandString` was
+asked for the verb of every row the shell extensions had just built, submenu
+owners included. The old `GetMenuItemID == u32::MAX` check had been skipping
+those by accident; reading the id properly took the accident away. The filter
+now returns before it asks anything when there is nothing to match against, and
+the item menu is back.
+
+That left rename with nowhere to live — the shell only offers 이름 바꾸기 when
+asked with `CMF_CANRENAME`, and invoking it wants a shell view site we do not
+have. So the flag goes in, the shell places the item where explorer places it
+(between 삭제 and 속성, not first, which is where a prepended custom entry would
+have landed), and `run()` reads the verb of the *one* row the user picked —
+after the menu is down, one call, not one per row — and returns
+`MenuOutcome::Rename` for our own inline editor instead of invoking it.
+
+Two more explorer gestures, both keyboard-and-wheel: **Shift+F10 and the context
+key** raise the menu at the focused icon (or at the grid origin when nothing is
+selected), and **Ctrl+wheel** steps the icon size. `WM_CONTEXTMENU` never
+arrives at this window — it is `WS_EX_NOACTIVATE` and `DefWindowProc` does not
+synthesize one — and `F10` comes in as `WM_SYSKEYDOWN` even with Shift held, so
+both are handled as keys.
+
+Verified in the lab on the shipping build: right-click on 새 폴더 draws the full
+item menu with the shell alive after it (`h09`); 이름 바꾸기 opens the inline
+editor with the stem selected (`h14`); Shift+F10 draws the same menu at the
+selected icon (`h16`); the context key on empty ground draws the background menu
+(`h18`); Ctrl+wheel up twice grows the icons and three notches down shrink them
+past the size they started at (`h19`, `h23`).
+
+Rig note, the fourth — two rig bugs faked two results. `act.ps1 -A` took a
+`[string[]]`, and `-File` bound only the first of `R62,590 L140,531` because each
+token already contains a comma; the second action was dropped in silence and the
+menu looked like it had ignored the click. Actions are one `;`-separated string
+now. And in `GUEST-MOUSE.ps1` the flag constant `$WHEEL = 0x0800` *was* the
+`-Wheel` parameter — PowerShell variable names are case-insensitive — so every
+scroll went `120 * 2048` notches up regardless of direction, and Ctrl+wheel-down
+read as "the shell only grows icons". Renamed `$MWHEEL`.
 
 ## 2026-07-27 (evening)
 
