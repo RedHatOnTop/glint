@@ -39,13 +39,14 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject,
     STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
-use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
 use windows::Win32::System::SystemServices::{
     MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS, SFGAO_DROPTARGET,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::System::Ole::{
-    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop,
+    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
+    DoDragDrop,
     IDropSource, IDropSource_Impl, IDropTarget, OleFlushClipboard, OleGetClipboard, OleInitialize,
     OleSetClipboard, RegisterDragDrop, ReleaseStgMedium,
 };
@@ -107,6 +108,9 @@ const ID_DISPLAY: u32 = 3;
 const ID_PERSONAL: u32 = 4;
 const ID_AUTO_ARRANGE: u32 = 5;
 const ID_SHOW_ICONS: u32 = 6;
+const ID_PASTE: u32 = 7;
+/// One id per 새로 만들기 entry, offset by its index in `newmenu::types()`.
+const ID_NEW_FIRST: u32 = 100;
 /// Icon edge in logical px, in the order explorer lists the sizes. The cell
 /// and the label box follow from it, so this one number is the whole setting.
 const ICON_SIZES: [(u32, &str, f32); 3] =
@@ -1142,16 +1146,50 @@ impl Desktop {
             .map(|(id, label, s)| Item::radio(*id, label, self.view.sort == *s))
             .collect();
 
+        let new: Vec<Item> = crate::newmenu::types()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Item::new(ID_NEW_FIRST + i as u32, &t.label))
+            .collect();
+
         vec![
             Item::submenu("보기", view),
             Item::submenu("정렬 기준", sort),
             Item::sep(),
             Item::new(ID_REFRESH, "새로 고침"),
+            Item::sep(),
+            // The desktop's own background menu has no 붙여넣기 — the shell
+            // leaves that one to the view, and we are the view.
+            Item {
+                enabled: unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() },
+                ..Item::new(ID_PASTE, "붙여넣기")
+            },
+            Item::sep(),
+            Item::submenu("새로 만들기", new),
             Item::new(ID_GLIDE, "glide로 열기"),
             Item::sep(),
             Item::new(ID_DISPLAY, "디스플레이 설정"),
             Item::new(ID_PERSONAL, "개인 설정"),
         ]
+    }
+
+    /// A 새로 만들기 pick: the shell's registry says what to make, and the new
+    /// item lands in inline rename with its name selected, which is the half
+    /// of the gesture explorer users actually use.
+    fn create_new(&mut self, hwnd: HWND, idx: usize) {
+        let Some(t) = crate::newmenu::types().get(idx) else { return };
+        let Some(dir) = desktop_dir() else { return };
+        let Some(path) = crate::newmenu::create(&dir, t) else { return };
+        self.refresh_all();
+        let Some(i) = self.items.iter().position(|it| it.path.as_deref() == Some(&*path)) else {
+            return;
+        };
+        for (j, it) in self.items.iter_mut().enumerate() {
+            it.selected = j == i;
+        }
+        self.cursor = i;
+        self.anchor = i;
+        self.begin_rename(hwnd, i);
     }
 
     /// A view option changed: the icons have to be extracted again at the new
@@ -2309,6 +2347,10 @@ extern "system" fn desktop_wndproc(
                 match outcome {
                     MenuOutcome::Invoked | MenuOutcome::Custom(ID_REFRESH) => desk.refresh_all(),
                     MenuOutcome::Custom(ID_GLIDE) => open_glide(),
+                    MenuOutcome::Custom(ID_PASTE) => desk.clipboard_paste(),
+                    MenuOutcome::Custom(id) if id >= ID_NEW_FIRST => {
+                        desk.create_new(hwnd, (id - ID_NEW_FIRST) as usize)
+                    }
                     MenuOutcome::Custom(ID_DISPLAY) => open_uri("ms-settings:display"),
                     MenuOutcome::Custom(ID_PERSONAL) => open_uri("ms-settings:personalization"),
                     MenuOutcome::Custom(ID_AUTO_ARRANGE) => {

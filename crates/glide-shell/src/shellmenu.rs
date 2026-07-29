@@ -18,7 +18,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DeleteMenu, DestroyMenu, GetCursorPos, GetMenuItemCount,
-    GetMenuItemID, GetMenuItemInfoW, HMENU, InsertMenuItemW, MENU_ITEM_STATE, MENU_ITEM_TYPE,
+    GetMenuItemInfoW, HMENU, InsertMenuItemW, MENU_ITEM_STATE, MENU_ITEM_TYPE,
     MENUITEMINFOW, MF_BYPOSITION, MF_SEPARATOR, MFS_CHECKED, MFS_GRAYED, MFT_RADIOCHECK,
     MFT_SEPARATOR, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, PostMessageW,
     WM_INITMENUPOPUP, WM_NULL,
@@ -77,9 +77,11 @@ impl CustomItem {
 const ID_SHELL_FIRST: u32 = 0x1000;
 const ID_SHELL_LAST: u32 = 0x7FFF;
 
-// Background menu only: our caller provides 새로 고침 itself, and the shell
-// verb repaints nothing in our window anyway.
-const BG_VERB_FILTER: &[&str] = &["refresh"];
+// Background menu only. 새로 고침: the shell verb repaints nothing in our
+// window, and the caller has its own. 새로 만들기: NewMenu paints entries it
+// cannot then create anything from without a shell-view site, so newmenu.rs
+// replaces it. 액세스 권한 부여: comes up empty for the same reason.
+const BG_VERB_FILTER: &[&str] = &["refresh", "new", "windows.share"];
 
 thread_local! {
     static MENU_FWD: RefCell<Option<(Option<IContextMenu2>, Option<IContextMenu3>)>> =
@@ -208,8 +210,19 @@ unsafe fn filter_verbs(
     unsafe {
         let count = GetMenuItemCount(Some(hmenu));
         for i in (0..count).rev() {
-            let id = GetMenuItemID(hmenu, i);
-            if id == u32::MAX || id < ID_SHELL_FIRST {
+            // Not GetMenuItemID: it answers -1 for an item that owns a
+            // submenu, which is exactly what 새로 만들기 and 액세스 권한 부여
+            // are, so they slipped through every filter until now.
+            let mut mii = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(hmenu, i as u32, true, &mut mii).is_err() {
+                continue;
+            }
+            let id = mii.wID;
+            if id < ID_SHELL_FIRST {
                 continue;
             }
             let mut buf = [0u16; 128];

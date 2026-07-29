@@ -157,6 +157,64 @@ where the new type-ahead read it and Enter opened a folder. Nothing was broken,
 but a whole round was spent reading a screen that showed the wrong thing (it did
 prove type-ahead and Enter work against a real key stream).
 
+**새로 만들기 is ours and it creates files now** (`newmenu.rs`). It had been the
+one item on the desktop menu that painted perfectly and did nothing — the
+shell's `NewMenu` fills the submenu on `WM_INITMENUPOPUP`, icons and all, and
+then wants a shell-view site to select and rename what it made, which a
+composition window is not.
+
+- The entries come from the registry `NewMenu` itself reads, the file is written
+  here, and the caller drops the new icon straight into inline rename the way
+  explorer does. `Data` before `NullFile`, because `.zip` carries both and an
+  empty `.zip` is a broken file.
+- Every word comes out of shell32's string table (`SHLoadIndirectString`), so a
+  Korean install says 폴더 / 새 폴더 and an English one says Folder / New folder
+  with no translation of ours.
+- Nothing is painted that cannot be delivered: a `FileName` template whose file
+  is not on disk, a `Command` whose program is not installed, and any entry with
+  a `Handler` (a COM class wanting that same shell-view site) are dropped while
+  the menu is built rather than shown and then fumbled. 바로 가기 goes with
+  them — its ShellNew names a Handler, and the classic stand-in `rundll32
+  appwiz.cpl,NewLinkHere` is inert on this Windows from the command line too.
+- 붙여넣기 is on the background menu again, enabled off `IsClipboardFormatAvailable`.
+  The shell's own background menu has no paste item, so there was nothing to
+  filter through — it had to be one of ours.
+
+Three registry facts cost a round each, all found by reading the live registry
+rather than guessing:
+
+- `ItemName` is the *file's* name, not the menu label — the menu read 새 비트맵
+  이미지 until it moved to where it belongs, and it is now what the created file
+  is called, so we land on explorer's exact `새 압축(ZIP) 폴더.zip`.
+- `.zip` keeps its ShellNew under a ProgID subkey — `HKCR\.zip\CompressedFolder\ShellNew`
+  — not under the extension. A menu that reads only the extension is missing
+  압축(ZIP) 폴더 and cannot tell you why.
+- Half of these values are REG_EXPAND_SZ and arrive with `%SystemRoot%` intact,
+  and a `Command` is `"…\Wab.exe" /CreateContact "%1"` — quoted, so splitting at
+  the first space hands `ShellExecuteW` a path that ends mid-word.
+
+The verb filter that was supposed to keep the shell's own duplicates out had
+been doing nothing: `GetMenuItemID` answers -1 for an item that owns a submenu,
+which is exactly what 새로 만들기 and 액세스 권한 부여 are. `GetMenuItemInfoW`
+with `MIIM_ID` gives the real id, and both are gone from the merged menu.
+
+Verified in the lab on the shipping build: the submenu reads 폴더 / 비트맵 이미지
+/ 압축(ZIP) 폴더 / 연락처 / 텍스트 문서 (`nm43`); 비트맵 이미지 put
+`새 비트맵 이미지.bmp` on the desktop with the stem selected in inline rename
+(`nm29`, `nm31`); 압축(ZIP) 폴더 produced `새 압축(ZIP) 폴더.zip`, 22 bytes, which
+`ZipFile.OpenRead` opens (`nm42`, `nm44`); 연락처 opened wab.exe's contact sheet
+(`nm45`) — an entry explorer hides and ours actually runs.
+
+Rig note, the third: the lab swap script raced Winlogon. Killing the shell to
+overwrite its exe gives Winlogon its cue to start it again, so the copy lands on
+a locked file, says nothing, and the next round is spent testing the build you
+thought you had replaced (a timestamp on `C:\glint\*.exe` is what caught it).
+`swap.cmd` now retries kill-then-copy until the copy wins, and lets Winlogon —
+not `start` — bring the new image up. And the whole menu scenario has to fit
+inside one `act.ps1 -Hold`: when it expires the console comes back to the
+foreground and takes the menu down with it, so keystrokes sent after a host-side
+round trip land in the console instead.
+
 ## 2026-07-27 (evening)
 
 Desktop gap 1 of 4: **the desktop had no namespace items.** It enumerated two

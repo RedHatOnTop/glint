@@ -15,6 +15,7 @@ mod desktop;
 mod flyout;
 mod icons;
 mod menupopup;
+mod newmenu;
 mod osd;
 mod power;
 mod preview;
