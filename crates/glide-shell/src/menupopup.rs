@@ -123,8 +123,18 @@ struct Track {
 /// `init` is called with (popup, item position) before each level is read, so
 /// the caller can hand WM_INITMENUPOPUP to an IContextMenu2/3 the way a menu
 /// loop would.
+/// True while `track` is running. The click-away hook reads it: a menu of ours
+/// takes capture and judges clicks outside itself, and a second opinion from
+/// the hook closed the popup the menu was raised over.
+pub fn tracking() -> bool {
+    TRACKING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static TRACKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn track(owner: HWND, hmenu: HMENU, x: i32, y: i32, init: fn(HMENU, u32)) -> u32 {
     unsafe {
+        TRACKING.store(true, std::sync::atomic::Ordering::Relaxed);
         register();
         let dpi = dpi_at(x, y);
         let mut t = Box::new(Track {
@@ -138,6 +148,7 @@ pub fn track(owner: HWND, hmenu: HMENU, x: i32, y: i32, init: fn(HMENU, u32)) ->
         });
         let ptr = &mut *t as *mut Track;
         let Some(mut root) = Popup::new(ptr, hmenu, 0, dpi, init, true) else {
+            TRACKING.store(false, std::sync::atomic::Ordering::Relaxed);
             return 0;
         };
         let (wd, hd) = root.device_size();
@@ -178,6 +189,7 @@ pub fn track(owner: HWND, hmenu: HMENU, x: i32, y: i32, init: fn(HMENU, u32)) ->
         // The owner is a NOACTIVATE window hosting a menu: same epilogue the
         // classic tray menu needs so the input state fully unwinds.
         let _ = SetForegroundWindow(owner);
+        TRACKING.store(false, std::sync::atomic::Ordering::Relaxed);
         t.picked
     }
 }

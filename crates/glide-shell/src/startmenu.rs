@@ -258,6 +258,10 @@ pub struct StartMenu {
     /// See dismiss(): keeps a bar-button UP from reopening the menu its own
     /// DOWN closed via WA_INACTIVE/click-away.
     dismissed_at: Option<std::time::Instant>,
+    /// A context menu of ours is up over the menu. It is a window and it takes
+    /// the foreground, which would otherwise read as "the user clicked away"
+    /// and close the menu out from under the item they right-clicked.
+    menu_tracking: bool,
     scale: f32,
     w: f32,
     h: f32,
@@ -428,6 +432,7 @@ impl StartMenu {
                 fmt_glyph,
                 open: false,
                 dismissed_at: None,
+                menu_tracking: false,
                 scale: dpi / 96.0,
                 w: 0.0,
                 h: 0.0,
@@ -1400,8 +1405,10 @@ impl StartMenu {
         unsafe {
             // SetForegroundWindow can be denied; if we never became foreground
             // and the user moved on, WA_INACTIVE never comes — close here.
+            // Unless one of our menus is up: that popup is deliberately the
+            // foreground window, and this timer read it as the user leaving.
             let fg = GetForegroundWindow();
-            if fg != self.hwnd && fg != self.fg_at_open {
+            if fg != self.hwnd && fg != self.fg_at_open && !self.menu_tracking {
                 self.dismiss();
             }
         }
@@ -2488,7 +2495,7 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 LRESULT(0)
             }
             WM_ACTIVATE => {
-                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE && !sm.menu_tracking {
                     sm.dismiss();
                 }
                 LRESULT(0)
@@ -2669,17 +2676,15 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     }
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
-                    let cmd = TrackPopupMenu(
-                        menu,
-                        TPM_RIGHTBUTTON | TPM_RETURNCMD,
-                        pt.x,
-                        pt.y,
-                        Some(0),
-                        hwnd,
-                        None,
-                    );
+                    sm.menu_tracking = true;
+                    let cmd = crate::menupopup::track(hwnd, menu, pt.x, pt.y, |_, _| {});
                     let _ = DestroyMenu(menu);
                     let sm = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut StartMenu);
+                    sm.menu_tracking = false;
+                    // The popup had the foreground; without it back here the
+                    // next click elsewhere never reaches WA_INACTIVE and the
+                    // menu would sit there.
+                    let _ = SetForegroundWindow(hwnd);
                     let (parsing, name) = match &target {
                         RTarget::AppLike { parsing, name, .. }
                         | RTarget::Tile { parsing, name, .. }
@@ -2688,7 +2693,7 @@ extern "system" fn start_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         }
                         RTarget::FolderTile { name } => (String::new(), name.clone()),
                     };
-                    match cmd.0 as usize {
+                    match cmd as usize {
                         MENU_TOGGLE_PIN => sm.toggle_pin(&parsing, &name),
                         MENU_TOGGLE_WIDE => sm.toggle_wide(&parsing),
                         MENU_DISSOLVE => sm.dissolve(&name),

@@ -58,7 +58,12 @@ pub fn install(bar: HWND) {
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        // A context menu of ours runs its own modal loop and decides for
+        // itself what a click outside it means. Reporting those clicks here as
+        // well closed the start menu out from under the item the user had just
+        // right-clicked, before the menu they raised had even been answered.
         if code >= 0
+            && !crate::menupopup::tracking()
             && (START_OPEN.load(Ordering::Relaxed)
                 || FLYOUT_OPEN.load(Ordering::Relaxed)
                 || AC_OPEN.load(Ordering::Relaxed)

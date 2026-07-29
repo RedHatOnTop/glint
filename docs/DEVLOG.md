@@ -278,6 +278,30 @@ the hook has it — but glide never draws in this VM: it exits 0 with no window,
 GPU-less, and eframe wants a GL surface. That half is unverified here and will
 have to be checked on real hardware.
 
+**The last three stock menus are gone.** The desktop's context menu had been
+ours since `aa60208` while the bar's own three still drew the grey win32 box:
+empty-bar right-click, task-button right-click, and start-menu item
+right-click. All three now go through `menupopup::track`.
+
+The start menu's fought back. Raising a menu over it closed it, and the cause
+was three separate things wearing the same symptom:
+
+- `WM_ACTIVATE`/`WA_INACTIVE` — our popup is a real window and takes the
+  foreground, which reads exactly like the user clicking away. A
+  `menu_tracking` flag on `StartMenu` covers the window it is up for.
+- the click-away hook — it posts on button **down**, and a right-click only
+  starts tracking on the **up**, so the post outlives the check and lands
+  inside the menu's own message loop. `menupopup::tracking()` is therefore
+  read in `click_away` (where tracking is already true), not only in the hook.
+- `refresh()`'s once-a-second "foreground isn't me, the user moved on" guard,
+  which is the one the log pinned: the hide always arrived one second after the
+  right-click, never at the moment of it.
+
+Verified in the lab: 시작 메뉴 항목 우클릭 leaves the menu standing with
+시작 화면에 고정 over it (`m11`), and picking it puts 명령 프롬프트 in the tile
+pane with the menu still open (`m12`); the bar's own two menus draw in our
+style (`m01`, `m02`).
+
 Rig note, the fourth — two rig bugs faked two results. `act.ps1 -A` took a
 `[string[]]`, and `-File` bound only the first of `R62,590 L140,531` because each
 token already contains a comma; the second action was dropped in silence and the

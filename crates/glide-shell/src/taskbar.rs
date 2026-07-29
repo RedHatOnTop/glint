@@ -1587,6 +1587,13 @@ impl Bar {
     /// nothing, clicks on this bar are left to its own handlers (which
     /// toggle), anything else dismisses.
     fn click_away(&mut self, pt: POINT) {
+        // The hook posts on button-DOWN, and a right-click that raises one of
+        // our menus only starts tracking on the UP — so the post outlives the
+        // check in the hook and lands inside the menu's own message loop.
+        // Judge it here, where tracking is already true.
+        if crate::menupopup::tracking() {
+            return;
+        }
         if !self.start.open
             && self.flyout.kind.is_none()
             && !self.actioncenter.open
@@ -1922,17 +1929,9 @@ impl Bar {
             // Menu on a NOACTIVATE window: same trap as tray menus — bring
             // ourselves foreground first or the menu never dismisses.
             let _ = SetForegroundWindow(self.hwnd);
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_BOTTOMALIGN,
-                pt.x,
-                pt.y,
-                Some(0),
-                self.hwnd,
-                None,
-            );
+            let cmd = crate::menupopup::track(self.hwnd, menu, pt.x, pt.y, |_, _| {});
             let _ = DestroyMenu(menu);
-            match cmd.0 as usize {
+            match cmd as usize {
                 MENU_PIN => {
                     if let Some(x) = exe {
                         if !self.pins.contains(&x) {
@@ -1981,17 +1980,9 @@ impl Bar {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let _ = SetForegroundWindow(self.hwnd);
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_BOTTOMALIGN,
-                pt.x,
-                pt.y,
-                Some(0),
-                self.hwnd,
-                None,
-            );
+            let cmd = crate::menupopup::track(self.hwnd, menu, pt.x, pt.y, |_, _| {});
             let _ = DestroyMenu(menu);
-            match cmd.0 as usize {
+            match cmd as usize {
                 MENU_SETTINGS => {
                     let hwnd = self.hwnd;
                     self.settings.open(hwnd);
