@@ -28,17 +28,36 @@ use windows::core::PCWSTR;
 pub const WM_WINKEY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 /// Posted when Win+S was captured (search — glint).
 pub const WM_WINKEY_S: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+/// Posted for every other Win chord we claim; `wparam` is the VK.
+pub const WM_WINKEY_COMBO: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 8;
 
 // PowerToys' masking key: reserved VK, no app reacts to it, but its presence
 // between Win-down and Win-up stops explorer treating the Win press as bare.
 const VK_DUMMY: u16 = 0xFF;
 const VK_S: u32 = 0x53;
 
+/// The Win chords explorer used to answer and nobody does once it is gone —
+/// with the shell replaced they reach no window at all, and the bare letter
+/// lands in whatever has focus. Win+L (winlogon) and Win+Shift+S (the OS
+/// snipper) are not on the list because they never belonged to the shell.
+const CLAIMED: &[u32] = &[
+    0x45, // E  file manager
+    0x52, // R  run
+    0x44, // D  show desktop (toggle)
+    0x4D, // M  minimize all
+    0x49, // I  settings
+    0x41, // A  action centre
+    0x58, // X  power-user menu
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, // 1-9  bar slots
+];
+
 thread_local! {
     static BAR: Cell<isize> = const { Cell::new(0) };
     static WIN_DOWN: Cell<bool> = const { Cell::new(false) };
     static OTHER_KEY: Cell<bool> = const { Cell::new(false) };
-    static SWALLOW_S: Cell<bool> = const { Cell::new(false) };
+    /// VK of a chord press we swallowed, so its release goes too and an
+    /// auto-repeat does not fire the action again. 0 when nothing is held.
+    static SWALLOW_VK: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Install the hook on the current (taskbar) thread; `bar` receives
@@ -76,21 +95,26 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                         if WIN_DOWN.get() && !win_physically_down() {
                             WIN_DOWN.set(false);
                         }
-                        // Win+S: ours (glint search), never the stock search
-                        // pane. Swallow every S repeat while Win is held and
-                        // mask once with the dummy so the Win release that
-                        // follows doesn't read as bare. Only the plain chord:
-                        // Win+Shift+S is the OS snipping shortcut (and any
-                        // other modifier isn't ours either).
-                        if WIN_DOWN.get() && kb.vkCode == VK_S && !modifier_down() {
+                        // A chord we answer: swallow every repeat while Win is
+                        // held and mask once with the dummy so the Win release
+                        // that follows doesn't read as bare. Only the plain
+                        // chord — Win+Shift+S is the OS snipping shortcut, and
+                        // any other modifier isn't ours either.
+                        let ours = kb.vkCode == VK_S || CLAIMED.contains(&kb.vkCode);
+                        if WIN_DOWN.get() && ours && !modifier_down() {
                             OTHER_KEY.set(true);
-                            if !SWALLOW_S.get() {
-                                SWALLOW_S.set(true);
+                            if SWALLOW_VK.get() != kb.vkCode {
+                                SWALLOW_VK.set(kb.vkCode);
                                 send_keys(&[(VK_DUMMY, false), (VK_DUMMY, true)]);
+                                let (msg, w) = if kb.vkCode == VK_S {
+                                    (WM_WINKEY_S, 0)
+                                } else {
+                                    (WM_WINKEY_COMBO, kb.vkCode as usize)
+                                };
                                 let _ = PostMessageW(
                                     Some(HWND(BAR.get() as *mut _)),
-                                    WM_WINKEY_S,
-                                    WPARAM(0),
+                                    msg,
+                                    WPARAM(w),
                                     LPARAM(0),
                                 );
                             }
@@ -98,9 +122,9 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                         }
                         OTHER_KEY.set(true);
                     }
-                    WM_KEYUP | WM_SYSKEYUP if kb.vkCode == VK_S && SWALLOW_S.get() => {
-                        // The matching release of a swallowed S press.
-                        SWALLOW_S.set(false);
+                    WM_KEYUP | WM_SYSKEYUP if kb.vkCode == SWALLOW_VK.get() => {
+                        // The matching release of a swallowed chord press.
+                        SWALLOW_VK.set(0);
                         return LRESULT(1);
                     }
                     WM_KEYUP | WM_SYSKEYUP if win => {
@@ -163,6 +187,41 @@ fn send_keys(keys: &[(u16, bool)]) {
         .collect();
     unsafe {
         SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// Win+E. glide is this desktop's file manager; explorer would open the stock
+/// one and put a second shell's window on screen.
+pub fn open_file_manager() {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("glide.exe")));
+    match exe {
+        Some(path) if path.exists() => launch(&path.to_string_lossy(), None),
+        // No sibling build: better the stock window than nothing at all.
+        _ => launch("explorer.exe", None),
+    }
+}
+
+/// Win+R. shell32's own run dialog, by ordinal, in a process of its own — it
+/// is modal, and hosting it here would freeze the bar for as long as it is up.
+pub fn run_dialog() {
+    launch("rundll32.exe", Some("shell32.dll,#61"));
+}
+
+fn launch(exe: &str, args: Option<&str>) {
+    let exe: Vec<u16> = exe.encode_utf16().chain(std::iter::once(0)).collect();
+    let args: Option<Vec<u16>> =
+        args.map(|a| a.encode_utf16().chain(std::iter::once(0)).collect());
+    unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            PCWSTR(exe.as_ptr()),
+            args.as_ref().map_or(PCWSTR::null(), |a| PCWSTR(a.as_ptr())),
+            None,
+            SW_SHOWNORMAL,
+        );
     }
 }
 

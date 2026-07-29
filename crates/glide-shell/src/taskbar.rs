@@ -917,6 +917,26 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 crate::winkey::toggle_glint();
                 LRESULT(0)
             }
+            crate::winkey::WM_WINKEY_COMBO => {
+                match wparam.0 as u32 {
+                    0x45 => crate::winkey::open_file_manager(), // E
+                    0x52 => crate::winkey::run_dialog(),        // R
+                    0x44 => {
+                        // D
+                        bar.toggle_desktop();
+                        bar.paint();
+                    }
+                    0x4D => bar.minimize_all(), // M
+                    0x49 => bar.settings.open(hwnd), // I
+                    0x41 => bar.ac_toggle(hwnd), // A
+                    0x58 => bar.winx_menu(hwnd), // X
+                    // Win+1..9 works the bar left to right, launcher slots
+                    // included — the same thing a click on that button does.
+                    vk @ 0x31..=0x39 => bar.click((vk - 0x31) as usize),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
             WM_AUDIO_REBIND => {
                 bar.status.rebind_volume();
                 bar.paint();
@@ -1188,6 +1208,73 @@ impl Bar {
                     }
                 }
                 self.desk_stash.clear();
+            }
+        }
+    }
+
+    /// Win+M. Same stash as the show-desktop toggle, so a following Win+D
+    /// brings this set back rather than minimizing what is already down.
+    fn minimize_all(&mut self) {
+        if self.desk_stash.is_empty() {
+            self.toggle_desktop();
+            self.paint();
+        }
+    }
+
+    /// Win+X. The chords explorer answered are gone with it; this is the one
+    /// that was a menu, so it stays a menu — ours, above the start button.
+    fn winx_menu(&mut self, hwnd: HWND) {
+        const ID_FILES: u32 = 1;
+        const ID_RUN: u32 = 2;
+        const ID_TASKMGR: u32 = 3;
+        const ID_SETTINGS: u32 = 4;
+        const ID_SIGNOUT: u32 = 5;
+        const ID_RESTART: u32 = 6;
+        const ID_SHUTDOWN: u32 = 7;
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let add = |id: u32, label: &str| {
+                let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
+            };
+            add(ID_FILES, "파일 관리자");
+            add(ID_RUN, "실행");
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            add(ID_TASKMGR, "작업 관리자");
+            add(ID_SETTINGS, "설정");
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            add(ID_SIGNOUT, "로그아웃");
+            add(ID_RESTART, "다시 시작");
+            add(ID_SHUTDOWN, "시스템 종료");
+
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+            let _ = SetForegroundWindow(self.hwnd);
+            let cmd = crate::menupopup::track(self.hwnd, menu, rect.left + 8, rect.top - 8, |_, _| {});
+            let _ = DestroyMenu(menu);
+            match cmd {
+                ID_FILES => crate::winkey::open_file_manager(),
+                ID_RUN => crate::winkey::run_dialog(),
+                ID_TASKMGR => {
+                    if let Ok(exe) = std::env::current_exe() {
+                        use std::os::windows::process::CommandExt;
+                        let _ = std::process::Command::new(exe)
+                            .arg("--taskmgr")
+                            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                            .spawn();
+                    }
+                }
+                ID_SETTINGS => self.settings.open(hwnd),
+                ID_SIGNOUT => {
+                    ShellExecuteW(None, None, w!("shutdown.exe"), w!("/l"), None, SW_HIDE);
+                }
+                ID_RESTART => {
+                    ShellExecuteW(None, None, w!("shutdown.exe"), w!("/r /t 0"), None, SW_HIDE);
+                }
+                ID_SHUTDOWN => {
+                    ShellExecuteW(None, None, w!("shutdown.exe"), w!("/s /t 0"), None, SW_HIDE);
+                }
+                _ => {}
             }
         }
     }

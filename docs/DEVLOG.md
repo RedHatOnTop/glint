@@ -249,6 +249,35 @@ selected icon (`h16`); the context key on empty ground draws the background menu
 (`h18`); Ctrl+wheel up twice grows the icons and three notches down shrink them
 past the size they started at (`h19`, `h23`).
 
+**The Win chords were all dead.** Win+E, Win+R, Win+D — explorer answered those,
+and with explorer gone nobody does: the chord reaches no window and the bare
+letter falls through to whatever has focus (`erd` accumulated in the console
+while I probed them). The Win hook was already there for the bare press and
+Win+S, so claiming the rest is the same swallow-and-mask path, generalized: a
+`CLAIMED` table, one `SWALLOW_VK` latch instead of the S-only flag, and a
+`WM_WINKEY_COMBO` carrying the VK to the bar.
+
+- **E** glide, **R** shell32's run dialog, **D** show-desktop toggle (the bar
+  already had one), **M** minimize all, **I** our settings app, **A** action
+  centre, **1**-**9** the bar's slots left to right, **X** a power-user menu of
+  our own — file manager / run / task manager / settings / sign out / restart /
+  shut down, drawn with `menupopup` above the start button.
+- Win+R goes through `rundll32 shell32.dll,#61` rather than calling `RunFileDlg`
+  in-process: the dialog is modal and would freeze the bar for as long as it is
+  open. The cost is that its description reads "RunDLL" — a run box of our own
+  is the fix, and it is not written yet.
+- Win+L stays the system's (winlogon), Win+Shift+S stays the snipper: a
+  modifier other than Win means the chord was never ours.
+
+Verified in the lab, each by the thing it does: Win+R draws the run dialog
+(`k14`), Win+A the action centre (`k15`), Win+X our menu above the start button
+(`k18`), Win+D minimizes everything and a second press brings the same set back
+(`k16`, `k17`), Win+I opens our settings app (`k18`), Win+1 minimizes the
+console and Win+1 again restores it (`k24`, `k25`). Win+E swallowed its key —
+the hook has it — but glide never draws in this VM: it exits 0 with no window,
+GPU-less, and eframe wants a GL surface. That half is unverified here and will
+have to be checked on real hardware.
+
 Rig note, the fourth — two rig bugs faked two results. `act.ps1 -A` took a
 `[string[]]`, and `-File` bound only the first of `R62,590 L140,531` because each
 token already contains a comma; the second action was dropped in silence and the
