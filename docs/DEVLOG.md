@@ -111,8 +111,33 @@ Ctrl+X ghosted it (`kb5`); Esc then `m` jumped the selection to Microsoft Edge
 (`kb6`); F5 came back with the desktop whole and the new copy still on it
 (`kb7`).
 
-Still open on the desktop: it is a drag *target* and not a drag *source* —
-`DoDragDrop` with the same `selection_data()` is the missing half.
+**And the desktop is a drag source now.** It accepted drops and could not give
+one: a file could come in from anywhere and could not leave except through the
+clipboard.
+
+- `IDropSource` is the one interface the shell cannot supply — it is the
+  *source's* judgement of when the drag ends — but both methods are pure
+  policy and both get the standard answer: cancel on Escape or the right
+  button, drop when the button that started it comes up, default cursors.
+  The data object is the same `selection_data()` the clipboard uses.
+- The hand-off happens in `WM_MOUSEMOVE`: past the system drag threshold and
+  over a window that is not one of ours, the drag stops being a rearrangement
+  and becomes an export — icons snap back, capture is released, `DoDragDrop`
+  takes the pointer. `WindowFromPoint` is not confused by our own capture, and
+  the secondary desktops count as ours, so crossing a monitor edge stays a
+  move within one folder.
+- `DoDragDrop` pumps this wndproc reentrantly, so no `Desktop` borrow lives
+  across it — same discipline as the context menu.
+
+Verified in the lab: dragging `drag-me - 복사본.txt` from the desktop onto a
+Notepad window opened it there — title `drag-me - 복사본.txt`, body `dragged`
+(`ds3`) — and the icon stayed where it was. Dragging within the desktop still
+rearranges: `drag-me.txt` moved a column right and a row down and stayed there
+(`ds6`).
+
+Still open on the desktop: dropping *onto* a desktop icon. 휴지통 and a folder
+icon are drop targets in explorer and are inert here — an internal drag only
+ever rearranges.
 
 ## 2026-07-27 (evening)
 

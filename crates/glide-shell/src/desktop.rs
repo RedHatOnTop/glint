@@ -12,7 +12,8 @@
 use std::path::PathBuf;
 
 use windows::Win32::Foundation::{
-    GENERIC_READ, HGLOBAL, HWND, LPARAM, LRESULT, POINTL, RECT, WPARAM,
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, GENERIC_READ, HGLOBAL, HWND,
+    LPARAM, LRESULT, POINTL, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -40,12 +41,13 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::SystemServices::{
-    MK_CONTROL, MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS,
+    MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::System::Ole::{
-    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, IDropTarget, OleFlushClipboard, OleGetClipboard,
-    OleInitialize, OleSetClipboard, RegisterDragDrop, ReleaseStgMedium,
+    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop,
+    IDropSource, IDropSource_Impl, IDropTarget, OleFlushClipboard, OleGetClipboard, OleInitialize,
+    OleSetClipboard, RegisterDragDrop, ReleaseStgMedium,
 };
 use windows::Win32::Graphics::Imaging::{
     GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
@@ -67,7 +69,7 @@ use windows::Win32::UI::Shell::{
     SetWindowSubclass, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, PCWSTR, w};
+use windows::core::{BOOL, HRESULT, PCWSTR, implement, w};
 use windows_numerics::Vector2;
 
 use crate::render::{Renderer, ellipsize, fill_round, rect};
@@ -1783,6 +1785,66 @@ unsafe fn preferred_effect(data: &IDataObject) -> DROPEFFECT {
     }
 }
 
+/// The drag source side of the same trade. IDropSource is the one interface
+/// the shell cannot supply for us — it is the *source's* judgement of when the
+/// drag ends — but it is also two methods of pure policy, and both are the
+/// standard answer: cancel on Escape or the right button, drop when the button
+/// that started it comes up, and let OLE draw its own cursors.
+#[implement(IDropSource)]
+struct DragSource;
+
+impl IDropSource_Impl for DragSource_Impl {
+    fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
+        if escape.as_bool() || keys.0 & MK_RBUTTON.0 != 0 {
+            DRAGDROP_S_CANCEL
+        } else if keys.0 & MK_LBUTTON.0 == 0 {
+            DRAGDROP_S_DROP
+        } else {
+            windows::Win32::Foundation::S_OK
+        }
+    }
+
+    fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+/// Is the pointer over a window that is not one of ours? Capture does not
+/// change what is under the cursor, so this stays true while we hold it. The
+/// secondary desktops count as ours: dragging an icon across a monitor edge is
+/// a move within one folder, not an export.
+unsafe fn pointer_left_us() -> bool {
+    unsafe {
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return false;
+        }
+        let h = WindowFromPoint(pt);
+        if h.is_invalid() {
+            return false;
+        }
+        let root = GetAncestor(h, GA_ROOT);
+        DESKTOPS.with(|d| !d.borrow().contains(&root))
+    }
+}
+
+/// Runs the drag. Modal: OLE pumps this thread's messages until the button
+/// comes up, so no borrow of the Desktop may be alive across it. Answers
+/// whether the files left the desktop.
+unsafe fn drag_out(data: &IDataObject) -> bool {
+    unsafe {
+        let source: IDropSource = DragSource.into();
+        let mut effect = DROPEFFECT_NONE;
+        let hr = DoDragDrop(
+            data,
+            &source,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK,
+            &mut effect,
+        );
+        hr == DRAGDROP_S_DROP && effect == DROPEFFECT_MOVE
+    }
+}
+
 /// Make the desktop accept drops, by handing the job to the shell rather than
 /// implementing IDropTarget here. The Desktop folder's own drop target already
 /// knows copy against move against link, what the modifier keys mean, what to
@@ -2006,6 +2068,25 @@ extern "system" fn desktop_wndproc(
                         d.x = x;
                         d.y = y;
                         d.moved |= (x - d.ox).abs() > tx || (y - d.oy).abs() > ty;
+                    }
+                    // Off our windows and past the threshold, the drag stops
+                    // being a rearrangement and becomes an export: the icons
+                    // go back where they were and OLE takes over the pointer.
+                    if desk.drag.as_ref().is_some_and(|d| d.moved) && pointer_left_us() {
+                        desk.drag = None;
+                        desk.hover = None;
+                        let data = desk.selection_data();
+                        desk.paint();
+                        let _ = ReleaseCapture();
+                        // DoDragDrop pumps this wndproc reentrantly — the desk
+                        // borrow must not live across it.
+                        let moved = data.as_ref().is_some_and(|d| drag_out(d));
+                        let desk =
+                            &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Desktop);
+                        if moved {
+                            desk.refresh_all();
+                        }
+                        return LRESULT(0);
                     }
                     desk.paint();
                 } else if desk.marquee.is_some() {
